@@ -1,0 +1,258 @@
+import type {
+  WorkflowSummary,
+  WorkflowDetail,
+  CreateWorkflowRequest,
+  UpdateWorkflowRequest,
+  RunInfo,
+  TriggerRunResponse,
+  ModelInfo,
+  ApiError,
+} from "@/types/api";
+
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+const API_BASE =
+  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+
+// ---------------------------------------------------------------------------
+// Custom error class — wraps API errors with structured data
+// ---------------------------------------------------------------------------
+export class ApiRequestError extends Error {
+  /** HTTP status code */
+  public readonly status: number;
+  /** Machine-readable error code from the server (if available) */
+  public readonly code: string;
+  /** Additional details from the server (if available) */
+  public readonly details?: Record<string, unknown>;
+
+  constructor(status: number, message: string, code?: string, details?: Record<string, unknown>) {
+    super(message);
+    this.name = "ApiRequestError";
+    this.status = status;
+    this.code = code ?? `HTTP_${status}`;
+    this.details = details;
+  }
+
+  /** Convert to the ApiError type from types/api.ts */
+  toApiError(): ApiError {
+    return {
+      status: this.status,
+      code: this.code,
+      message: this.message,
+      details: this.details,
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Internal request helper — typed, with unified error handling
+// ---------------------------------------------------------------------------
+async function request<T>(
+  path: string,
+  options?: RequestInit,
+): Promise<T> {
+  let response: Response;
+
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      headers: { "Content-Type": "application/json" },
+      ...options,
+    });
+  } catch (err) {
+    // Network-level error (no response at all)
+    throw new ApiRequestError(
+      0,
+      err instanceof Error ? err.message : "Network request failed",
+      "NETWORK_ERROR",
+    );
+  }
+
+  // ---- Handle non-OK responses ----
+  if (!response.ok) {
+    await handleHttpError(response);
+  }
+
+  // ---- Handle 204 No Content (e.g. DELETE, cancel) ----
+  if (response.status === 204 || response.headers.get("content-length") === "0") {
+    return undefined as unknown as T;
+  }
+
+  // ---- Parse JSON ----
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new ApiRequestError(
+      response.status,
+      "Failed to parse API response as JSON",
+      "PARSE_ERROR",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Error handler — maps HTTP status codes to user-friendly messages
+// ---------------------------------------------------------------------------
+async function handleHttpError(response: Response): Promise<never> {
+  const { status } = response;
+
+  // Attempt to parse the body as ApiError from the server
+  let body: Partial<ApiError> | null = null;
+  try {
+    body = await response.json();
+  } catch {
+    // Body is not JSON — ignore
+  }
+
+  const serverMessage = body?.message;
+  const serverCode = body?.code;
+  const serverDetails = body?.details;
+
+  switch (status) {
+    case 400:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "Bad request. Please check your input.",
+        serverCode ?? "BAD_REQUEST",
+        serverDetails,
+      );
+
+    case 401:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "Authentication required. Please log in.",
+        serverCode ?? "UNAUTHORIZED",
+        serverDetails,
+      );
+
+    case 403:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "You do not have permission to perform this action.",
+        serverCode ?? "FORBIDDEN",
+        serverDetails,
+      );
+
+    case 404:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "The requested resource was not found.",
+        serverCode ?? "NOT_FOUND",
+        serverDetails,
+      );
+
+    case 422:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "Validation error. Please check your input.",
+        serverCode ?? "VALIDATION_ERROR",
+        serverDetails,
+      );
+
+    case 429:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "Too many requests. Please try again later.",
+        serverCode ?? "RATE_LIMITED",
+        serverDetails,
+      );
+
+    case 500:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "Internal server error. Please try again later.",
+        serverCode ?? "INTERNAL_ERROR",
+        serverDetails,
+      );
+
+    case 502:
+    case 503:
+    case 504:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? "Service unavailable. Please try again later.",
+        serverCode ?? "SERVICE_UNAVAILABLE",
+        serverDetails,
+      );
+
+    default:
+      throw new ApiRequestError(
+        status,
+        serverMessage ?? `Request failed with status ${status}`,
+        serverCode ?? `HTTP_${status}`,
+        serverDetails,
+      );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Typed API client
+// ---------------------------------------------------------------------------
+export const api = {
+  // ---- Workflows ----
+
+  /** List all workflows (summary) */
+  listWorkflows: (): Promise<WorkflowSummary[]> =>
+    request<WorkflowSummary[]>("/workflows"),
+
+  /** Get full workflow detail by ID */
+  getWorkflow: (id: string): Promise<WorkflowDetail> =>
+    request<WorkflowDetail>(`/workflows/${id}`),
+
+  /** Create a new workflow */
+  createWorkflow: (data: CreateWorkflowRequest): Promise<WorkflowDetail> =>
+    request<WorkflowDetail>("/workflows", {
+      method: "POST",
+      body: JSON.stringify(data),
+    }),
+
+  /** Update an existing workflow */
+  updateWorkflow: (id: string, data: UpdateWorkflowRequest): Promise<WorkflowDetail> =>
+    request<WorkflowDetail>(`/workflows/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(data),
+    }),
+
+  /** Delete a workflow */
+  deleteWorkflow: (id: string): Promise<void> =>
+    request<void>(`/workflows/${id}`, { method: "DELETE" }),
+
+  // ---- Runs ----
+
+  /** Trigger a new run for a workflow */
+  triggerRun: (workflowId: string, input?: Record<string, unknown>): Promise<TriggerRunResponse> =>
+    request<TriggerRunResponse>(`/workflows/${workflowId}/run`, {
+      method: "POST",
+      body: JSON.stringify({ input }),
+    }),
+
+  /** Get run details by ID */
+  getRun: (id: string): Promise<RunInfo> =>
+    request<RunInfo>(`/runs/${id}`),
+
+  /** List all runs */
+  listRuns: (): Promise<RunInfo[]> =>
+    request<RunInfo[]>("/runs"),
+
+  /** Cancel a running workflow */
+  cancelRun: (id: string): Promise<void> =>
+    request<void>(`/runs/${id}/cancel`, { method: "POST" }),
+
+  /** Approve a paused run (Human-in-the-Loop) */
+  approveRun: (id: string): Promise<void> =>
+    request<void>(`/runs/${id}/approve`, { method: "POST" }),
+
+  /** Reject a paused run (Human-in-the-Loop) */
+  rejectRun: (id: string): Promise<void> =>
+    request<void>(`/runs/${id}/reject`, { method: "POST" }),
+
+  /** Get the diff for a paused run (Human-in-the-Loop) */
+  getRunDiff: (id: string): Promise<string> =>
+    request<string>(`/runs/${id}/diff`),
+
+  // ---- Models ----
+
+  /** List available LLM models */
+  listModels: (): Promise<ModelInfo[]> =>
+    request<ModelInfo[]>("/models"),
+};

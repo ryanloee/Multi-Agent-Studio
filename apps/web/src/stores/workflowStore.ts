@@ -1,0 +1,178 @@
+import { create } from "zustand";
+import {
+  applyNodeChanges,
+  applyEdgeChanges,
+  type OnNodesChange,
+  type OnEdgesChange,
+  type OnConnect,
+  type NodeChange,
+  type EdgeChange,
+  type Connection,
+} from "@xyflow/react";
+// Connection is used in onConnect parameter type
+import type {
+  WorkflowNode,
+  WorkflowEdge,
+  AgentNodeType,
+  NodeData,
+} from "@/types/workflow";
+import type { WorkflowDetail } from "@/types/api";
+import { NODE_META, VALID_CONNECTIONS } from "@/lib/constants";
+import { translations } from "@/lib/i18n";
+import { useLocaleStore } from "./localeStore";
+
+// ---------------------------------------------------------------------------
+// State shape
+// ---------------------------------------------------------------------------
+interface WorkflowState {
+  nodes: WorkflowNode[];
+  edges: WorkflowEdge[];
+  selectedNodeId: string | null;
+
+  // React Flow change handlers
+  onNodesChange: OnNodesChange<WorkflowNode>;
+  onEdgesChange: OnEdgesChange;
+
+  // Node CRUD
+  addNode: (type: AgentNodeType, position: { x: number; y: number }) => void;
+  updateNodeData: (id: string, data: Partial<NodeData>) => void;
+  removeNode: (id: string) => void;
+
+  // Connection handler with validation
+  onConnect: OnConnect;
+
+  // Bulk operations
+  loadWorkflow: (workflow: WorkflowDetail) => void;
+  clearCanvas: () => void;
+
+  // Selection
+  setSelectedNode: (id: string | null) => void;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: generate a simple unique id
+// ---------------------------------------------------------------------------
+let idCounter = 0;
+function nextNodeId(): string {
+  idCounter += 1;
+  return `node_${Date.now()}_${idCounter}`;
+}
+
+// ---------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------
+export const useWorkflowStore = create<WorkflowState>((set, get) => ({
+  nodes: [],
+  edges: [],
+  selectedNodeId: null,
+
+  // ---- React Flow change handlers ----
+  onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
+    set({ nodes: applyNodeChanges(changes, get().nodes) });
+  },
+
+  onEdgesChange: (changes: EdgeChange<WorkflowEdge>[]) => {
+    set({ edges: applyEdgeChanges(changes, get().edges) });
+  },
+
+  // ---- Node CRUD ----
+  addNode: (type: AgentNodeType, position: { x: number; y: number }) => {
+    const meta = NODE_META[type];
+    const id = nextNodeId();
+    // Read current locale for translated default label
+    const { locale } = useLocaleStore.getState();
+    const t = (key: string) => translations[locale][key] || key;
+    const newNode: WorkflowNode = {
+      id,
+      type,
+      position,
+      data: {
+        label: t(`node.${type}.label`),
+        agentType: type,
+        modelProvider: meta.defaultData.modelProvider ?? "",
+        modelId: meta.defaultData.modelId ?? "",
+        prompt: meta.defaultData.prompt ?? "",
+        permissions: meta.defaultData.permissions ?? {},
+        command: meta.defaultData.command ?? "",
+        description: meta.defaultData.description ?? "",
+      },
+    };
+    set({ nodes: [...get().nodes, newNode] });
+  },
+
+  updateNodeData: (id: string, data: Partial<NodeData>) => {
+    set({
+      nodes: get().nodes.map((node) =>
+        node.id === id ? { ...node, data: { ...node.data, ...data } } : node
+      ),
+    });
+  },
+
+  removeNode: (id: string) => {
+    set({
+      nodes: get().nodes.filter((node) => node.id !== id),
+      edges: get().edges.filter((edge) => edge.source !== id && edge.target !== id),
+      selectedNodeId: get().selectedNodeId === id ? null : get().selectedNodeId,
+    });
+  },
+
+  // ---- Connection with validation ----
+  onConnect: (connection: Connection) => {
+    const { nodes, edges } = get();
+
+    // Look up source and target node types
+    const sourceNode = nodes.find((n) => n.id === connection.source);
+    const targetNode = nodes.find((n) => n.id === connection.target);
+
+    if (!sourceNode || !targetNode) return;
+
+    // Check against VALID_CONNECTIONS whitelist
+    const allowed = VALID_CONNECTIONS.some(
+      (rule) =>
+        rule.source === sourceNode.type &&
+        rule.target === targetNode.type
+    );
+
+    if (!allowed) return;
+
+    // Prevent duplicate edges
+    const duplicate = edges.some(
+      (edge) =>
+        edge.source === connection.source &&
+        edge.target === connection.target
+    );
+    if (duplicate) return;
+
+    const newEdge: WorkflowEdge = {
+      id: `e_${connection.source}-${connection.target}`,
+      source: connection.source,
+      target: connection.target,
+      ...(connection.sourceHandle && { sourceHandle: connection.sourceHandle }),
+      ...(connection.targetHandle && { targetHandle: connection.targetHandle }),
+    };
+
+    set({ edges: [...edges, newEdge] });
+  },
+
+  // ---- Bulk operations ----
+  loadWorkflow: (workflow: WorkflowDetail) => {
+    set({
+      nodes: workflow.nodes as WorkflowNode[],
+      edges: workflow.edges as WorkflowEdge[],
+      selectedNodeId: null,
+    });
+  },
+
+  clearCanvas: () => {
+    set({
+      nodes: [],
+      edges: [],
+      selectedNodeId: null,
+    });
+  },
+
+  // ---- Selection ----
+  setSelectedNode: (id: string | null) => {
+    set({ selectedNodeId: id });
+  },
+}));

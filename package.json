@@ -1,0 +1,16 @@
+{
+  "name": "multi-agent-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Multi-Agent Workflow Orchestration OS",
+  "scripts": {
+    "dev:web": "cd apps/web && pnpm dev",
+    "build:web": "cd apps/web && pnpm build",
+    "dev": "concurrently \"pnpm dev:web\""
+  },
+  "devDependencies": {
+    "concurrently": "^9.0.0",
+    "turbo": "^2.3.0"
+  },
+  "packageManager": "pnpm@9.15.0"
+}

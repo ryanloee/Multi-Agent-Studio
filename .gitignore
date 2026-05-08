@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+*.pyc
+
+# Build
+.next/
+dist/
+build/
+*.egg-info/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporal
+temporal.db/
+
+# Docker
+docker-compose.override.yml
+
+# Logs
+*.log
+npm-debug.log*
+
+# Testing
+coverage/
+.coverage
+htmlcov/
+
+# Turbo
+.turbo/

@@ -1,0 +1,65 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Workflow DAG",
+  "description": "React Flow JSON schema for workflow definition",
+  "type": "object",
+  "required": ["nodes", "edges"],
+  "properties": {
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorkflowNode"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/WorkflowEdge"
+      }
+    }
+  },
+  "definitions": {
+    "WorkflowNode": {
+      "type": "object",
+      "required": ["id", "type", "position"],
+      "properties": {
+        "id": { "type": "string" },
+        "type": {
+          "type": "string",
+          "enum": ["coder", "plan", "explore", "general", "shell", "review", "human"]
+        },
+        "position": {
+          "type": "object",
+          "properties": {
+            "x": { "type": "number" },
+            "y": { "type": "number" }
+          }
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "label": { "type": "string" },
+            "agentType": { "type": "string" },
+            "modelProvider": { "type": "string" },
+            "modelId": { "type": "string" },
+            "prompt": { "type": "string" },
+            "permissions": { "type": "object" },
+            "command": { "type": "string" }
+          }
+        }
+      }
+    },
+    "WorkflowEdge": {
+      "type": "object",
+      "required": ["id", "source", "target"],
+      "properties": {
+        "id": { "type": "string" },
+        "source": { "type": "string" },
+        "target": { "type": "string" },
+        "sourceHandle": { "type": "string" },
+        "targetHandle": { "type": "string" },
+        "type": { "type": "string" }
+      }
+    }
+  }
+}

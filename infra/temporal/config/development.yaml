@@ -1,0 +1,18 @@
+# Temporal dynamic config for development
+# Matches the dynamicConfigClient.filepath in infra/temporal/config.yaml
+
+frontend.enableUpdateWorkflowExecution:
+  - value: true
+
+frontend.enableUpdateWorkflowExecutionAsyncAccepted:
+  - value: true
+
+system.enableActivityEagerExecution:
+  - value: true
+
+worker.buildIdScavengerEnabled:
+  - value: false
+
+# Allow long workflows for development
+limit.historySize.error:
+  - value: 50000

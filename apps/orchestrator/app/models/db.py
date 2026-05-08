@@ -1,0 +1,106 @@
+"""SQLAlchemy ORM models for the orchestrator database.
+
+Uses SQLAlchemy 2.0 style with Mapped / mapped_column.
+All models use UUID primary keys and async-compatible column types.
+"""
+
+import uuid
+from datetime import datetime
+from typing import Optional
+
+from sqlalchemy import String, Text, ForeignKey, Integer, text
+from sqlalchemy.dialects.postgresql import UUID, JSONB, TIMESTAMP
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    """Base class for all ORM models."""
+    pass
+
+
+class Workflow(Base):
+    __tablename__ = "workflows"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dag_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False,
+        server_default=text("now()"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False,
+        server_default=text("now()"), onupdate=datetime.utcnow,
+    )
+
+    # Relationships
+    runs: Mapped[list["Run"]] = relationship(
+        "Run", back_populates="workflow", cascade="all, delete-orphan",
+    )
+
+
+class Run(Base):
+    __tablename__ = "runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="pending",
+        server_default="pending",
+    )
+    temporal_workflow_id: Mapped[Optional[str]] = mapped_column(
+        String(512), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False,
+        server_default=text("now()"),
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True,
+    )
+
+    # Relationships
+    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="runs")
+    node_executions: Mapped[list["NodeExecution"]] = relationship(
+        "NodeExecution", back_populates="run", cascade="all, delete-orphan",
+    )
+
+
+class NodeExecution(Base):
+    __tablename__ = "node_executions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    agent_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="pending",
+        server_default="pending",
+    )
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True,
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=True,
+    )
+    exit_code: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Relationships
+    run: Mapped["Run"] = relationship("Run", back_populates="node_executions")
