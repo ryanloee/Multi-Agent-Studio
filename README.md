@@ -89,7 +89,7 @@ Multi-Agent Studio 是一个开源的 AI 多智能体工作流编排系统。用
 
 ### 一键初始化
 
-项目提供了 `setup.sh` 脚本，克隆后运行即可完成所有依赖安装和基础设施启动：
+项目提供了安装脚本，克隆后运行即可完成所有依赖安装和基础设施启动：
 
 ```bash
 # 1. 克隆项目
@@ -97,6 +97,11 @@ git clone <repo-url>
 cd multi-agent-studio
 
 # 2. 一键安装（检查前置条件、安装依赖、构建沙盒镜像、启动基础设施）
+
+# Windows (PowerShell):
+.\scripts\setup.ps1
+
+# Linux / macOS:
 bash scripts/setup.sh
 ```
 
@@ -104,7 +109,7 @@ bash scripts/setup.sh
 1. 检查 Docker、Python、Node 是否已安装
 2. 安装前端依赖（`apps/web`）
 3. 安装 Python 依赖（`apps/orchestrator`）
-4. 构建沙盒 Docker 镜像
+4. 构建沙盒 Docker 镜像（首次约 5-10 分钟）
 5. 启动 PostgreSQL、Redis、Temporal、MinIO 容器
 
 ### 手动安装
@@ -120,7 +125,7 @@ cd multi-agent-studio
 cd apps/web && pnpm install && cd ../..
 
 # 3. 安装后端依赖
-cd apps/orchestrator && pip install poetry && poetry install && cd ../..
+cd apps/orchestrator && pip install poetry && poetry install --no-root && cd ../..
 
 # 4. 构建沙盒镜像
 docker build -t multi-agent-studio/sandbox-base:latest infra/sandbox-images/base/
@@ -128,25 +133,27 @@ docker build -t multi-agent-studio/sandbox-base:latest infra/sandbox-images/base
 # 5. 启动基础设施
 docker compose -f infra/docker-compose.yml up -d
 
-# 6. 配置环境变量
-cp apps/orchestrator/.env.example apps/orchestrator/.env
-# 编辑 .env 填入实际配置
+# 6. 启动后端 API（终端 1）
+cd apps/orchestrator && poetry run python -m app.main
 
-# 7. 启动后端 API
-cd apps/orchestrator && poetry run python -m app.main &
+# 7. 启动 Temporal Worker（终端 2）
+cd apps/orchestrator && poetry run python -m app.workflows.worker
 
-# 8. 启动 Temporal Worker
-cd apps/orchestrator && poetry run python -m app.workflows.worker &
-
-# 9. 启动前端
+# 8. 启动前端（终端 3）
 cd apps/web && pnpm dev
 ```
 
+> **Windows 注意**：`poetry run` 不支持 `&` 后台运行，每个服务需要单独开一个终端窗口。
+
 ### 使用开发脚本
 
-`scripts/dev.sh` 会自动检测并启动所有服务：
+脚本会自动检测并启动所有服务：
 
 ```bash
+# Windows (PowerShell):
+.\scripts\dev.ps1
+
+# Linux / macOS:
 bash scripts/dev.sh
 ```
 

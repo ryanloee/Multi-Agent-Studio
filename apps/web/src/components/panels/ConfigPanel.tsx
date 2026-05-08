@@ -70,7 +70,7 @@ const FEATURES: Record<AgentNodeType, FeatureFlags> = {
 // ---------------------------------------------------------------------------
 export default function ConfigPanel() {
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
-  const nodes = useWorkflowStore((s) => s.nodes);
+  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
 

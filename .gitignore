@@ -42,3 +42,9 @@ htmlcov/
 
 # Turbo
 .turbo/
+
+# Logs
+logs/
+
+# Dev temp
+.dev-bat/

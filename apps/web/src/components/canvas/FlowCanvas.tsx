@@ -18,8 +18,8 @@ import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow
 import { NODE_META } from "@/lib/constants";
 
 export default function FlowCanvas() {
-  const nodes = useWorkflowStore((s) => s.nodes);
-  const edges = useWorkflowStore((s) => s.edges);
+  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
+  const edges = useWorkflowStore((s) => s.edges) ?? [];
   const onNodesChange = useWorkflowStore((s) => s.onNodesChange);
   const onEdgesChange = useWorkflowStore((s) => s.onEdgesChange);
   const onConnect = useWorkflowStore((s) => s.onConnect);

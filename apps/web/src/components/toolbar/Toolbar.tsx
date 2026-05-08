@@ -39,8 +39,8 @@ export default function Toolbar({
   onNameChange,
   onSave,
 }: ToolbarProps) {
-  const nodes = useWorkflowStore((s) => s.nodes);
-  const edges = useWorkflowStore((s) => s.edges);
+  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
+  const edges = useWorkflowStore((s) => s.edges) ?? [];
 
   const runId = useRunStore((s) => s.runId);
   const status = useRunStore((s) => s.status);

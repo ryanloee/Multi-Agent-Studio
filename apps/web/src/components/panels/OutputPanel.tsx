@@ -41,7 +41,7 @@ export default function OutputPanel() {
   const [selectedNodeId, setSelectedNodeId] = useState<string>("");
 
   // Node list from workflow store for the filter dropdown
-  const nodes = useWorkflowStore((s) => s.nodes);
+  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const t = useLocaleStore((s) => s.t);
 
   // Build node filter options

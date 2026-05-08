@@ -42,8 +42,8 @@ export default function WorkflowEditor() {
 
   // ---- Stores ----
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
-  const nodes = useWorkflowStore((s) => s.nodes);
-  const edges = useWorkflowStore((s) => s.edges);
+  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
+  const edges = useWorkflowStore((s) => s.edges) ?? [];
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
 
   const runId = useRunStore((s) => s.runId);
