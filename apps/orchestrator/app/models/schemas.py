@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -21,6 +21,18 @@ class UpdateWorkflowRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
+    nodes: Optional[list[dict[str, Any]]] = None
+    edges: Optional[list[dict[str, Any]]] = None
+
+    @model_validator(mode="after")
+    def build_dag_json(self):
+        """If nodes/edges are provided, pack them into dag_json for storage."""
+        if self.nodes is not None or self.edges is not None:
+            self.dag_json = {
+                "nodes": self.nodes or [],
+                "edges": self.edges or [],
+            }
+        return self
 
 
 class WorkflowResponse(BaseModel):
@@ -30,6 +42,16 @@ class WorkflowResponse(BaseModel):
     dag_json: Optional[dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def nodes(self) -> list[dict[str, Any]]:
+        return self.dag_json.get("nodes", []) if self.dag_json else []
+
+    @computed_field
+    @property
+    def edges(self) -> list[dict[str, Any]]:
+        return self.dag_json.get("edges", []) if self.dag_json else []
 
     model_config = {"from_attributes": True}
 

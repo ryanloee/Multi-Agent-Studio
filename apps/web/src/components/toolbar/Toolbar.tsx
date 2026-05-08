@@ -6,8 +6,8 @@ import {
   Square,
   Save,
   Loader2,
-  Keyboard,
   Globe,
+  Check,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -16,23 +16,13 @@ import { api } from "@/lib/api";
 import { STATUS_COLORS } from "@/lib/constants";
 import type { RunStatus } from "@/types/workflow";
 
-// ---------------------------------------------------------------------------
-// Props
-// ---------------------------------------------------------------------------
 interface ToolbarProps {
-  /** Workflow ID — needed for save / run operations */
   workflowId: string;
-  /** Current workflow name — editable in the toolbar */
   workflowName: string;
-  /** Callback when the user renames the workflow */
   onNameChange: (name: string) => void;
-  /** Callback after a successful save */
   onSave?: () => void;
 }
 
-// ---------------------------------------------------------------------------
-// Toolbar — fixed-height top bar (h-12) with logo, name, save, run controls
-// ---------------------------------------------------------------------------
 export default function Toolbar({
   workflowId,
   workflowName,
@@ -53,12 +43,12 @@ export default function Toolbar({
   const t = useLocaleStore((s) => s.t);
 
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [triggering, setTriggering] = useState(false);
 
   const isRunning = status === "running";
   const isPaused = status === "paused";
 
-  // Status labels derived from i18n
   const STATUS_LABELS: Record<RunStatus, string> = {
     idle: t("toolbar.status.idle"),
     running: t("toolbar.status.running"),
@@ -67,16 +57,14 @@ export default function Toolbar({
     failed: t("toolbar.status.failed"),
   };
 
-  // ----- Save handler -----
   const handleSave = useCallback(async () => {
     setSaving(true);
+    setSaved(false);
     try {
-      await api.updateWorkflow(workflowId, {
-        name: workflowName,
-        nodes,
-        edges,
-      });
+      await api.updateWorkflow(workflowId, { name: workflowName, nodes, edges });
+      setSaved(true);
       onSave?.();
+      setTimeout(() => setSaved(false), 2000);
     } catch (err) {
       console.error("Save failed:", err);
     } finally {
@@ -84,7 +72,6 @@ export default function Toolbar({
     }
   }, [workflowId, workflowName, nodes, edges, onSave]);
 
-  // ----- Run / Cancel handler -----
   const handleRun = useCallback(async () => {
     setTriggering(true);
     try {
@@ -111,64 +98,50 @@ export default function Toolbar({
     }
   }, [runId, setRunId, setStatus]);
 
-  // ----- Keyboard shortcuts: Ctrl+S to save, Ctrl+Enter to run -----
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      // Ctrl+S or Cmd+S -> save
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
         e.preventDefault();
         handleSave();
       }
-      // Ctrl+Enter or Cmd+Enter -> run
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
-        if (!isRunning && !isPaused) {
-          handleRun();
-        }
+        if (!isRunning && !isPaused) handleRun();
       }
     }
-
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleSave, handleRun, isRunning, isPaused]);
 
-  // ----- Name editing -----
   const [editingName, setEditingName] = useState(false);
   const [tempName, setTempName] = useState(workflowName);
 
-  useEffect(() => {
-    setTempName(workflowName);
-  }, [workflowName]);
+  useEffect(() => { setTempName(workflowName); }, [workflowName]);
 
   const commitName = useCallback(() => {
     setEditingName(false);
     const trimmed = tempName.trim();
-    if (trimmed && trimmed !== workflowName) {
-      onNameChange(trimmed);
-    } else {
-      setTempName(workflowName);
-    }
+    if (trimmed && trimmed !== workflowName) onNameChange(trimmed);
+    else setTempName(workflowName);
   }, [tempName, workflowName, onNameChange]);
 
-  // ----- Language toggle -----
-  const toggleLocale = useCallback(() => {
-    setLocale(locale === "zh" ? "en" : "zh");
-  }, [locale, setLocale]);
+  const toggleLocale = useCallback(() => setLocale(locale === "zh" ? "en" : "zh"), [locale, setLocale]);
 
-  // ----- Render -----
   return (
-    <header className="h-12 bg-white border-b border-gray-200 flex items-center px-4 shrink-0 select-none">
-      {/* ---- Left: Logo ---- */}
-      <div className="flex items-center gap-2 mr-6">
-        <div className="w-7 h-7 rounded-md bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
-          <span className="text-white text-xs font-bold">MA</span>
-        </div>
-        <span className="text-sm font-semibold text-gray-800 hidden sm:inline">
-          {t("toolbar.appTitle")}
-        </span>
+    <header className="h-13 bg-white/95 backdrop-blur-sm border-b border-gray-200 flex items-center px-4 shrink-0 select-none">
+      {/* Left: Logo + Back */}
+      <div className="flex items-center gap-3 mr-6">
+        <a href="/workflows" className="flex items-center gap-2 group">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-sm group-hover:shadow-md transition-shadow">
+            <span className="text-white text-xs font-bold">MA</span>
+          </div>
+          <span className="text-sm font-semibold text-gray-700 hidden sm:inline group-hover:text-blue-600 transition-colors">
+            {t("toolbar.appTitle")}
+          </span>
+        </a>
       </div>
 
-      {/* ---- Center: Workflow name (editable) ---- */}
+      {/* Center: Workflow name */}
       <div className="flex-1 flex justify-center">
         {editingName ? (
           <input
@@ -178,17 +151,14 @@ export default function Toolbar({
             onBlur={commitName}
             onKeyDown={(e) => {
               if (e.key === "Enter") commitName();
-              if (e.key === "Escape") {
-                setTempName(workflowName);
-                setEditingName(false);
-              }
+              if (e.key === "Escape") { setTempName(workflowName); setEditingName(false); }
             }}
-            className="text-sm font-medium text-gray-700 text-center bg-gray-50 border border-gray-300 rounded px-2 py-0.5 focus:outline-none focus:ring-1 focus:ring-blue-400 max-w-[300px]"
+            className="text-sm font-medium text-gray-700 text-center bg-gray-50 border border-gray-300 rounded-lg px-3 py-1 focus:outline-none focus:ring-2 focus:ring-blue-400 max-w-[300px]"
           />
         ) : (
           <button
             onClick={() => setEditingName(true)}
-            className="text-sm font-medium text-gray-700 hover:text-gray-900 px-2 py-0.5 rounded hover:bg-gray-100 transition-colors max-w-[300px] truncate"
+            className="text-sm font-medium text-gray-700 hover:text-gray-900 px-3 py-1 rounded-lg hover:bg-gray-100 transition-colors max-w-[300px] truncate"
             title={t("toolbar.clickToRename")}
           >
             {workflowName || t("toolbar.untitled")}
@@ -196,29 +166,34 @@ export default function Toolbar({
         )}
       </div>
 
-      {/* ---- Right: Save + Run/Cancel + Status badge + Language toggle ---- */}
+      {/* Right: Actions */}
       <div className="flex items-center gap-2">
-        {/* Save button */}
+        {/* Save */}
         <button
           onClick={handleSave}
           disabled={saving}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors disabled:opacity-50"
+          className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-all disabled:opacity-50 ${
+            saved
+              ? "border-green-300 bg-green-50 text-green-700"
+              : "border-gray-300 text-gray-600 hover:bg-gray-50 hover:border-gray-400"
+          }`}
           title={t("toolbar.saveShortcut")}
         >
           {saving ? (
             <Loader2 size={14} className="animate-spin" />
+          ) : saved ? (
+            <Check size={14} />
           ) : (
             <Save size={14} />
           )}
-          {t("toolbar.save")}
+          {saved ? t("toolbar.saved") || "已保存" : t("toolbar.save")}
         </button>
 
-        {/* Run / Cancel button */}
+        {/* Run / Cancel */}
         {isRunning || isPaused ? (
           <button
             onClick={handleCancel}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-red-500 text-white hover:bg-red-600 transition-colors"
-            title={t("toolbar.cancelShortcut")}
+            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg bg-red-500 text-white hover:bg-red-600 transition-colors shadow-sm"
           >
             <Square size={14} />
             {t("toolbar.cancel")}
@@ -226,8 +201,8 @@ export default function Toolbar({
         ) : (
           <button
             onClick={handleRun}
-            disabled={triggering}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-green-600 text-white hover:bg-green-700 transition-colors disabled:opacity-50"
+            disabled={triggering || nodes.length === 0}
+            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700 transition-all shadow-sm disabled:opacity-50"
             title={t("toolbar.runShortcut")}
           >
             {triggering ? (
@@ -241,21 +216,15 @@ export default function Toolbar({
 
         {/* Status badge */}
         <span
-          className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${STATUS_COLORS[status]}`}
+          className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${STATUS_COLORS[status]}`}
         >
           {STATUS_LABELS[status]}
-        </span>
-
-        {/* Shortcut hint (subtle) */}
-        <span className="text-[10px] text-gray-300 hidden lg:inline-flex items-center gap-0.5 ml-1">
-          <Keyboard size={10} />
-          {t("toolbar.shortcutHint")}
         </span>
 
         {/* Language toggle */}
         <button
           onClick={toggleLocale}
-          className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-md border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors ml-1"
+          className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700 transition-colors"
           title={locale === "zh" ? "Switch to English" : "切换为中文"}
         >
           <Globe size={14} />

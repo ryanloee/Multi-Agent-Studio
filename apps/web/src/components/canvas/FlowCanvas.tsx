@@ -104,13 +104,18 @@ export default function FlowCanvas() {
 
       {/* Empty canvas guide text */}
       {nodes.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none">
-          <div className="text-center space-y-2">
-            <p className="text-gray-400 text-lg font-medium">
-              Drag nodes from the sidebar to get started
+        <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none z-10">
+          <div className="text-center space-y-3 max-w-sm px-4">
+            <div className="w-12 h-12 rounded-xl bg-blue-50 flex items-center justify-center mx-auto">
+              <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+              </svg>
+            </div>
+            <p className="text-gray-500 text-base font-medium">
+              从左侧节点库拖拽节点到此处
             </p>
-            <p className="text-gray-300 text-sm">
-              Connect nodes to build your workflow
+            <p className="text-gray-400 text-sm leading-relaxed">
+              先拖一个「规划器」作为起点，再拖「编码器」「审查器」等节点，用连线把它们串起来，就是一个自动化工作流。
             </p>
           </div>
         </div>

@@ -5,9 +5,6 @@ import type { AgentNodeType } from "@/types/workflow";
 import { NODE_META } from "@/lib/constants";
 import { useLocaleStore } from "@/stores/localeStore";
 
-// ---------------------------------------------------------------------------
-// Icon mapping — SVG glyphs matching NODE_META icon names
-// ---------------------------------------------------------------------------
 const ICON_MAP: Record<string, JSX.Element> = {
   Code: (
     <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2}>
@@ -40,7 +37,6 @@ const ICON_MAP: Record<string, JSX.Element> = {
       <polyline points="14 2 14 8 20 8" />
       <line x1="16" y1="13" x2="8" y2="13" />
       <line x1="16" y1="17" x2="8" y2="17" />
-      <polyline points="10 9 9 9 8 9" />
     </svg>
   ),
   User: (
@@ -51,26 +47,17 @@ const ICON_MAP: Record<string, JSX.Element> = {
   ),
 };
 
-// ---------------------------------------------------------------------------
-// Color mapping for icon tinting
-// ---------------------------------------------------------------------------
-const COLOR_MAP: Record<string, string> = {
-  blue: "#3b82f6",
-  green: "#22c55e",
-  yellow: "#eab308",
-  gray: "#6b7280",
-  purple: "#a855f7",
-  orange: "#f97316",
+const COLOR_MAP: Record<string, { bg: string; text: string; border: string }> = {
+  blue: { bg: "bg-blue-50", text: "text-blue-600", border: "border-blue-200" },
+  green: { bg: "bg-emerald-50", text: "text-emerald-600", border: "border-emerald-200" },
+  yellow: { bg: "bg-amber-50", text: "text-amber-600", border: "border-amber-200" },
+  gray: { bg: "bg-gray-50", text: "text-gray-600", border: "border-gray-200" },
+  purple: { bg: "bg-purple-50", text: "text-purple-600", border: "border-purple-200" },
+  orange: { bg: "bg-orange-50", text: "text-orange-600", border: "border-orange-200" },
 };
 
-// ---------------------------------------------------------------------------
-// Node type list to render (stable order)
-// ---------------------------------------------------------------------------
 const NODE_ORDER: AgentNodeType[] = ["coder", "plan", "explore", "shell", "review", "human"];
 
-// ---------------------------------------------------------------------------
-// Sidebar component
-// ---------------------------------------------------------------------------
 export default function Sidebar() {
   const t = useLocaleStore((s) => s.t);
 
@@ -80,41 +67,33 @@ export default function Sidebar() {
   };
 
   return (
-    <aside className="w-[240px] h-full bg-white border-r border-gray-200 flex flex-col overflow-hidden shrink-0">
-      {/* Header */}
-      <div className="px-4 py-3 border-b border-gray-100">
-        <h2 className="text-sm font-semibold text-gray-700">{t("sidebar.title")}</h2>
+    <aside className="w-[248px] h-full bg-white border-r border-gray-200 flex flex-col overflow-hidden shrink-0">
+      <div className="px-4 py-3.5 border-b border-gray-100">
+        <h2 className="text-sm font-semibold text-gray-800">{t("sidebar.title")}</h2>
         <p className="text-xs text-gray-400 mt-0.5">{t("sidebar.dragToCanvas")}</p>
       </div>
 
-      {/* Node cards */}
       <div className="flex-1 overflow-y-auto p-3 space-y-2">
         {NODE_ORDER.map((type) => {
           const meta = NODE_META[type];
           const icon = ICON_MAP[meta.icon] ?? ICON_MAP.Code;
-          const color = COLOR_MAP[meta.color] ?? "#6b7280";
+          const colors = COLOR_MAP[meta.color] ?? COLOR_MAP.gray;
 
           return (
             <div
               key={type}
               draggable
               onDragStart={(e) => onDragStart(e, type)}
-              className="flex items-start gap-3 p-3 rounded-lg border border-gray-150 bg-gray-50 cursor-grab hover:bg-gray-100 hover:border-gray-300 hover:shadow-sm transition-all select-none active:cursor-grabbing"
+              className={`group flex items-center gap-3 p-3 rounded-xl border ${colors.border} ${colors.bg} cursor-grab hover:shadow-md hover:scale-[1.02] transition-all duration-200 select-none active:cursor-grabbing active:scale-[0.98]`}
             >
-              {/* Icon */}
-              <div
-                className="flex items-center justify-center w-8 h-8 rounded-md shrink-0"
-                style={{ backgroundColor: `${color}18` }}
-              >
-                <span style={{ color }}>{icon}</span>
+              <div className={`flex items-center justify-center w-9 h-9 rounded-lg bg-white shadow-sm shrink-0 ${colors.text}`}>
+                {icon}
               </div>
-
-              {/* Text */}
               <div className="min-w-0">
-                <p className="text-sm font-medium text-gray-800 leading-tight">
+                <p className="text-sm font-semibold text-gray-800 leading-tight">
                   {t(`node.${type}.label`)}
                 </p>
-                <p className="text-xs text-gray-400 mt-0.5 leading-snug line-clamp-2">
+                <p className="text-xs text-gray-400 mt-0.5 leading-snug line-clamp-1">
                   {t(`node.${type}.description`)}
                 </p>
               </div>

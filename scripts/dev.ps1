@@ -8,12 +8,9 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $LogDir = Join-Path $ProjectRoot "logs"
-$BatDir = Join-Path $ProjectRoot ".dev-bat"
 
-# Create directories
-foreach ($d in @($LogDir, $BatDir)) {
-    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
-}
+# Create log directory
+if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir -Force | Out-Null }
 
 # Find poetry executable path
 $PoetryExe = (Get-Command poetry -ErrorAction SilentlyContinue).Source
@@ -48,12 +45,23 @@ try {
     exit 1
 }
 
-# Start infrastructure if not running
-$pgRunning = docker ps --format "{{.Names}}" 2>&1 | Select-String "mas-postgres" -Quiet
-if (-not $pgRunning) {
-    Write-Host "Starting infrastructure containers..." -ForegroundColor Yellow
+# ---------------------------------------------------------------------------
+# Start infrastructure containers (create if missing, start if stopped, skip if running)
+# ---------------------------------------------------------------------------
+$pgRunning = docker ps --format "{{.Names}}" 2>$null | Select-String "mas-postgres" -Quiet
+$pgExists  = docker ps -a --format "{{.Names}}" 2>$null | Select-String "mas-postgres" -Quiet
+
+if (-not $pgExists) {
+    Write-Host "Creating infrastructure containers..." -ForegroundColor Yellow
     Push-Location $ProjectRoot
     docker compose -f infra/docker-compose.yml up -d
+    Pop-Location
+    Write-Host "Waiting for services to be ready..." -ForegroundColor Yellow
+    Start-Sleep -Seconds 8
+} elseif (-not $pgRunning) {
+    Write-Host "Starting infrastructure containers..." -ForegroundColor Yellow
+    Push-Location $ProjectRoot
+    docker compose -f infra/docker-compose.yml start
     Pop-Location
     Write-Host "Waiting for services to be ready..." -ForegroundColor Yellow
     Start-Sleep -Seconds 8
@@ -65,55 +73,73 @@ Write-Host ""
 Write-Host "Starting services (no window popups, logs -> logs\)..." -ForegroundColor Yellow
 Write-Host ""
 
-# Helper: create a .bat launcher and run it hidden (no window)
-function Start-Service {
-    param([string]$Name, [string]$BatContent)
+# ---------------------------------------------------------------------------
+# Helper: start a service process with NO window popup and full log capture.
+# Uses .NET ProcessStartInfo so CreateNoWindow works reliably.
+# Returns the REAL process object (the cmd.exe that runs your command).
+# ---------------------------------------------------------------------------
+function Start-ServiceProcess {
+    param(
+        [string]$Name,
+        [string]$Command,
+        [string]$WorkingDir
+    )
 
-    $batFile = Join-Path $BatDir "$Name.bat"
     $logFile = Join-Path $LogDir "$Name.log"
 
-    # Write batch file
-    @"
-@echo off
-cd /d "$ProjectRoot"
-$BatContent > "$logFile" 2>&1
-"@ | Out-File -FilePath $batFile -Encoding ascii -Force
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "cmd.exe"
+    # /k keeps cmd alive while child runs; we kill it later with taskkill /T
+    $psi.Arguments = "/k $Command > `"$logFile`" 2>&1"
+    $psi.WorkingDirectory = $WorkingDir
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
 
-    # Start hidden (no window) via start command with /min
-    $proc = Start-Process -FilePath "cmd.exe" `
-        -ArgumentList "/c", "start `"$Name`" /min `"$batFile`"" `
-        -PassThru -WindowStyle Hidden
-
+    $proc = [System.Diagnostics.Process]::Start($psi)
     Write-Host "  [$Name] PID=$($proc.Id)" -ForegroundColor Gray
     return $proc
 }
 
+# ---------------------------------------------------------------------------
 # Start services
+# ---------------------------------------------------------------------------
 $procs = @()
 
-$procs += Start-Service -Name "orchestrator" -BatContent "cd /d apps\orchestrator && `"$PoetryExe`" run python -m app.main"
-$procs += Start-Service -Name "worker" -BatContent "cd /d apps\orchestrator && `"$PoetryExe`" run python -m app.workflows.worker"
+$procs += Start-ServiceProcess -Name "orchestrator" `
+    -Command "`"$PoetryExe`" run python -m app.main" `
+    -WorkingDir "$ProjectRoot\apps\orchestrator"
+
+$procs += Start-ServiceProcess -Name "worker" `
+    -Command "`"$PoetryExe`" run python -m app.workflows.worker" `
+    -WorkingDir "$ProjectRoot\apps\orchestrator"
 
 if (Get-Command pnpm -ErrorAction SilentlyContinue) {
-    $procs += Start-Service -Name "frontend" -BatContent "cd /d apps\web && pnpm dev"
+    $procs += Start-ServiceProcess -Name "frontend" `
+        -Command "pnpm dev" `
+        -WorkingDir "$ProjectRoot\apps\web"
 } else {
-    $procs += Start-Service -Name "frontend" -BatContent "cd /d apps\web && npm run dev"
+    $procs += Start-ServiceProcess -Name "frontend" `
+        -Command "npm run dev" `
+        -WorkingDir "$ProjectRoot\apps\web"
 }
 
 # Give services a moment to start
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 4
 
-# Quick health check (use curl.exe, not PowerShell's curl alias)
+# ---------------------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------------------
 $health = curl.exe -s http://localhost:8000/health 2>$null
 if ($health -match "ok") {
     Write-Host ""
-    Write-Host "  Backend: OK" -ForegroundColor Green
+    Write-Host "  Backend:  OK" -ForegroundColor Green
 } else {
     Write-Host ""
-    Write-Host "  Backend: starting... (check logs\orchestrator.log)" -ForegroundColor Yellow
+    Write-Host "  Backend:  starting... (check logs\orchestrator.log)" -ForegroundColor Yellow
 }
 
-$feCode = curl.exe -s -o /dev/null -w "%{http_code}" http://localhost:3000 2>$null
+$feCode = curl.exe -s -o nul -w "%{http_code}" http://localhost:3000 2>$null
 if ($feCode -match "200|307") {
     Write-Host "  Frontend: OK" -ForegroundColor Green
 } else {
@@ -130,26 +156,28 @@ Write-Host "  Temporal UI:   http://localhost:8088" -ForegroundColor White
 Write-Host ""
 Write-Host "  Logs: $LogDir\" -ForegroundColor Gray
 Write-Host ""
-Write-Host "Press Enter to stop all services and containers..." -ForegroundColor Yellow
+Write-Host "Press Enter to stop all services (containers will be kept)..." -ForegroundColor Yellow
 
 # Wait for user to press Enter
 $null = Read-Host
 
-# Cleanup: kill all background processes
+# ---------------------------------------------------------------------------
+# Cleanup: kill the ENTIRE process tree (cmd + all children: node, python...)
+# ---------------------------------------------------------------------------
 Write-Host "Stopping services..." -ForegroundColor Yellow
 
 foreach ($p in $procs) {
-    try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+    if ($p -and -not $p.HasExited) {
+        # /T = kill tree (children too), /F = force
+        $null = taskkill /T /F /PID $p.Id 2>$null
+    }
 }
 
-# Clean up batch files
-Remove-Item -Path $BatDir -Recurse -Force -ErrorAction SilentlyContinue
-
-# Stop Docker containers
-Write-Host "Stopping Docker containers..." -ForegroundColor Yellow
+# Stop Docker containers (keep them — do NOT remove)
+Write-Host "Stopping Docker containers (keeping data)..." -ForegroundColor Yellow
 Push-Location $ProjectRoot
-docker compose -f infra/docker-compose.yml down
+docker compose -f infra/docker-compose.yml stop
 Pop-Location
 
 Write-Host ""
-Write-Host "All services and containers stopped." -ForegroundColor Green
+Write-Host "All services stopped. Containers are preserved for next start." -ForegroundColor Green

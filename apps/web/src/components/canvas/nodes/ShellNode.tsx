@@ -19,7 +19,7 @@ const ShellNode = memo(function ShellNode(props: NodeProps) {
           {preview}
         </code>
       ) : (
-        <span className="italic text-gray-400">No command set</span>
+        <span className="italic text-gray-400">未设置命令</span>
       )}
     </BaseNode>
   );

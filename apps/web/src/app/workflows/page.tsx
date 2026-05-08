@@ -2,14 +2,10 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2, Workflow, Clock, Play } from "lucide-react";
+import { Plus, Trash2, Workflow, Clock, Play, ArrowRight } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLocaleStore } from "@/stores/localeStore";
 import type { WorkflowSummary, RunInfo } from "@/types/api";
-
-// ---------------------------------------------------------------------------
-// WorkflowListPage — grid card layout of all workflows
-// ---------------------------------------------------------------------------
 
 export default function WorkflowListPage() {
   const router = useRouter();
@@ -21,10 +17,8 @@ export default function WorkflowListPage() {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
-  // ---- Load workflows + runs on mount ----
   useEffect(() => {
     let cancelled = false;
-
     async function load() {
       setLoading(true);
       setError(null);
@@ -38,32 +32,25 @@ export default function WorkflowListPage() {
         setRuns(runList);
       } catch (err) {
         if (cancelled) return;
-        setError(err instanceof Error ? err.message : "Failed to load workflows");
+        setError(err instanceof Error ? err.message : t("wfList.loadFailed"));
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
-
     load();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+    return () => { cancelled = true; };
+  }, [t]);
 
-  // ---- Count runs per workflow ----
   const getRunCount = useCallback(
-    (workflowId: string): number => {
-      return runs.filter((r) => r.workflow_id === workflowId).length;
-    },
+    (workflowId: string): number => runs.filter((r) => r.workflow_id === workflowId).length,
     [runs]
   );
 
-  // ---- Create new workflow ----
   const handleCreate = useCallback(async () => {
     setCreating(true);
     try {
       const newWf = await api.createWorkflow({
-        name: `Workflow ${workflows.length + 1}`,
+        name: `${t("wfList.newWorkflow")} ${workflows.length + 1}`,
         description: "",
       });
       router.push(`/workflows/${newWf.id}`);
@@ -72,15 +59,12 @@ export default function WorkflowListPage() {
     } finally {
       setCreating(false);
     }
-  }, [workflows.length, router]);
+  }, [workflows.length, router, t]);
 
-  // ---- Delete workflow ----
   const handleDelete = useCallback(
     async (id: string, e: React.MouseEvent) => {
       e.stopPropagation();
-      const confirmed = window.confirm(t("wfList.deleteConfirm"));
-      if (!confirmed) return;
-
+      if (!window.confirm(t("wfList.deleteConfirm"))) return;
       try {
         await api.deleteWorkflow(id);
         setWorkflows((prev) => prev.filter((w) => w.id !== id));
@@ -91,15 +75,8 @@ export default function WorkflowListPage() {
     [t]
   );
 
-  // ---- Navigate to editor ----
-  const handleOpen = useCallback(
-    (id: string) => {
-      router.push(`/workflows/${id}`);
-    },
-    [router]
-  );
+  const handleOpen = useCallback((id: string) => router.push(`/workflows/${id}`), [router]);
 
-  // ---- Format relative time ----
   function formatTime(iso: string): string {
     const date = new Date(iso);
     const now = new Date();
@@ -107,7 +84,6 @@ export default function WorkflowListPage() {
     const diffMin = Math.floor(diffMs / 60000);
     const diffHr = Math.floor(diffMin / 60);
     const diffDay = Math.floor(diffHr / 24);
-
     if (diffMin < 1) return t("wfList.justNow");
     if (diffMin < 60) return t("wfList.minAgo").replace("{n}", String(diffMin));
     if (diffHr < 24) return t("wfList.hrAgo").replace("{n}", String(diffHr));
@@ -115,28 +91,33 @@ export default function WorkflowListPage() {
     return date.toLocaleDateString();
   }
 
-  // ---- Loading state ----
+  // ---- Loading ----
   if (loading) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center space-y-3">
-          <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mx-auto" />
-          <p className="text-sm text-gray-500">{t("wfList.loading")}</p>
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 flex items-center justify-center">
+        <div className="flex flex-col items-center gap-4">
+          <div className="w-10 h-10 border-3 border-blue-500 border-t-transparent rounded-full animate-spin" />
+          <p className="text-sm text-gray-500 font-medium">{t("wfList.loading")}</p>
         </div>
       </div>
     );
   }
 
-  // ---- Error state ----
+  // ---- Error ----
   if (error) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center space-y-3">
-          <p className="text-red-500 font-medium">{t("wfList.loadFailed")}</p>
-          <p className="text-sm text-gray-400">{error}</p>
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 flex items-center justify-center">
+        <div className="bg-white rounded-2xl shadow-lg p-8 max-w-md w-full text-center">
+          <div className="w-16 h-16 bg-red-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
+            <svg className="w-8 h-8 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+            </svg>
+          </div>
+          <h3 className="text-lg font-semibold text-gray-800 mb-2">{t("wfList.loadFailed")}</h3>
+          <p className="text-sm text-gray-500 mb-6">{error}</p>
           <button
             onClick={() => window.location.reload()}
-            className="px-4 py-2 text-sm bg-blue-500 text-white rounded-md hover:bg-blue-600 transition-colors"
+            className="px-6 py-2.5 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors shadow-sm"
           >
             {t("wfList.retry")}
           </button>
@@ -145,28 +126,22 @@ export default function WorkflowListPage() {
     );
   }
 
-  // ---- Empty state ----
+  // ---- Empty ----
   if (workflows.length === 0) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
-        <div className="text-center space-y-5 max-w-md">
-          <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-blue-100 to-indigo-100 flex items-center justify-center mx-auto">
-            <Workflow size={32} className="text-blue-500" />
+      <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50/30 flex items-center justify-center p-6">
+        <div className="bg-white rounded-2xl shadow-lg p-10 max-w-lg w-full text-center">
+          <div className="w-20 h-20 bg-gradient-to-br from-blue-100 to-indigo-100 rounded-2xl flex items-center justify-center mx-auto mb-6">
+            <Workflow size={36} className="text-blue-500" />
           </div>
-          <div className="space-y-2">
-            <h2 className="text-xl font-semibold text-gray-800">
-              {t("wfList.emptyTitle")}
-            </h2>
-            <p className="text-sm text-gray-400">
-              {t("wfList.emptyDesc")}
-            </p>
-          </div>
+          <h2 className="text-2xl font-bold text-gray-800 mb-3">{t("wfList.emptyTitle")}</h2>
+          <p className="text-gray-500 mb-8 leading-relaxed">{t("wfList.emptyDesc")}</p>
           <button
             onClick={handleCreate}
             disabled={creating}
-            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+            className="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md hover:shadow-lg disabled:opacity-50"
           >
-            <Plus size={16} />
+            <Plus size={18} />
             {t("wfList.createFirst")}
           </button>
         </div>
@@ -174,24 +149,25 @@ export default function WorkflowListPage() {
     );
   }
 
-  // ---- Main grid layout ----
+  // ---- Main ----
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
       {/* Header */}
-      <header className="bg-white border-b border-gray-200 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+      <header className="bg-white/80 backdrop-blur-sm border-b border-gray-200 sticky top-0 z-10">
+        <div className="max-w-7xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-md bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center">
-              <span className="text-white text-xs font-bold">MA</span>
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-sm">
+              <span className="text-white text-sm font-bold">MA</span>
             </div>
-            <h1 className="text-lg font-semibold text-gray-800">
-              {t("toolbar.appTitle")}
-            </h1>
+            <div>
+              <h1 className="text-lg font-bold text-gray-900">{t("toolbar.appTitle")}</h1>
+              <p className="text-xs text-gray-400">AI Multi-Agent Workflow Platform</p>
+            </div>
           </div>
           <button
             onClick={handleCreate}
             disabled={creating}
-            className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50"
           >
             <Plus size={16} />
             {t("wfList.newWorkflow")}
@@ -199,46 +175,53 @@ export default function WorkflowListPage() {
         </div>
       </header>
 
-      {/* Workflow grid */}
-      <main className="max-w-7xl mx-auto px-6 py-6">
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+      {/* Grid */}
+      <main className="max-w-7xl mx-auto px-6 py-8">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
           {workflows.map((wf) => (
             <div
               key={wf.id}
               onClick={() => handleOpen(wf.id)}
-              className="group bg-white rounded-xl border border-gray-200 p-5 cursor-pointer hover:border-blue-300 hover:shadow-md transition-all"
+              className="group bg-white rounded-xl border border-gray-200 p-6 cursor-pointer hover:border-blue-300 hover:shadow-lg transition-all duration-200 relative overflow-hidden"
             >
-              {/* Card header */}
-              <div className="flex items-start justify-between gap-2">
+              {/* Accent bar */}
+              <div className="absolute top-0 left-0 right-0 h-1 bg-gradient-to-r from-blue-500 to-indigo-500 opacity-0 group-hover:opacity-100 transition-opacity" />
+
+              <div className="flex items-start justify-between gap-3">
                 <div className="flex-1 min-w-0">
-                  <h3 className="text-sm font-semibold text-gray-800 truncate group-hover:text-blue-600 transition-colors">
-                    {wf.name}
-                  </h3>
+                  <div className="flex items-center gap-2 mb-2">
+                    <div className="w-8 h-8 rounded-lg bg-blue-50 flex items-center justify-center shrink-0">
+                      <Workflow size={16} className="text-blue-500" />
+                    </div>
+                    <h3 className="text-sm font-semibold text-gray-800 truncate group-hover:text-blue-600 transition-colors">
+                      {wf.name}
+                    </h3>
+                  </div>
                   {wf.description && (
-                    <p className="text-xs text-gray-400 mt-1 line-clamp-2">
-                      {wf.description}
-                    </p>
+                    <p className="text-xs text-gray-400 line-clamp-2 ml-10">{wf.description}</p>
                   )}
                 </div>
                 <button
                   onClick={(e) => handleDelete(wf.id, e)}
-                  className="p-1.5 rounded-md text-gray-300 hover:text-red-500 hover:bg-red-50 opacity-0 group-hover:opacity-100 transition-all"
+                  className="p-2 rounded-lg text-gray-300 hover:text-red-500 hover:bg-red-50 opacity-0 group-hover:opacity-100 transition-all"
                   title={t("wfList.deleteTooltip")}
                 >
                   <Trash2 size={14} />
                 </button>
               </div>
 
-              {/* Card footer: metadata */}
-              <div className="flex items-center gap-4 mt-4 text-xs text-gray-400">
-                <div className="flex items-center gap-1">
-                  <Clock size={12} />
-                  {formatTime(wf.updated_at)}
+              <div className="flex items-center justify-between mt-5 pt-4 border-t border-gray-100">
+                <div className="flex items-center gap-4 text-xs text-gray-400">
+                  <span className="flex items-center gap-1.5">
+                    <Clock size={12} />
+                    {formatTime(wf.updated_at)}
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <Play size={12} />
+                    {t("wfList.runs").replace("{n}", String(getRunCount(wf.id)))}
+                  </span>
                 </div>
-                <div className="flex items-center gap-1">
-                  <Play size={12} />
-                  {t("wfList.runs").replace("{n}", String(getRunCount(wf.id)))}
-                </div>
+                <ArrowRight size={16} className="text-gray-300 group-hover:text-blue-500 transition-colors" />
               </div>
             </div>
           ))}

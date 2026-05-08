@@ -10,7 +10,7 @@ const PlanNode = memo(function PlanNode(props: NodeProps) {
   return (
     <BaseNode {...props}>
       <span className="inline-block rounded bg-green-100 px-1.5 py-0.5 text-green-700 text-xs font-medium">
-        Read-only
+        只读模式
       </span>
     </BaseNode>
   );

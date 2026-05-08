@@ -13,11 +13,11 @@ const ReviewNode = memo(function ReviewNode(props: NodeProps) {
   );
 
   const statusLabels: Record<string, string> = {
-    idle: "Waiting",
-    running: "Reviewing",
-    paused: "Awaiting review",
-    completed: "Reviewed",
-    failed: "Review failed",
+    idle: "等待中",
+    running: "审查中",
+    paused: "等待审批",
+    completed: "已审查",
+    failed: "审查失败",
   };
 
   return (

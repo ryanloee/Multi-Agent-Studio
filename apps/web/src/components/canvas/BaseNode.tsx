@@ -90,9 +90,10 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
   return (
     <div
       className={[
-        "relative w-[200px] rounded-md border bg-white shadow-sm transition-shadow",
+        "relative rounded-md border bg-white shadow-sm transition-shadow",
         selected ? "ring-2 ring-blue-500" : "",
       ].join(" ")}
+      style={{ width: 200 }}
     >
       {/* Handles */}
       <Handle
