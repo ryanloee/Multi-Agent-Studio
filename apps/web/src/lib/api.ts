@@ -8,6 +8,8 @@ import type {
   ModelInfo,
   ApiError,
 } from "@/types/api";
+import type { AppSettings } from "@/types/settings";
+import type { PathValidateResult, ModelTestResult } from "@/types/settings";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -246,8 +248,10 @@ export const api = {
     request<void>(`/runs/${id}/reject`, { method: "POST" }),
 
   /** Get the diff for a paused run (Human-in-the-Loop) */
-  getRunDiff: (id: string): Promise<string> =>
-    request<string>(`/runs/${id}/diff`),
+  getRunDiff: async (id: string): Promise<string> => {
+    const data = await request<{ run_id: string; diff: string; node_id?: string }>(`/runs/${id}/diff`);
+    return data.diff ?? "";
+  },
 
   // ---- Tasks ----
 
@@ -341,4 +345,37 @@ export const api = {
     const data = await request<{ models: ModelInfo[] }>("/models");
     return data.models ?? [];
   },
+
+  // ---- Settings ----
+
+  /** Get global application settings */
+  getSettings: (): Promise<AppSettings> =>
+    request<AppSettings>("/settings"),
+
+  /** Update global application settings (partial merge) */
+  updateSettings: (settings: AppSettings): Promise<AppSettings> =>
+    request<AppSettings>("/settings", {
+      method: "PUT",
+      body: JSON.stringify(settings),
+    }),
+
+  /** Validate a filesystem path */
+  validatePath: (path: string): Promise<PathValidateResult> =>
+    request<PathValidateResult>("/settings/validate-path", {
+      method: "POST",
+      body: JSON.stringify({ path }),
+    }),
+
+  /** Test model provider URL connectivity */
+  testModelUrl: (params: { format: string; base_url: string; api_key: string; default_model?: string }): Promise<ModelTestResult> =>
+    request<ModelTestResult>("/settings/test-model-url", {
+      method: "POST",
+      body: JSON.stringify(params),
+    }),
+
+  // ---- Planner Chat ----
+
+  /** Load persisted chat history for a workflow + node */
+  getChatHistory: (workflowId: string, nodeId: string = "planner"): Promise<import("@/types/settings").ChatHistoryItem[]> =>
+    request<import("@/types/settings").ChatHistoryItem[]>(`/planner/history/${workflowId}?node_id=${nodeId}`),
 };

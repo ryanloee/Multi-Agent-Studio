@@ -10,6 +10,7 @@ import {
   Filter,
   X,
   MessageSquare,
+  MessageCircle,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -20,18 +21,21 @@ import LLMOutput from "./LLMOutput";
 import XtermStream from "./XtermStream";
 import ToolCallList from "./ToolCallList";
 import CommunicationPanel from "./CommunicationPanel";
+import PlannerChatTab from "./PlannerChatTab";
 
 // ---------------------------------------------------------------------------
-// Tab definitions
+// Tab definitions — Chat tab is added dynamically when in auto mode
 // ---------------------------------------------------------------------------
-const TABS = [
+const BASE_TABS = [
   { key: "llm", labelKey: "output.tab.llm", icon: Brain },
   { key: "shell", labelKey: "output.tab.shell", icon: Terminal },
   { key: "tools", labelKey: "output.tab.tools", icon: Wrench },
   { key: "comm", labelKey: "output.tab.comm", icon: MessageSquare },
 ] as const;
 
-type TabKey = (typeof TABS)[number]["key"];
+const CHAT_TAB = { key: "chat", labelKey: "output.tab.chat", icon: MessageCircle } as const;
+
+type TabKey = "llm" | "shell" | "tools" | "comm" | "chat";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -79,7 +83,13 @@ export default function OutputPanel() {
 
   // Node list from workflow store for the filter dropdown
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
+  const mode = useWorkflowStore((s) => s.mode);
   const t = useLocaleStore((s) => s.t);
+
+  // Build tab list: add Chat tab in auto mode
+  const TABS = mode === "auto"
+    ? [...BASE_TABS, CHAT_TAB]
+    : BASE_TABS;
 
   // Run state
   const runStatus = useRunStore((s) => s.status);
@@ -276,6 +286,7 @@ export default function OutputPanel() {
             {activeTab === "shell" && <XtermStream nodeId={filterNodeId} />}
             {activeTab === "tools" && <ToolCallList nodeId={filterNodeId} />}
             {activeTab === "comm" && <CommunicationPanel nodeId={filterNodeId} />}
+            {activeTab === "chat" && <PlannerChatTab />}
           </div>
         </>
       )}

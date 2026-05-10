@@ -29,6 +29,7 @@ interface WorkflowState {
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   selectedNodeId: string | null;
+  selectedEdgeId: string | null;
 
   // Current workflow identity + workspace directory
   currentWorkflowId: string | null;
@@ -61,12 +62,16 @@ interface WorkflowState {
   // Connection handler with validation
   onConnect: OnConnect;
 
+  // Edge configuration
+  updateEdgeData: (id: string, data: Partial<import("@/types/workflow").EdgeData>) => void;
+
   // Bulk operations
   loadWorkflow: (workflow: WorkflowDetail) => void;
   clearCanvas: () => void;
 
   // Selection
   setSelectedNode: (id: string | null) => void;
+  setSelectedEdge: (id: string | null) => void;
 
   // Focus + highlight a node on the canvas (triggers fitView animation)
   focusNodeId: string | null;
@@ -96,6 +101,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   nodes: [],
   edges: [],
   selectedNodeId: null,
+  selectedEdgeId: null,
   focusNodeId: null,
   currentWorkflowId: null,
   workspaceDirectory: "",
@@ -149,6 +155,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       nodes: get().nodes.filter((node) => node.id !== id),
       edges: get().edges.filter((edge) => edge.source !== id && edge.target !== id),
       selectedNodeId: get().selectedNodeId === id ? null : get().selectedNodeId,
+      selectedEdgeId: null,
     });
   },
 
@@ -282,12 +289,24 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set({ edges: [...edges, newEdge] });
   },
 
+  // ---- Edge configuration ----
+  updateEdgeData: (id: string, data: Partial<import("@/types/workflow").EdgeData>) => {
+    set({
+      edges: get().edges.map((edge) =>
+        edge.id === id
+          ? { ...edge, data: { ...(edge.data ?? {}), ...data } }
+          : edge
+      ),
+    });
+  },
+
   // ---- Bulk operations ----
   loadWorkflow: (workflow: WorkflowDetail) => {
     set({
       nodes: workflow.nodes as WorkflowNode[],
       edges: workflow.edges as WorkflowEdge[],
       selectedNodeId: null,
+      selectedEdgeId: null,
       currentWorkflowId: workflow.id,
       workspaceDirectory: workflow.workspace_directory ?? "",
       mode: (workflow.mode as "auto" | "manual") ?? "manual",
@@ -300,6 +319,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       nodes: [],
       edges: [],
       selectedNodeId: null,
+      selectedEdgeId: null,
       mode: "manual",
       goal: "",
     });
@@ -307,7 +327,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
   // ---- Selection ----
   setSelectedNode: (id: string | null) => {
-    set({ selectedNodeId: id });
+    set({ selectedNodeId: id, selectedEdgeId: id ? null : get().selectedEdgeId });
+  },
+
+  setSelectedEdge: (id: string | null) => {
+    set({ selectedEdgeId: id, selectedNodeId: id ? null : get().selectedNodeId });
   },
 
   // ---- Focus node on canvas ----
@@ -330,8 +354,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   // ---- Mode & goal ----
   updateMode: async (mode: "auto" | "manual") => {
     const { currentWorkflowId } = get();
-    if (!currentWorkflowId) return;
+    // Always update local state immediately (optimistic)
     set({ mode });
+    if (!currentWorkflowId) return;
     try {
       await api.updateWorkflow(currentWorkflowId, { mode });
     } catch (err) {
@@ -341,8 +366,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
   updateGoal: async (goal: string) => {
     const { currentWorkflowId } = get();
-    if (!currentWorkflowId) return;
+    // Always update local state immediately (optimistic)
     set({ goal });
+    if (!currentWorkflowId) return;
     try {
       await api.updateWorkflow(currentWorkflowId, { goal });
     } catch (err) {

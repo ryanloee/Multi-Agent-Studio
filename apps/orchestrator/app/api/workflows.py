@@ -46,6 +46,30 @@ async def create_workflow(
         mode=body.mode or "manual",
         goal=body.goal,
     )
+
+    # Auto mode: initialize with a default Planner node
+    if (body.mode or "manual") == "auto" and body.dag_json is None:
+        workflow.dag_json = {
+            "nodes": [
+                {
+                    "id": "planner",
+                    "type": "plan",
+                    "position": {"x": 300, "y": 200},
+                    "data": {
+                        "label": "Planner",
+                        "agentType": "plan",
+                        "modelProvider": "",
+                        "modelId": "",
+                        "prompt": body.goal or "",
+                        "permissions": {},
+                        "command": "",
+                        "description": "",
+                    },
+                }
+            ],
+            "edges": [],
+        }
+
     db.add(workflow)
     await db.flush()
     await db.refresh(workflow)

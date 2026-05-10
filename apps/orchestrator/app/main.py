@@ -29,6 +29,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.models import router as models_router
 from app.api.runs import router as runs_router, init_engine as init_runs_engine
+from app.api.planner_chat import router as planner_chat_router
+from app.api.settings import router as settings_router
 from app.api.tasks import router as tasks_router, init_task_deps as init_tasks_deps
 from app.api.workflows import router as workflows_router
 from app.config import settings
@@ -38,6 +40,7 @@ from app.core.local_engine import LocalDAGExecutor
 from app.core.local_sandbox import LocalSandbox
 from app.models.db import Base
 from app.models.task import Task, TaskMessage  # noqa: F401 — ensure tables are registered
+from app.models.db import ChatMessage  # noqa: F401 — ensure chat_messages table is registered
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
 from app.ws.hub import WebSocketHub
@@ -71,6 +74,10 @@ async def lifespan(app: FastAPI):
                     "will recreate database"
                 )
                 needs_reset = True
+            # Check for chat_messages table (new table for context persistence)
+            result2 = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_messages'"))
+            if not result2.fetchone():
+                logger.info("Schema migration: chat_messages table not found, will be created by create_all")
         if needs_reset:
             await db_engine.dispose()
             db_path.unlink(missing_ok=True)
@@ -128,6 +135,8 @@ app.add_middleware(
 
 app.include_router(workflows_router, prefix="/api/workflows", tags=["workflows"])
 app.include_router(runs_router, prefix="/api/runs", tags=["runs"])
+app.include_router(planner_chat_router, prefix="/api/planner", tags=["planner"])
+app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
 app.include_router(tasks_router, prefix="/api/runs", tags=["tasks"])
 app.include_router(models_router, prefix="/api/models", tags=["models"])
 

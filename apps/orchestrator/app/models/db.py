@@ -42,6 +42,9 @@ class Workflow(Base):
     runs: Mapped[list["Run"]] = relationship(
         "Run", back_populates="workflow", cascade="all, delete-orphan",
     )
+    chat_messages: Mapped[list["ChatMessage"]] = relationship(
+        "ChatMessage", back_populates="workflow", cascade="all, delete-orphan",
+    )
 
 
 class Run(Base):
@@ -106,3 +109,35 @@ class NodeExecution(Base):
 
     # Relationships
     run: Mapped["Run"] = relationship("Run", back_populates="node_executions")
+
+
+class ChatMessage(Base):
+    """Persisted chat messages for planner/node conversations in a workflow.
+
+    Supports resuming conversations after page reload or app restart.
+    Each message is associated with a workflow and optionally a specific node.
+    """
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4,
+    )
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    node_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, server_default="planner",
+    )
+    role: Mapped[str] = mapped_column(
+        String(20), nullable=False,
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(),
+    )
+
+    # Relationships
+    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="chat_messages")

@@ -2,14 +2,17 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2, Workflow, Clock, Play, ArrowRight, Target, PenLine } from "lucide-react";
+import { Plus, Trash2, Workflow, Clock, Play, ArrowRight, Target, PenLine, Settings } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLocaleStore } from "@/stores/localeStore";
+import { useSettingsStore } from "@/stores/settingsStore";
+import SettingsModal from "@/components/settings/SettingsModal";
 import type { WorkflowSummary, RunInfo } from "@/types/api";
 
 export default function WorkflowListPage() {
   const router = useRouter();
   const t = useLocaleStore((s) => s.t);
+  const openSettings = useSettingsStore((s) => s.openModal);
 
   const [workflows, setWorkflows] = useState<WorkflowSummary[]>([]);
   const [runs, setRuns] = useState<RunInfo[]>([]);
@@ -207,44 +210,53 @@ export default function WorkflowListPage() {
               <p className="text-xs text-gray-400">AI Multi-Agent Workflow Platform</p>
             </div>
           </div>
-          <div className="relative" ref={createMenuRef}>
+          <div className="flex items-center gap-3">
             <button
-              onClick={() => setShowCreateMenu((v) => !v)}
-              disabled={creating}
-              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50"
+              onClick={openSettings}
+              className="p-2.5 rounded-xl text-gray-500 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+              title={t("settings.title")}
             >
-              <Plus size={16} />
-              {t("wfList.newWorkflow")}
+              <Settings size={20} />
             </button>
+            <div className="relative" ref={createMenuRef}>
+              <button
+                onClick={() => setShowCreateMenu((v) => !v)}
+                disabled={creating}
+                className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50"
+              >
+                <Plus size={16} />
+                {t("wfList.newWorkflow")}
+              </button>
 
-            {showCreateMenu && (
-              <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-lg border border-gray-200 py-2 z-20">
-                <button
-                  onClick={() => { setShowCreateMenu(false); handleCreate("auto"); }}
-                  className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-blue-50 transition-colors"
-                >
-                  <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center shrink-0">
-                    <Target size={16} className="text-blue-600" />
-                  </div>
-                  <div>
-                    <p className="text-sm font-semibold text-gray-800">{t("workflow.modeAuto")}</p>
-                    <p className="text-xs text-gray-400 mt-0.5">{t("workflow.modeAutoDesc")}</p>
-                  </div>
-                </button>
-                <button
-                  onClick={() => { setShowCreateMenu(false); handleCreate("manual"); }}
-                  className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
-                >
-                  <div className="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0">
-                    <PenLine size={16} className="text-gray-600" />
-                  </div>
-                  <div>
-                    <p className="text-sm font-semibold text-gray-800">{t("workflow.modeManual")}</p>
-                    <p className="text-xs text-gray-400 mt-0.5">{t("workflow.modeManualDesc")}</p>
-                  </div>
-                </button>
-              </div>
-            )}
+              {showCreateMenu && (
+                <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-lg border border-gray-200 py-2 z-20">
+                  <button
+                    onClick={() => { setShowCreateMenu(false); handleCreate("auto"); }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-blue-50 transition-colors"
+                  >
+                    <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center shrink-0">
+                      <Target size={16} className="text-blue-600" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-gray-800">{t("workflow.modeAuto")}</p>
+                      <p className="text-xs text-gray-400 mt-0.5">{t("workflow.modeAutoDesc")}</p>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => { setShowCreateMenu(false); handleCreate("manual"); }}
+                    className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
+                  >
+                    <div className="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0">
+                      <PenLine size={16} className="text-gray-600" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-semibold text-gray-800">{t("workflow.modeManual")}</p>
+                      <p className="text-xs text-gray-400 mt-0.5">{t("workflow.modeManualDesc")}</p>
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       </header>
@@ -270,6 +282,18 @@ export default function WorkflowListPage() {
                     <h3 className="text-sm font-semibold text-gray-800 truncate group-hover:text-blue-600 transition-colors">
                       {wf.name}
                     </h3>
+                    {/* Mode badge */}
+                    {wf.mode === "auto" ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700">
+                        <Target size={10} />
+                        {t("workflow.modeAuto")}
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-600">
+                        <PenLine size={10} />
+                        {t("workflow.modeManual")}
+                      </span>
+                    )}
                   </div>
                   {wf.description && (
                     <p className="text-xs text-gray-400 line-clamp-2 ml-10">{wf.description}</p>
@@ -301,6 +325,9 @@ export default function WorkflowListPage() {
           ))}
         </div>
       </main>
+
+      {/* Global Settings Modal */}
+      <SettingsModal />
     </div>
   );
 }

@@ -121,6 +121,7 @@ class LocalDAGExecutor:
             "status": "running",
             "task": task,
             "cancel_event": cancel_event,
+            "global_config": global_config or {},
         }
         logger.info("DAG task created for run %s with %d layers", run_id, len(layers))
         return run_id
@@ -181,6 +182,55 @@ class LocalDAGExecutor:
             if ev_type in ("llm_token", "llm_chunk", "text"):
                 parts.append(ev.get("content", ""))
         return "".join(parts)
+
+    async def _route_escalation(
+        self, run_id: str, source_node_id: str, message: str
+    ) -> None:
+        """Route an escalation from a worker to its upstream node.
+
+        In auto mode, the planner is always the upstream — the existing
+        TaskScheduler handles this.  In manual mode, we look up the
+        edges to find the direct upstream node(s) and emit a
+        ``escalation_routed`` event targeting them.  The UI can then
+        display the escalation in the upstream node's output panel.
+
+        If the upstream node has already completed, we inject the
+        escalation as a new message into the run's event stream.
+        """
+        run_state = self._runs.get(run_id, {})
+        global_config = run_state.get("global_config", {})
+        edges: list[dict] = global_config.get("_edges", [])
+
+        # Find upstream nodes (edges where source_node_id is the target)
+        upstream_ids = [
+            e["source"] for e in edges
+            if e.get("target") == source_node_id
+        ]
+
+        if not upstream_ids:
+            logger.info(
+                "Escalation from %s: no upstream node found in edges, "
+                "broadcasting to run",
+                source_node_id,
+            )
+            # No upstream — just broadcast
+            await self._emit(
+                "escalation_broadcast", run_id, source_node_id,
+                content=message,
+            )
+            return
+
+        # Route to all upstream nodes (typically just one in serial chains)
+        for upstream_id in upstream_ids:
+            logger.info(
+                "Escalation from %s routed to upstream %s: %s",
+                source_node_id, upstream_id, message[:100],
+            )
+            await self._emit(
+                "escalation_routed", run_id, upstream_id,
+                content=message,
+                source_node_id=source_node_id,
+            )
 
     def _build_upstream_context(
         self,
@@ -370,6 +420,12 @@ class LocalDAGExecutor:
                     if _sid:
                         sandbox_map[node_id] = _sid
 
+                        # Persist to run state for API access
+                        run_state = self._runs.get(run_id, {})
+                        if not run_state.get("_sandbox_map"):
+                            run_state["_sandbox_map"] = {}
+                        run_state["_sandbox_map"][node_id] = _sid
+
                         # Post-node git checkpoint + commit_map tracking
                         try:
                             commit_hash = await self._checkpoint.auto_commit(
@@ -377,6 +433,12 @@ class LocalDAGExecutor:
                             )
                             if commit_hash:
                                 commit_map[node_id] = commit_hash
+
+                                # Persist to run state for API access
+                                run_state = self._runs.get(run_id, {})
+                                if not run_state.get("_commit_map"):
+                                    run_state["_commit_map"] = {}
+                                run_state["_commit_map"][node_id] = commit_hash
                         except Exception:
                             pass
 
@@ -441,10 +503,22 @@ class LocalDAGExecutor:
             await self._emit("run_started", run_id, "")
             edges = global_config.get("_edges", [])
 
-            await self._execute_layers(
+            layer_results = await self._execute_layers(
                 run_id, layers, edges, global_config, cancel_event,
                 workspace_directory=workspace_directory,
             )
+
+            # Persist commit_map and sandbox_map into _runs for API access
+            run_state = self._runs.get(run_id, {})
+            run_state["_commit_map"] = run_state.get("_commit_map", {})
+            run_state["_sandbox_map"] = run_state.get("_sandbox_map", {})
+            # Store initial commit hash (first checkpoint of the run)
+            if "_initial" not in run_state.get("_commit_map", {}):
+                commit_map = run_state.get("_commit_map", {})
+                # The first entry by time is the initial commit
+                if commit_map:
+                    first_key = next(iter(commit_map))
+                    run_state["_commit_map"]["_initial"] = commit_map[first_key]
 
             status = "cancelled" if cancel_event.is_set() else "completed"
             self._runs[run_id]["status"] = status
@@ -540,6 +614,68 @@ class LocalDAGExecutor:
 
             if agent_type == "plan":
                 prompt = prompt + PLAN_SYSTEM_SUFFIX
+
+            # --- Human-in-the-Loop: pause execution and wait for approval ---
+            if agent_type == "human":
+                logger.info("HITL node %s: pausing run %s for human approval", node_id, run_id)
+
+                # Emit paused event
+                await self._emit("status", run_id, node_id, content="paused")
+                await self._emit("node_paused", run_id, node_id, content="Awaiting human approval")
+
+                # Update run status to paused in DB
+                await self._update_run_status_db(run_id, "paused")
+
+                # Register an asyncio.Event that the approve/reject API will set
+                approval_event = asyncio.Event()
+                from app.api.runs import set_approval_event, _approval_results, clear_approval
+                set_approval_event(run_id, approval_event)
+
+                # Wait for approval (with periodic cancel_event checks)
+                while not approval_event.is_set() and not cancel_event.is_set():
+                    try:
+                        await asyncio.wait_for(approval_event.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    break
+
+                # Check the result
+                approval_info = _approval_results.get(run_id, {})
+                approved = approval_info.get("approved", False)
+                reason = approval_info.get("reason", "")
+
+                # Clean up
+                clear_approval(run_id)
+
+                if not approved:
+                    logger.info("HITL node %s: REJECTED (reason: %s)", node_id, reason)
+                    await self._emit("node_rejected", run_id, node_id, content=reason)
+                    state = "failed"
+                    result: dict[str, Any] = {
+                        "state": state,
+                        "exit_code": 1,
+                        "node_id": node_id,
+                        "sandbox_id": sandbox_id,
+                        "error": f"Human rejected: {reason}",
+                    }
+                    await self._emit("node_failed", run_id, node_id, content="Human rejected")
+                    await self._emit("status", run_id, node_id, content=state)
+                    return result
+
+                logger.info("HITL node %s: APPROVED", node_id)
+                await self._emit("node_approved", run_id, node_id, content="Human approved")
+
+                # Human approved — continue execution. Human node
+                # "completes" successfully, downstream nodes proceed.
+                state = "completed"
+                await self._emit("node_completed", run_id, node_id, content="Human approved")
+                await self._emit("status", run_id, node_id, content=state)
+                return {
+                    "state": state,
+                    "exit_code": 0,
+                    "node_id": node_id,
+                    "sandbox_id": sandbox_id,
+                }
 
             # Inject escalation protocol for non-plan, non-human nodes (manual mode)
             if agent_type != "plan" and agent_type != "human":
@@ -741,6 +877,9 @@ class LocalDAGExecutor:
                     await self._emit(
                         "worker_escalation", run_id, node_id, content=escalation_msg,
                     )
+                    # In manual mode, route the escalation to the upstream node
+                    # based on the edges defined in the workflow.
+                    await self._route_escalation(run_id, node_id, escalation_msg)
                 await self._emit("shell_stdout", run_id, node_id, content=line)
 
         return len(log_content)

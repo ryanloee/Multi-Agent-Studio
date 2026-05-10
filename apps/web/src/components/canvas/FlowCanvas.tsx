@@ -15,7 +15,6 @@ import "@xyflow/react/dist/style.css";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { nodeTypes } from "@/components/canvas/nodeTypes";
-import GoalInput from "@/components/canvas/GoalInput";
 import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow";
 import { NODE_META } from "@/lib/constants";
 import type { ChildCreatedEvent } from "@/types/events";
@@ -32,13 +31,10 @@ export default function FlowCanvas() {
   const setFocusNode = useWorkflowStore((s) => s.setFocusNode);
   const mode = useWorkflowStore((s) => s.mode);
 
-  const runStatus = useRunStore((s) => s.status);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const allEvents = useRunStore((s) => s.events);
   const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
-
-  // Derive whether the workflow is actively running
-  const isRunning = runStatus === "running" || runStatus === "pending" || runStatus === "paused";
+  const setSelectedEdge = useWorkflowStore((s) => s.setSelectedEdge);
 
   // ---- Sync child_created events into workflowStore as real nodes ----
   useEffect(() => {
@@ -107,7 +103,17 @@ export default function FlowCanvas() {
   const onPaneClick = useCallback(() => {
     setSelectedNode(null);
     setSelectedRunNode(null);
-  }, [setSelectedNode, setSelectedRunNode]);
+    setSelectedEdge(null);
+  }, [setSelectedNode, setSelectedRunNode, setSelectedEdge]);
+
+  // ---- Edge click: select edge for configuration ----
+  const onEdgeClick = useCallback(
+    (_event: React.MouseEvent, edge: WorkflowEdge) => {
+      setSelectedEdge(edge.id);
+      setSelectedRunNode(null);
+    },
+    [setSelectedEdge, setSelectedRunNode]
+  );
 
   // ---- Focus node when focusNodeId changes (e.g. from TaskBoard click) ----
   useEffect(() => {
@@ -131,11 +137,6 @@ export default function FlowCanvas() {
   // ---- Child nodes are added to workflowStore via addDynamicNode ----
   // No merge needed — staticNodes already contains them.
 
-  // Auto mode + NOT running: show GoalInput instead of canvas
-  if (mode === "auto" && !isRunning) {
-    return <GoalInput />;
-  }
-
   return (
     <div className="w-full h-full relative">
       <ReactFlow
@@ -149,6 +150,7 @@ export default function FlowCanvas() {
         onDrop={mode === "auto" ? undefined : onDrop}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
+        onEdgeClick={onEdgeClick}
         nodeTypes={nodeTypes}
         snapToGrid
         snapGrid={[16, 16]}
@@ -157,7 +159,6 @@ export default function FlowCanvas() {
         maxZoom={2}
         nodesDraggable={mode !== "auto"}
         nodesConnectable={mode !== "auto"}
-        elementsSelectable={mode !== "auto"}
         deleteKeyCode={mode === "auto" ? null : undefined}
       >
         <Background gap={16} size={1} />
@@ -174,17 +175,38 @@ export default function FlowCanvas() {
       {staticNodes.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none z-10">
           <div className="text-center space-y-3 max-w-sm px-4">
-            <div className="w-12 h-12 rounded-xl bg-blue-50 flex items-center justify-center mx-auto">
-              <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-              </svg>
+            <div className={`w-12 h-12 rounded-xl flex items-center justify-center mx-auto ${
+              mode === "auto" ? "bg-blue-50" : "bg-blue-50"
+            }`}>
+              {mode === "auto" ? (
+                <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+                </svg>
+              ) : (
+                <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                </svg>
+              )}
             </div>
-            <p className="text-gray-500 text-base font-medium">
-              从左侧节点库拖拽节点到此处
-            </p>
-            <p className="text-gray-400 text-sm leading-relaxed">
-              先拖一个「规划器」作为起点，再拖「编码器」「审查器」等节点，用连线把它们串起来，就是一个自动化工作流。
-            </p>
+            {mode === "auto" ? (
+              <>
+                <p className="text-gray-500 text-base font-medium">
+                  自动规划模式
+                </p>
+                <p className="text-gray-400 text-sm leading-relaxed">
+                  在底部面板的 Chat 标签页中与规划器对话，描述你的目标，规划器会自动构建工作流。
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-gray-500 text-base font-medium">
+                  从左侧节点库拖拽节点到此处
+                </p>
+                <p className="text-gray-400 text-sm leading-relaxed">
+                  先拖一个「规划器」作为起点，再拖「编码器」「审查器」等节点，用连线把它们串起来，就是一个自动化工作流。
+                </p>
+              </>
+            )}
           </div>
         </div>
       )}

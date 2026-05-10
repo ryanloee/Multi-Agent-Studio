@@ -1,0 +1,28 @@
+{
+  "general": {
+    "language": "zh",
+    "default_workspace": ""
+  },
+  "display": {
+    "theme": "dark",
+    "compact_mode": true
+  },
+  "models": [
+    {
+      "id": "model_1778427756854_1",
+      "name": "mimo-v2.5-pro",
+      "format": "anthropic",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
+      "api_key": "tp-cirgolhviac2hnnqvdsxoj5xdndt0my7ye8jf4601qkvvkml",
+      "default_model": "mimo-v2.5-pro"
+    },
+    {
+      "id": "model_1778427763343_2",
+      "name": "mimo-v2.5",
+      "format": "anthropic",
+      "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
+      "api_key": "tp-cirgolhviac2hnnqvdsxoj5xdndt0my7ye8jf4601qkvvkml",
+      "default_model": "mimo-v2.5"
+    }
+  ]
+}

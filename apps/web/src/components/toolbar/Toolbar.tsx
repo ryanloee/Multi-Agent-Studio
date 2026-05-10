@@ -8,6 +8,8 @@ import {
   Loader2,
   Globe,
   Check,
+  Target,
+  PenLine,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -31,6 +33,7 @@ export default function Toolbar({
 }: ToolbarProps) {
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
+  const mode = useWorkflowStore((s) => s.mode);
 
   const runId = useRunStore((s) => s.runId);
   const status = useRunStore((s) => s.status);
@@ -144,8 +147,9 @@ export default function Toolbar({
         </a>
       </div>
 
-      {/* Center: Workflow name */}
-      <div className="flex-1 flex justify-center">
+      {/* Center: Workflow name + Mode toggle */}
+      <div className="flex-1 flex justify-center items-center gap-3">
+        {/* Workflow name */}
         {editingName ? (
           <input
             autoFocus
@@ -167,6 +171,16 @@ export default function Toolbar({
             {workflowName || t("toolbar.untitled")}
           </button>
         )}
+
+        {/* Mode badge (read-only, set at creation time) */}
+        <div className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none ${
+          mode === "auto"
+            ? "bg-blue-100 text-blue-700"
+            : "bg-gray-100 text-gray-600"
+        }`}>
+          {mode === "auto" ? <Target size={12} /> : <PenLine size={12} />}
+          {mode === "auto" ? t("workflow.modeAuto") : t("workflow.modeManual")}
+        </div>
       </div>
 
       {/* Right: Actions */}

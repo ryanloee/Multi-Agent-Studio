@@ -36,6 +36,8 @@ export interface WorkflowSummary {
   id: string;
   name: string;
   description: string;
+  /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
+  mode?: string;
   /** ISO timestamp of last modification */
   updated_at: string;
   /** ISO timestamp of creation */

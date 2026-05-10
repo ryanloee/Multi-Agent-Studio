@@ -42,10 +42,24 @@ export interface NodeData {
 }
 
 // ---------------------------------------------------------------------------
+// Edge Data — the business data stored inside each workflow edge
+// ---------------------------------------------------------------------------
+export interface EdgeData {
+  /** Index signature required for @xyflow/react v12 Edge data compatibility (Record<string, unknown>) */
+  [key: string]: unknown;
+  /** Whether to pass files (reuse sandbox) from source to target */
+  transfer_files?: boolean;
+  /** Whether to inject upstream output summary into downstream prompt */
+  transfer_summary?: boolean;
+  /** Format of data transfer: "summary" | "full" | "diff" */
+  transfer_format?: "summary" | "full" | "diff";
+}
+
+// ---------------------------------------------------------------------------
 // Workflow Node & Edge — typed wrappers around @xyflow/react primitives
 // ---------------------------------------------------------------------------
 export type WorkflowNode = Node<NodeData, AgentNodeType>;
-export type WorkflowEdge = Edge;
+export type WorkflowEdge = Edge<EdgeData>;
 
 // ---------------------------------------------------------------------------
 // Run Status — lifecycle states of a workflow execution
