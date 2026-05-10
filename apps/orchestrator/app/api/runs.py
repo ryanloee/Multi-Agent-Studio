@@ -24,8 +24,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models.db import Run, NodeExecution
-from app.models.schemas import TriggerRunRequest, RunResponse, NodeExecutionResponse
+from app.models.db import NodeExecution, Run
+from app.models.schemas import NodeExecutionResponse, RunResponse, TriggerRunRequest
 
 if TYPE_CHECKING:
     from app.core.local_engine import LocalDAGExecutor
@@ -325,8 +325,12 @@ async def get_run_diff(
     if not initial_hash:
         # Fallback: get the first commit in the log
         try:
-            from app.sandbox.checkpoint import GitCheckpointManager
-            log = await engine._checkpoint.get_log(sandbox_id, max_entries=50) if hasattr(engine._checkpoint, 'get_log') else []
+            if not hasattr(engine._checkpoint, 'get_log'):
+                log = []
+            else:
+                log = await engine._checkpoint.get_log(
+                    sandbox_id, max_entries=50,
+                )
             if log:
                 initial_hash = log[-1]["hash"]  # oldest commit
         except Exception:
