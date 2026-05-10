@@ -6,14 +6,20 @@ GET    /{run_id}             - Get run status
 POST   /{run_id}/cancel      - Cancel a running workflow
 GET    /{run_id}/diff         - Get Git diff (Human-in-the-Loop)
 GET    /{run_id}/nodes        - Get node execution details
+POST   /{run_id}/approve     - Approve a paused run (Human-in-the-Loop)
+POST   /{run_id}/reject      - Reject a paused run (Human-in-the-Loop)
+POST   /{run_id}/rollback    - Rollback to a previous checkpoint
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +29,8 @@ from app.models.schemas import TriggerRunRequest, RunResponse, NodeExecutionResp
 
 if TYPE_CHECKING:
     from app.core.local_engine import LocalDAGExecutor
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -40,6 +48,28 @@ def _require_engine() -> LocalDAGExecutor:
     if _engine is None:
         raise HTTPException(status_code=503, detail="Workflow engine not initialised")
     return _engine
+
+
+# ---------------------------------------------------------------------------
+# HITL approval state — in-memory store for pending approvals
+# ---------------------------------------------------------------------------
+
+# Maps run_id -> asyncio.Event that the engine waits on for approval
+_approval_events: dict[str, asyncio.Event] = {}
+
+# Maps run_id -> {"approved": bool, "reason": str}
+_approval_results: dict[str, dict] = {}
+
+
+def set_approval_event(run_id: str, event: asyncio.Event) -> None:
+    """Register an approval wait event for a run (called by engine)."""
+    _approval_events[run_id] = event
+
+
+def clear_approval(run_id: str) -> None:
+    """Clean up approval state after resolution."""
+    _approval_events.pop(run_id, None)
+    _approval_results.pop(run_id, None)
 
 
 @router.post("/{workflow_id}/run", response_model=RunResponse, status_code=201)
@@ -247,13 +277,72 @@ async def cancel_run(
 
 
 @router.get("/{run_id}/diff")
-async def get_run_diff(run_id: str):
+async def get_run_diff(
+    run_id: UUID,
+    node_id: str | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Get Git diff for Human-in-the-Loop approval panel.
 
-    This queries the GitCheckpointManager for the latest checkpoint diff.
+    Queries the GitCheckpointManager for the diff between the initial
+    checkpoint (before the run started) and the current HEAD of the
+    sandbox used by the specified node (or the last node that executed).
     """
-    # TODO: Integrate with GitCheckpointManager once sandbox tracking is available
-    return {"run_id": run_id, "diff": ""}
+    engine = _require_engine()
+
+    # Find the relevant node to get its sandbox_id and commit history
+    result = await db.execute(
+        select(NodeExecution)
+        .where(NodeExecution.run_id == run_id)
+        .order_by(NodeExecution.started_at.desc())
+    )
+    nodes = result.scalars().all()
+    if not nodes:
+        return {"run_id": str(run_id), "diff": "", "error": "No executed nodes found"}
+
+    # Find the target node or use the most recent one
+    target_node = None
+    if node_id:
+        target_node = next((n for n in nodes if n.node_id == node_id), None)
+    if target_node is None:
+        target_node = nodes[0]
+
+    # Get the commit map from the engine to find the initial and current commits
+    run_state = engine._runs.get(str(run_id))
+    commit_map: dict = {}
+    sandbox_map: dict = {}
+    if run_state and isinstance(run_state, dict):
+        commit_map = run_state.get("_commit_map", {})
+        sandbox_map = run_state.get("_sandbox_map", {})
+
+    # Find the sandbox_id for the target node
+    sandbox_id = sandbox_map.get(target_node.node_id)
+    if not sandbox_id:
+        return {"run_id": str(run_id), "diff": "", "node_id": target_node.node_id}
+
+    # Get the initial commit (first checkpoint) for this run
+    initial_hash = commit_map.get("_initial")
+    if not initial_hash:
+        # Fallback: get the first commit in the log
+        try:
+            from app.sandbox.checkpoint import GitCheckpointManager
+            log = await engine._checkpoint.get_log(sandbox_id, max_entries=50) if hasattr(engine._checkpoint, 'get_log') else []
+            if log:
+                initial_hash = log[-1]["hash"]  # oldest commit
+        except Exception:
+            pass
+
+    if not initial_hash:
+        return {"run_id": str(run_id), "diff": "", "node_id": target_node.node_id}
+
+    # Get diff from initial commit to HEAD
+    try:
+        diff_text = await engine._checkpoint.get_diff(sandbox_id, initial_hash)
+    except Exception as exc:
+        logger.warning("Failed to get diff for run %s: %s", run_id, exc)
+        diff_text = ""
+
+    return {"run_id": str(run_id), "diff": diff_text, "node_id": target_node.node_id}
 
 
 @router.get("/{run_id}/nodes", response_model=list[NodeExecutionResponse])
@@ -270,8 +359,138 @@ async def get_run_nodes(
     return result.scalars().all()
 
 
+class RollbackRequest(BaseModel):
+    """Request body for rollback endpoint."""
+    node_id: str = Field(..., description="Node ID to rollback to (its commit will be restored)")
+    reason: str = Field("", description="Reason for rollback")
+
+
 @router.post("/{run_id}/approve")
-async def approve_run(run_id: str):
-    """Human-in-the-Loop approval."""
-    # TODO: Implement HITL approval via engine
-    return {"status": "approved", "run_id": run_id}
+async def approve_run(
+    run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Human-in-the-Loop approval — resume a paused run."""
+    result = await db.execute(
+        select(Run).where(Run.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != "paused":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in status '{run.status}', expected 'paused'",
+        )
+
+    # Signal approval to the engine
+    _approval_results[str(run_id)] = {"approved": True, "reason": ""}
+    event = _approval_events.get(str(run_id))
+    if event:
+        event.set()
+
+    # Update DB
+    run.status = "running"
+    await db.flush()
+
+    return {"status": "approved", "run_id": str(run_id)}
+
+
+@router.post("/{run_id}/reject")
+async def reject_run(
+    run_id: UUID,
+    reason: str = "",
+    db: AsyncSession = Depends(get_db),
+):
+    """Human-in-the-Loop rejection — mark run as rejected/failed."""
+    result = await db.execute(
+        select(Run).where(Run.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status != "paused":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Run is in status '{run.status}', expected 'paused'",
+        )
+
+    # Signal rejection to the engine
+    _approval_results[str(run_id)] = {"approved": False, "reason": reason}
+    event = _approval_events.get(str(run_id))
+    if event:
+        event.set()
+
+    # Update DB
+    run.status = "failed"
+    await db.flush()
+
+    return {"status": "rejected", "run_id": str(run_id), "reason": reason}
+
+
+@router.post("/{run_id}/rollback")
+async def rollback_run(
+    run_id: UUID,
+    body: RollbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rollback a run's sandbox to the checkpoint of a specific node.
+
+    Uses GitCheckpointManager.rollback() to restore the workspace
+    files to the state they were in after *node_id* executed.
+    """
+    engine = _require_engine()
+
+    result = await db.execute(
+        select(Run).where(Run.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    # Get the commit_map and sandbox_map from the engine's run state
+    run_state = engine._runs.get(str(run_id))
+    if not run_state:
+        raise HTTPException(status_code=404, detail="Run execution state not found")
+
+    commit_map: dict = run_state.get("_commit_map", {})
+    sandbox_map: dict = run_state.get("_sandbox_map", {})
+
+    # Find the commit hash and sandbox for the target node
+    commit_hash = commit_map.get(body.node_id)
+    sandbox_id = sandbox_map.get(body.node_id)
+
+    if not commit_hash:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No checkpoint found for node '{body.node_id}'",
+        )
+    if not sandbox_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No sandbox found for node '{body.node_id}'",
+        )
+
+    # Execute rollback
+    try:
+        await engine._checkpoint.rollback(sandbox_id, commit_hash)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Rollback failed: {exc}",
+        ) from exc
+
+    logger.info(
+        "Rolled back run %s to node %s (commit %s)",
+        run_id, body.node_id, commit_hash[:12],
+    )
+
+    return {
+        "status": "rolled_back",
+        "run_id": str(run_id),
+        "node_id": body.node_id,
+        "commit_hash": commit_hash,
+        "reason": body.reason,
+    }

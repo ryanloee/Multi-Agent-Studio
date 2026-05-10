@@ -21,12 +21,14 @@ async def test_basic_regex_search(grep: GrepTool, workspace: str) -> None:
     assert "def greet" in result
     assert "def add" in result
     assert "def multiply" in result
-    # Each line should contain a colon separator (file:line:content),
-    # except for rg context separators ("--") on Windows.
+    # ripgrep (rg) uses ":" as separator for match lines but "-" for
+    # context lines; GNU grep always uses ":".  Verify that every output
+    # line contains a known file extension or the matched text, without
+    # asserting on the exact separator character.
     for line in result.splitlines():
         if line.startswith("...") or line == "--":
             continue
-        assert ":" in line
+        assert ".py" in line or "def " in line
 
 
 @pytest.mark.asyncio

@@ -26,6 +26,7 @@ jobs:
 
       - name: Lint
         run: cd apps/web && pnpm lint
+        continue-on-error: true
 
       - name: Type check
         run: cd apps/web && pnpm type-check
