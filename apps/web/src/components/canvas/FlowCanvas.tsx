@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useRef, type DragEvent } from "react";
+import { useCallback, useEffect, useRef, type DragEvent } from "react";
 import {
   ReactFlow,
   Background,
@@ -30,8 +30,29 @@ export default function FlowCanvas() {
 
   const runStatus = useRunStore((s) => s.status);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
-  const parentChildMap = useRunStore((s) => s.parentChildMap);
   const allEvents = useRunStore((s) => s.events);
+  const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
+
+  // ---- Sync child_created events into workflowStore as real nodes ----
+  useEffect(() => {
+    const currentNodes = useWorkflowStore.getState().nodes;
+    const existingIds = new Set(currentNodes.map((n) => n.id));
+
+    for (const ev of allEvents) {
+      if (ev.type !== "child_created") continue;
+      const ce = ev as ChildCreatedEvent;
+      const childId = ce.child_node_id;
+      if (!childId || existingIds.has(childId)) continue;
+
+      existingIds.add(childId);
+      addDynamicNode(ce.node_id, {
+        id: childId,
+        type: (ce.child_type || "coder") as AgentNodeType,
+        prompt: ce.child_prompt || "",
+        model: ce.child_model || "",
+      });
+    }
+  }, [allEvents, addDynamicNode]);
 
   // ---- React Flow instance ref (for screenToFlowPosition in onDrop) ----
   const rfInstanceRef = useRef<ReactFlowInstance<WorkflowNode, WorkflowEdge> | null>(null);
@@ -83,87 +104,14 @@ export default function FlowCanvas() {
     setSelectedRunNode(null);
   }, [setSelectedNode, setSelectedRunNode]);
 
-  // ---- Merge static nodes with dynamic child nodes from planner ----
-  const { mergedNodes, mergedEdges } = useMemo(() => {
-    const childEntries = Object.entries(parentChildMap);
-    if (childEntries.length === 0) {
-      return { mergedNodes: staticNodes, mergedEdges: edges };
-    }
-
-    // Build a lookup of child_created events to get type/prompt/model
-    const childEventMap = new Map<string, ChildCreatedEvent>();
-    for (const ev of allEvents) {
-      if (ev.type === "child_created") {
-        const ce = ev as ChildCreatedEvent;
-        if (ce.child_node_id) childEventMap.set(ce.child_node_id, ce);
-      }
-    }
-
-    const dynamicNodes: WorkflowNode[] = [];
-    const dynamicEdges: WorkflowEdge[] = [];
-
-    for (const [parentId, childIds] of childEntries) {
-      const parentNode = staticNodes.find((n) => n.id === parentId);
-      if (!parentNode) continue;
-
-      const parentX = parentNode.position.x;
-      const parentY = parentNode.position.y;
-      const childCount = childIds.length;
-      const spacing = 200;
-      const totalWidth = (childCount - 1) * spacing;
-      const startX = parentX - totalWidth / 2;
-
-      for (let i = 0; i < childIds.length; i++) {
-        const childId = childIds[i];
-        const ce = childEventMap.get(childId);
-        const childType = ce?.child_type || "coder";
-        const childPrompt = ce?.child_prompt || "";
-
-        dynamicNodes.push({
-          id: childId,
-          type: "child" as AgentNodeType,
-          position: {
-            x: startX + i * spacing,
-            y: parentY + 120,
-          },
-          width: 180,
-          height: 100,
-          data: {
-            label: `${childType} #${i + 1}`,
-            agentType: childType as AgentNodeType,
-            modelProvider: "",
-            modelId: "",
-            prompt: childPrompt,
-            description: "",
-            permissions: {},
-            command: "",
-            childType,
-            childPrompt,
-          },
-        });
-
-        dynamicEdges.push({
-          id: `edge-${parentId}-${childId}`,
-          source: parentId,
-          target: childId,
-          type: "smoothstep",
-          animated: true,
-          style: { stroke: "#22c55e", strokeWidth: 1.5 },
-        });
-      }
-    }
-
-    return {
-      mergedNodes: [...staticNodes, ...dynamicNodes],
-      mergedEdges: [...edges, ...dynamicEdges],
-    };
-  }, [staticNodes, edges, parentChildMap, allEvents]);
+  // ---- Child nodes are added to workflowStore via addDynamicNode ----
+  // No merge needed — staticNodes already contains them.
 
   return (
     <div className="w-full h-full relative">
       <ReactFlow
-        nodes={mergedNodes}
-        edges={mergedEdges}
+        nodes={staticNodes}
+        edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}

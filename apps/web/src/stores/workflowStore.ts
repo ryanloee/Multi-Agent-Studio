@@ -139,7 +139,6 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   ) => {
     const { nodes } = get();
     const parentNode = nodes.find((n) => n.id === parentId);
-    if (!parentNode) return;
 
     // Calculate existing children count for positioning
     const existingChildren = nodes.filter(
@@ -147,9 +146,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     );
     const offset = existingChildren.length;
 
-    // Position child below and to the right of parent, staggered
-    const childX = parentNode.position.x + 220;
-    const childY = parentNode.position.y + offset * 120;
+    // Position child below parent; fall back to origin if parent not found
+    const parentX = parentNode?.position.x ?? 400;
+    const parentY = parentNode?.position.y ?? 200;
+    const childX = parentX + 220;
+    const childY = parentY + offset * 120;
 
     // Parse model string into provider/modelId
     const modelParts = childDef.model.split("/");
@@ -191,6 +192,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     const updatedNodes = nodes.map((node) => {
       if (node.id === parentId) {
         const currentChildIds = (node.data as NodeData).childNodeIds ?? [];
+        if (currentChildIds.includes(childDef.id)) return node;
         return {
           ...node,
           data: {
@@ -202,9 +204,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       return node;
     });
 
+    // Skip if node or edge already exists (prevents duplicates on re-render)
+    const nodeExists = nodes.some((n) => n.id === childDef.id);
+    const edgeExists = get().edges.some((e) => e.id === newEdge.id);
+
     set({
-      nodes: [...updatedNodes, newNode],
-      edges: [...get().edges, newEdge],
+      nodes: nodeExists ? updatedNodes : [...updatedNodes, newNode],
+      edges: edgeExists ? get().edges : [...get().edges, newEdge],
     });
   },
 
