@@ -28,6 +28,10 @@ export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
   const selectedRunNodeId = useRunStore((s) => s.selectedRunNodeId);
   const effectiveNodeId = nodeId || selectedRunNodeId || "";
 
+  // Get child node IDs for planner nodes
+  const parentChildMap = useRunStore((s) => s.parentChildMap);
+  const childIds = parentChildMap[effectiveNodeId] ?? [];
+
   // Find upstream and downstream node IDs
   const upstreamNodeIds = useMemo(
     () =>
@@ -97,10 +101,26 @@ export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
       });
     }
 
+    // If this is a planner node, also show child node events
+    if (childIds.length > 0) {
+      const childEvents = allEvents.filter(
+        (e) => e.node_id && childIds.includes(e.node_id)
+      );
+      for (const evt of childEvents) {
+        const childLabel = nodes.find((n) => n.id === evt.node_id)?.data?.label || evt.node_id;
+        result.push({
+          timestamp: evt.timestamp,
+          direction: "out",
+          summary: `[${childLabel}] ${evt.type}: ${(evt as { content?: string }).content?.slice(0, 60) || ""}`,
+          eventType: evt.type,
+        });
+      }
+    }
+
     // Sort by timestamp
     result.sort((a, b) => a.timestamp - b.timestamp);
     return result;
-  }, [allEvents, effectiveNodeId, upstreamNodeIds, nodes, t]);
+  }, [allEvents, effectiveNodeId, upstreamNodeIds, nodes, t, childIds]);
 
   // Format timestamp
   function formatTime(ts: number): string {

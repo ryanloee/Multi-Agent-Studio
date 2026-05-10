@@ -167,5 +167,45 @@ export function useWebSocket(
     }
   }, [runStatus, setStatus]);
 
+  // -----------------------------------------------------------------------
+  // Fallback polling: if status stays "running" too long, poll the REST API
+  // to catch cases where WebSocket events were missed.
+  // -----------------------------------------------------------------------
+  useEffect(() => {
+    if (!runId || runStatus !== "running") return;
+
+    const POLL_INTERVAL = 10_000; // 10 seconds
+    let cancelled = false;
+
+    const poll = async () => {
+      while (!cancelled) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL));
+        if (cancelled) break;
+
+        // Only poll if still running
+        const currentStatus = useRunStore.getState().status;
+        if (currentStatus !== "running") break;
+
+        try {
+          const { api } = await import("@/lib/api");
+          const runInfo = await api.getRun(runId);
+          if (
+            runInfo.status === "completed" ||
+            runInfo.status === "failed" ||
+            runInfo.status === "cancelled"
+          ) {
+            setStatus(runInfo.status === "cancelled" ? "failed" : runInfo.status);
+            break;
+          }
+        } catch {
+          // Ignore poll errors — WebSocket is the primary source
+        }
+      }
+    };
+
+    poll();
+    return () => { cancelled = true; };
+  }, [runId, runStatus, setStatus]);
+
   return { disconnect, isConnected };
 }

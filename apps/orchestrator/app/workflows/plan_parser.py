@@ -86,11 +86,34 @@ def parse_plan_output(raw_output: str) -> list[dict]:
     """Parse planner output to extract child tasks.
 
     Strategy order:
-    1. Look for plan.json lines (create_child_task tool output)
-    2. Look for JSON blocks with "tasks" array
-    3. Fall back to parsing todowrite tool calls from stream.jsonl lines
+    1. Look for JSON code blocks with "tasks" array (most specific)
+    2. Look for raw JSON object with "tasks" array
+    3. Look for plan.json lines (create_child_task tool output)
+    4. Fall back to parsing todowrite tool calls from stream.jsonl lines
     """
-    # Strategy 1: plan.json lines
+    # Strategy 1: JSON in markdown code blocks (greedy — backticks are the boundary)
+    code_block_pattern = r'```(?:json)?\s*(\{[\s\S]*\})\s*```'
+    for match in re.finditer(code_block_pattern, raw_output):
+        try:
+            data = json.loads(match.group(1))
+            if "tasks" in data and isinstance(data["tasks"], list):
+                logger.info("parse_plan_output: found tasks in code block")
+                return _validate_tasks(data["tasks"])
+        except json.JSONDecodeError:
+            continue
+
+    # Strategy 2: raw JSON object with tasks
+    brace_pattern = r'\{[^{}]*"tasks"\s*:\s*\[[\s\S]*?\]\s*\}'
+    for match in re.finditer(brace_pattern, raw_output):
+        try:
+            data = json.loads(match.group(0))
+            if "tasks" in data and isinstance(data["tasks"], list):
+                logger.info("parse_plan_output: found tasks in raw JSON")
+                return _validate_tasks(data["tasks"])
+        except json.JSONDecodeError:
+            continue
+
+    # Strategy 3: plan.json lines (create_child_task tool output)
     plan_json_tasks = parse_plan_json(raw_output)
     if plan_json_tasks:
         logger.info(
@@ -99,27 +122,7 @@ def parse_plan_output(raw_output: str) -> list[dict]:
         )
         return plan_json_tasks
 
-    # Strategy 2: JSON in markdown code blocks
-    code_block_pattern = r'```(?:json)?\s*(\{[\s\S]*?\})\s*```'
-    for match in re.finditer(code_block_pattern, raw_output):
-        try:
-            data = json.loads(match.group(1))
-            if "tasks" in data and isinstance(data["tasks"], list):
-                return _validate_tasks(data["tasks"])
-        except json.JSONDecodeError:
-            continue
-
-    # Strategy 2b: raw JSON object with tasks
-    brace_pattern = r'\{[^{}]*"tasks"\s*:\s*\[[\s\S]*?\]\s*\}'
-    for match in re.finditer(brace_pattern, raw_output):
-        try:
-            data = json.loads(match.group(0))
-            if "tasks" in data and isinstance(data["tasks"], list):
-                return _validate_tasks(data["tasks"])
-        except json.JSONDecodeError:
-            continue
-
-    # Strategy 3: todowrite tool calls
+    # Strategy 4: todowrite tool calls
     todowrite_tasks = parse_todowrite_tasks(raw_output)
     if todowrite_tasks:
         return todowrite_tasks
@@ -197,7 +200,8 @@ def _validate_tasks(tasks: list) -> list[dict]:
         task_type = task.get("type", "")
         if task_type not in valid_types:
             task_type = "coder"
-        prompt = task.get("prompt", "")
+        # Accept "prompt" or "command" (shell tasks may use "command")
+        prompt = task.get("prompt", "") or task.get("command", "")
         if not prompt:
             continue
         validated = {

@@ -55,6 +55,7 @@ export default function Toolbar({
     running: t("toolbar.status.running"),
     paused: t("toolbar.status.paused"),
     cancelling: t("toolbar.status.cancel"),
+    cancelled: t("toolbar.status.cancel"),
     completed: t("toolbar.status.completed"),
     failed: t("toolbar.status.failed"),
   };

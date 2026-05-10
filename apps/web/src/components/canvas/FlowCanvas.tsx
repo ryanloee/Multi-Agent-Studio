@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useRef, type DragEvent } from "react";
+import { useCallback, useMemo, useRef, type DragEvent } from "react";
 import {
   ReactFlow,
   Background,
@@ -17,9 +17,10 @@ import { useRunStore } from "@/stores/runStore";
 import { nodeTypes } from "@/components/canvas/nodeTypes";
 import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow";
 import { NODE_META } from "@/lib/constants";
+import type { ChildCreatedEvent } from "@/types/events";
 
 export default function FlowCanvas() {
-  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
+  const staticNodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const onNodesChange = useWorkflowStore((s) => s.onNodesChange);
   const onEdgesChange = useWorkflowStore((s) => s.onEdgesChange);
@@ -29,6 +30,8 @@ export default function FlowCanvas() {
 
   const runStatus = useRunStore((s) => s.status);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
+  const parentChildMap = useRunStore((s) => s.parentChildMap);
+  const allEvents = useRunStore((s) => s.events);
 
   // ---- React Flow instance ref (for screenToFlowPosition in onDrop) ----
   const rfInstanceRef = useRef<ReactFlowInstance<WorkflowNode, WorkflowEdge> | null>(null);
@@ -80,11 +83,87 @@ export default function FlowCanvas() {
     setSelectedRunNode(null);
   }, [setSelectedNode, setSelectedRunNode]);
 
+  // ---- Merge static nodes with dynamic child nodes from planner ----
+  const { mergedNodes, mergedEdges } = useMemo(() => {
+    const childEntries = Object.entries(parentChildMap);
+    if (childEntries.length === 0) {
+      return { mergedNodes: staticNodes, mergedEdges: edges };
+    }
+
+    // Build a lookup of child_created events to get type/prompt/model
+    const childEventMap = new Map<string, ChildCreatedEvent>();
+    for (const ev of allEvents) {
+      if (ev.type === "child_created") {
+        const ce = ev as ChildCreatedEvent;
+        if (ce.child_node_id) childEventMap.set(ce.child_node_id, ce);
+      }
+    }
+
+    const dynamicNodes: WorkflowNode[] = [];
+    const dynamicEdges: WorkflowEdge[] = [];
+
+    for (const [parentId, childIds] of childEntries) {
+      const parentNode = staticNodes.find((n) => n.id === parentId);
+      if (!parentNode) continue;
+
+      const parentX = parentNode.position.x;
+      const parentY = parentNode.position.y;
+      const childCount = childIds.length;
+      const spacing = 200;
+      const totalWidth = (childCount - 1) * spacing;
+      const startX = parentX - totalWidth / 2;
+
+      for (let i = 0; i < childIds.length; i++) {
+        const childId = childIds[i];
+        const ce = childEventMap.get(childId);
+        const childType = ce?.child_type || "coder";
+        const childPrompt = ce?.child_prompt || "";
+
+        dynamicNodes.push({
+          id: childId,
+          type: "child" as AgentNodeType,
+          position: {
+            x: startX + i * spacing,
+            y: parentY + 120,
+          },
+          width: 180,
+          height: 100,
+          data: {
+            label: `${childType} #${i + 1}`,
+            agentType: childType as AgentNodeType,
+            modelProvider: "",
+            modelId: "",
+            prompt: childPrompt,
+            description: "",
+            permissions: {},
+            command: "",
+            childType,
+            childPrompt,
+          },
+        });
+
+        dynamicEdges.push({
+          id: `edge-${parentId}-${childId}`,
+          source: parentId,
+          target: childId,
+          type: "smoothstep",
+          animated: true,
+          style: { stroke: "#22c55e", strokeWidth: 1.5 },
+        });
+      }
+    }
+
+    return {
+      mergedNodes: [...staticNodes, ...dynamicNodes],
+      mergedEdges: [...edges, ...dynamicEdges],
+    };
+  }, [staticNodes, edges, parentChildMap, allEvents]);
+
   return (
     <div className="w-full h-full relative">
       <ReactFlow
-        nodes={nodes}
-        edges={edges}
+        nodes={mergedNodes}
+        edges={mergedEdges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
@@ -111,7 +190,7 @@ export default function FlowCanvas() {
       </ReactFlow>
 
       {/* Empty canvas guide text */}
-      {nodes.length === 0 && (
+      {staticNodes.length === 0 && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none z-10">
           <div className="text-center space-y-3 max-w-sm px-4">
             <div className="w-12 h-12 rounded-xl bg-blue-50 flex items-center justify-center mx-auto">

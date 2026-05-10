@@ -6,6 +6,7 @@ import ShellNode from "@/components/canvas/nodes/ShellNode";
 import ReviewNode from "@/components/canvas/nodes/ReviewNode";
 import ExploreNode from "@/components/canvas/nodes/ExploreNode";
 import HumanNode from "@/components/canvas/nodes/HumanNode";
+import ChildNode from "@/components/canvas/nodes/ChildNode";
 
 /**
  * nodeTypes mapping — registered with React Flow's <ReactFlow> component.
@@ -20,4 +21,5 @@ export const nodeTypes: NodeTypes = {
   review: ReviewNode,
   explore: ExploreNode,
   human: HumanNode,
+  child: ChildNode,
 };

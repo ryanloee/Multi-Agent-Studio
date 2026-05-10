@@ -141,6 +141,29 @@ class LocalDAGExecutor:
         except Exception:
             logger.warning("Failed to publish event %s", event_type, exc_info=True)
 
+    @staticmethod
+    def _extract_llm_text(jsonl_content: str) -> str:
+        """Extract plain LLM text from stream.jsonl event lines.
+
+        Concatenates content from llm_token, llm_chunk, and text events
+        so the plan parser can find embedded JSON code blocks.
+        Tokens are naturally contiguous fragments — joining with empty
+        string preserves the original text without injecting extra newlines.
+        """
+        parts: list[str] = []
+        for line in jsonl_content.strip().split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev_type = ev.get("type", "")
+            if ev_type in ("llm_token", "llm_chunk", "text"):
+                parts.append(ev.get("content", ""))
+        return "".join(parts)
+
     async def _execute_dag(
         self,
         run_id: str,
@@ -196,8 +219,19 @@ class LocalDAGExecutor:
                     else:
                         layer_results[node_id] = result
                         # Plan node: parse output and execute dynamic children
+                        _node_data = node.get("data", {})
+                        _atype = (
+                            node.get("agent_type")
+                            or node.get("type")
+                            or (_node_data.get("agentType") if isinstance(_node_data, dict) else None)
+                        )
+                        logger.info(
+                            "DAG run=%s node %s: agent_type=%s, state=%s, has_raw_output=%s",
+                            run_id, node_id, _atype, result.get("state"),
+                            bool(result.get("raw_output")),
+                        )
                         if (
-                            node.get("agent_type") == "plan"
+                            _atype == "plan"
                             and result.get("state") == "completed"
                         ):
                             plan_results = await self._execute_dynamic_plan(
@@ -210,10 +244,42 @@ class LocalDAGExecutor:
             event_type = "run_completed" if status == "completed" else "run_failed"
             await self._emit(event_type, run_id, "", content=f"status={status}")
 
+            # Update run status in DB so REST API polls reflect the true state
+            try:
+                from app.core.database import async_session_factory
+                from app.models.db import Run as RunModel
+                async with async_session_factory() as session:
+                    from sqlalchemy import select
+                    result = await session.execute(
+                        select(RunModel).where(RunModel.id == run_id)
+                    )
+                    run_row = result.scalar_one_or_none()
+                    if run_row is not None:
+                        run_row.status = status
+                        await session.commit()
+            except Exception:
+                logger.warning("Failed to update run status in DB for %s", run_id, exc_info=True)
+
         except Exception as exc:
             logger.exception("DAG execution failed for run %s", run_id)
             self._runs[run_id]["status"] = "failed"
             await self._emit("run_failed", run_id, "", content=str(exc))
+
+            # Update run status in DB on failure too
+            try:
+                from app.core.database import async_session_factory
+                from app.models.db import Run as RunModel
+                async with async_session_factory() as session:
+                    from sqlalchemy import select
+                    result = await session.execute(
+                        select(RunModel).where(RunModel.id == run_id)
+                    )
+                    run_row = result.scalar_one_or_none()
+                    if run_row is not None:
+                        run_row.status = "failed"
+                        await session.commit()
+            except Exception:
+                logger.warning("Failed to update run status in DB for %s", run_id, exc_info=True)
 
     async def _execute_node(
         self,
@@ -253,10 +319,30 @@ class LocalDAGExecutor:
                 pass
 
             # 4. Build agent command
-            agent_type: str = node.get("agent_type", "coder")
-            model_provider: str = node.get("model_provider", "")
-            model_id: str = node.get("model_id", "")
-            prompt: str = node.get("prompt", "")
+            # React Flow nodes store type in top-level "type" and "data.agentType";
+            # compiled node dicts may use "agent_type".  Try all.
+            data = node.get("data", {})
+            agent_type: str = (
+                node.get("agent_type")
+                or node.get("type")
+                or (data.get("agentType") if isinstance(data, dict) else None)
+                or "coder"
+            )
+            model_provider: str = (
+                node.get("model_provider")
+                or (data.get("modelProvider") if isinstance(data, dict) else "")
+                or ""
+            )
+            model_id: str = (
+                node.get("model_id")
+                or (data.get("modelId") if isinstance(data, dict) else "")
+                or ""
+            )
+            prompt: str = (
+                node.get("prompt")
+                or (data.get("prompt") if isinstance(data, dict) else "")
+                or ""
+            )
 
             if agent_type == "plan":
                 prompt = prompt + PLAN_SYSTEM_SUFFIX
@@ -350,8 +436,8 @@ class LocalDAGExecutor:
                         env=subprocess_env,
                     )
                     result["raw_output"] = raw_log
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.warning("Failed to read raw_output for plan node %s: %s", node_id, exc)
 
             return result
 
@@ -435,9 +521,18 @@ class LocalDAGExecutor:
         """
         raw_output = parent_result.get("raw_output", "")
         if not raw_output:
+            logger.warning("_execute_dynamic_plan: no raw_output for parent %s", parent_node_id)
             return {}
 
-        tasks = parse_plan_output(raw_output)
+        # Extract LLM text from stream.jsonl — the parser needs plain text,
+        # not raw JSONL event lines
+        extracted_text = self._extract_llm_text(raw_output)
+        logger.info(
+            "_execute_dynamic_plan: extracted %d chars of LLM text from %d chars of raw output",
+            len(extracted_text), len(raw_output),
+        )
+
+        tasks = parse_plan_output(extracted_text)
         if not tasks:
             logger.info(
                 "Plan node %s produced no child tasks", parent_node_id,

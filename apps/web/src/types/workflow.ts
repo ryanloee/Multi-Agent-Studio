@@ -56,6 +56,7 @@ export type RunStatus =
   | "running"
   | "paused"
   | "cancelling"
+  | "cancelled"
   | "completed"
   | "failed";
 

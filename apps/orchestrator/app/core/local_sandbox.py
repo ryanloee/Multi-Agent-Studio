@@ -29,6 +29,7 @@ class _AsyncProcessShim:
 
     @property
     def returncode(self) -> int | None:
+        self._proc.poll()
         return self._proc.returncode
 
     def terminate(self) -> None:
