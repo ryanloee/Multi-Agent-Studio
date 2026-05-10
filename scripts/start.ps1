@@ -16,6 +16,41 @@ $Ports = @(8000, 3000)
 $PidDir = Join-Path $ProjectRoot ".pid"
 
 # ---------------------------------------------------------------------------
+# Helper: find root ancestor of a process (walk up until we hit a system/shell)
+# ---------------------------------------------------------------------------
+function Find-ServiceRoot {
+    param([int]$StartPid)
+
+    $current = $StartPid
+    $seen = @{}
+
+    while ($true) {
+        if ($seen.ContainsKey($current)) { break }
+        $seen[$current] = $true
+
+        try {
+            $wmiProc = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
+            if (-not $wmiProc) { break }
+
+            $parentPid = $wmiProc.ParentProcessId
+            if ($parentPid -le 4 -or $parentPid -eq $current) { break }
+
+            $parent = Get-Process -Id $parentPid -ErrorAction SilentlyContinue
+            if (-not $parent) { break }
+
+            # Stop at system processes, shells, terminals, and IDEs
+            if ($parent.ProcessName -match '^(services|lsass|csrss|System|smss|wininit|svchost|explorer|WindowsTerminal|conhost|devenv|Code|Cursor)$') { break }
+
+            $current = $parentPid
+        } catch {
+            break
+        }
+    }
+
+    return $current
+}
+
+# ---------------------------------------------------------------------------
 # Helper: kill a PID and ALL its descendant processes recursively
 # ---------------------------------------------------------------------------
 function Kill-ProcessTree {
@@ -23,33 +58,34 @@ function Kill-ProcessTree {
 
     $ErrorActionPreference = "Continue"
     try {
-        # Find all children recursively
-        $descendants = @()
+        # Skip if already dead
+        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+        if (-not $parent) { return }
+
+        # taskkill /F /T is the fastest way to kill a process tree on Windows
+        & taskkill /F /T /PID $ParentPid 2>&1 | Out-Null
+
+        # Brief wait then clean up any survivors with filtered WMI queries
+        Start-Sleep -Milliseconds 300
         $queue = @($ParentPid)
+        $visited = @{}
         while ($queue.Count -gt 0) {
             $current = $queue[0]
             $queue = $queue[1..($queue.Count - 1)]
-            $kids = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                Where-Object { $_.ParentProcessId -eq $current -and $_.ProcessId -ne $current }
+            if ($visited.ContainsKey($current)) { continue }
+            $visited[$current] = $true
+            # Filtered query — only returns children of $current, not all processes
+            $kids = Get-CimInstance Win32_Process -Filter "ParentProcessId=$current" -ErrorAction SilentlyContinue
             foreach ($kid in $kids) {
-                if ($descendants -notcontains $kid.ProcessId) {
-                    $descendants += $kid.ProcessId
-                    $queue += $kid.ProcessId
+                $proc = Get-Process -Id $kid.ProcessId -ErrorAction SilentlyContinue
+                if ($proc) {
+                    Write-Host "    Killing PID=$($kid.ProcessId) ($($proc.ProcessName))" -ForegroundColor DarkGray
+                    Stop-Process -Id $kid.ProcessId -Force -ErrorAction SilentlyContinue
                 }
-            }
-        }
-
-        # Kill descendants first (children before parents), then the parent
-        $allToKill = ($descendants | Sort-Object -Descending) + @($ParentPid) | Select-Object -Unique
-        foreach ($procId in $allToKill) {
-            $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-            if ($proc) {
-                Write-Host "    Killing PID=$procId ($($proc.ProcessName))" -ForegroundColor DarkGray
-                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+                $queue += $kid.ProcessId
             }
         }
     } catch {
-        # Fallback: just try taskkill
         & taskkill /F /T /PID $ParentPid 2>&1 | Out-Null
     }
     $ErrorActionPreference = "Stop"
@@ -57,6 +93,8 @@ function Kill-ProcessTree {
 
 # ---------------------------------------------------------------------------
 # Helper: find and kill ALL processes holding a specific port
+# Kills the ROOT ANCESTOR (e.g. pnpm/cmd.exe) not just the port holder,
+# so the parent can't respawn a new child.
 # ---------------------------------------------------------------------------
 function Kill-PortProcesses {
     param([int]$Port)
@@ -86,14 +124,65 @@ function Kill-PortProcesses {
     $ErrorActionPreference = "Stop"
 
     $pids = $pids | Sort-Object -Unique
-    foreach ($procId in $pids) {
-        $procName = try { (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName } catch { "unknown" }
-        Write-Host "  Killing port $Port holder PID=$procId ($procName)" -ForegroundColor Yellow
-        # Use taskkill /T first — most reliable for killing process trees on Windows
-        & taskkill /F /T /PID $procId 2>&1 | Out-Null
-        Kill-ProcessTree -ParentPid $procId
+    if ($pids.Count -eq 0) {
+        Write-Host "  Port ${Port}: no processes found" -ForegroundColor Gray
+        return 0
     }
+
+    # Find root ancestors for each port-holder so we kill the whole launcher tree
+    $rootPids = @()
+    foreach ($portPid in $pids) {
+        $root = Find-ServiceRoot -StartPid $portPid
+        if ($rootPids -notcontains $root) {
+            $rootPids += $root
+        }
+    }
+
+    foreach ($rootPid in $rootPids) {
+        $rootProc = Get-Process -Id $rootPid -ErrorAction SilentlyContinue
+        $rootName = if ($rootProc) { $rootProc.ProcessName } else { "unknown" }
+        $portHolderNames = @()
+        foreach ($pp in $pids) {
+            $pproc = Get-Process -Id $pp -ErrorAction SilentlyContinue
+            if ($pproc) { $portHolderNames += "$($pproc.ProcessName)[$pp]" }
+        }
+        Write-Host "  Port ${Port}: root=$rootName[$rootPid] (holders: $($portHolderNames -join ', '))" -ForegroundColor Yellow
+        # taskkill /T kills the entire process tree from root down
+        & taskkill /F /T /PID $rootPid 2>&1 | Out-Null
+        # Belt-and-suspenders: also walk the tree manually
+        Kill-ProcessTree -ParentPid $rootPid
+    }
+
     return $pids.Count
+}
+
+# ---------------------------------------------------------------------------
+# Helper: wait until a port is free (no LISTEN state)
+# ---------------------------------------------------------------------------
+function Wait-PortFree {
+    param(
+        [int]$Port,
+        [int]$TimeoutSeconds = 10
+    )
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt ($TimeoutSeconds * 1000)) {
+        $stillListening = $false
+        try {
+            $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+            if ($conns) { $stillListening = $true }
+        } catch {
+            $pat = ":${Port}\s"
+            $check = netstat -ano | Select-String $pat
+            if ($check) { $stillListening = $true }
+        }
+        if (-not $stillListening) {
+            Write-Host "  Port ${Port}: free" -ForegroundColor Green
+            return $true
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    Write-Host "  [WARN] Port ${Port} still occupied after ${TimeoutSeconds}s" -ForegroundColor Red
+    return $false
 }
 
 # ---------------------------------------------------------------------------
@@ -126,18 +215,14 @@ function Stop-Services {
 
     Start-Sleep -Milliseconds 500
 
-    # Step 2: Kill any remaining processes on our ports
+    # Step 2: Kill any remaining processes on our ports (via root ancestor)
     foreach ($port in $Ports) {
-        $count = Kill-PortProcesses -Port $port
-        if ($count -eq 0) {
-            Write-Host "  Port ${port}: no processes found" -ForegroundColor Gray
-        }
+        Kill-PortProcesses -Port $port
     }
 
     Start-Sleep -Milliseconds 500
 
     # Step 3: Kill any remaining python/node processes that match our project
-    # This catches orphaned uvicorn workers (multiprocessing.spawn with parent_pid)
     $pyProcs = Get-Process python* -ErrorAction SilentlyContinue |
         Where-Object {
             try {
@@ -166,50 +251,10 @@ function Stop-Services {
         Kill-ProcessTree -ParentPid $p.Id
     }
 
-    Start-Sleep -Seconds 2
-
-    # Step 4: Final verification — force kill anything still on ports, with retries
-    $maxRetries = 3
-    for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
-        $allFree = $true
-        foreach ($port in $Ports) {
-            $pidsOnPort = @()
-            try {
-                $conns = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-                foreach ($conn in $conns) {
-                    if ($conn.OwningProcess -and $conn.OwningProcess -ne 0) {
-                        $pidsOnPort += $conn.OwningProcess
-                    }
-                }
-            } catch {
-                $pat = ":${port}\s"
-                $lines = netstat -ano | Select-String $pat
-                foreach ($line in $lines) {
-                    $parts = ($line -split '\s+') | Where-Object { $_ }
-                    $procId = $parts[-1]
-                    if ($procId -match '^\d+$' -and $procId -ne "0") {
-                        $pidsOnPort += [int]$procId
-                    }
-                }
-            }
-            $pidsOnPort = $pidsOnPort | Sort-Object -Unique
-            if ($pidsOnPort.Count -gt 0) {
-                $allFree = $false
-                foreach ($rpid in $pidsOnPort) {
-                    $procName = try { (Get-Process -Id $rpid -ErrorAction SilentlyContinue).ProcessName } catch { "unknown" }
-                    Write-Host "  [Attempt $attempt] Force killing PID=$rpid ($procName) on port $port" -ForegroundColor Red
-                    # Use /T to kill the entire process tree, /F for force
-                    & taskkill /F /T /PID $rpid 2>&1 | Out-Null
-                    # Also kill via Stop-Process as backup
-                    Stop-Process -Id $rpid -Force -ErrorAction SilentlyContinue
-                }
-            }
-        }
-        if ($allFree) { break }
-        if ($attempt -lt $maxRetries) {
-            Write-Host "  Waiting 2 seconds before retry..." -ForegroundColor Gray
-            Start-Sleep -Seconds 2
-        }
+    # Step 4: Wait for ports to be free
+    Write-Host "  Waiting for ports to be released..." -ForegroundColor Gray
+    foreach ($port in $Ports) {
+        Wait-PortFree -Port $port -TimeoutSeconds 8
     }
 
     # Final status report
@@ -227,8 +272,6 @@ function Stop-Services {
         if ($stillOccupied) {
             Write-Host "  [WARN] Port ${p} still occupied" -ForegroundColor Red
             $clean = $false
-        } else {
-            Write-Host "  Port ${p}: free" -ForegroundColor Green
         }
     }
 
@@ -262,7 +305,7 @@ function Start-Services {
     Write-Host "=== Multi-Agent Studio ===" -ForegroundColor Cyan
     Write-Host ""
 
-    # Kill any existing processes on our ports first
+    # Kill any existing processes on our ports first — use root-ancestor killing
     Write-Host "  Cleaning up old processes..." -ForegroundColor Gray
     $savedEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
@@ -270,7 +313,14 @@ function Start-Services {
         Kill-PortProcesses -Port $port
     }
     $ErrorActionPreference = $savedEAP
-    Start-Sleep -Seconds 1
+
+    # Wait until ports are actually free before starting new services
+    Write-Host "  Waiting for ports to be released..." -ForegroundColor Gray
+    foreach ($port in $Ports) {
+        Wait-PortFree -Port $port -TimeoutSeconds 10
+    }
+
+    Write-Host ""
 
     # Start backend
     Write-Host "  Starting backend (port 8000)..." -ForegroundColor Gray
@@ -283,7 +333,6 @@ function Start-Services {
     $psi.UseShellExecute = $false
     $backendProc = [System.Diagnostics.Process]::Start($psi)
     Write-Host "    cmd.exe PID=$($backendProc.Id)" -ForegroundColor DarkGray
-    # Save cmd.exe PID for clean shutdown
     Set-Content -Path (Join-Path $PidDir "backend.pid") -Value $backendProc.Id -Force
 
     # Start frontend
@@ -300,7 +349,6 @@ function Start-Services {
     $psi2.UseShellExecute = $false
     $frontendProc = [System.Diagnostics.Process]::Start($psi2)
     Write-Host "    cmd.exe PID=$($frontendProc.Id)" -ForegroundColor DarkGray
-    # Save cmd.exe PID for clean shutdown
     Set-Content -Path (Join-Path $PidDir "frontend.pid") -Value $frontendProc.Id -Force
 
     Write-Host ""
