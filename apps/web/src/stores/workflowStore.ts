@@ -34,6 +34,10 @@ interface WorkflowState {
   currentWorkflowId: string | null;
   workspaceDirectory: string;
 
+  // Workflow dual mode (auto vs manual)
+  mode: "auto" | "manual";
+  goal: string;
+
   // React Flow change handlers
   onNodesChange: OnNodesChange<WorkflowNode>;
   onEdgesChange: OnEdgesChange;
@@ -70,6 +74,10 @@ interface WorkflowState {
 
   // Workspace directory
   updateWorkspaceDirectory: (dir: string) => Promise<void>;
+
+  // Mode & goal
+  updateMode: (mode: "auto" | "manual") => Promise<void>;
+  updateGoal: (goal: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +99,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   focusNodeId: null,
   currentWorkflowId: null,
   workspaceDirectory: "",
+  mode: "manual" as const,
+  goal: "",
 
   // ---- React Flow change handlers ----
   onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
@@ -275,6 +285,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       selectedNodeId: null,
       currentWorkflowId: workflow.id,
       workspaceDirectory: workflow.workspace_directory ?? "",
+      mode: (workflow.mode as "auto" | "manual") ?? "manual",
+      goal: workflow.goal ?? "",
     });
   },
 
@@ -283,6 +295,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       nodes: [],
       edges: [],
       selectedNodeId: null,
+      mode: "manual",
+      goal: "",
     });
   },
 
@@ -305,6 +319,29 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       await api.updateWorkflow(currentWorkflowId, { workspace_directory: dir });
     } catch (err) {
       console.error("Failed to update workspace directory:", err);
+    }
+  },
+
+  // ---- Mode & goal ----
+  updateMode: async (mode: "auto" | "manual") => {
+    const { currentWorkflowId } = get();
+    if (!currentWorkflowId) return;
+    set({ mode });
+    try {
+      await api.updateWorkflow(currentWorkflowId, { mode });
+    } catch (err) {
+      console.error("Failed to update workflow mode:", err);
+    }
+  },
+
+  updateGoal: async (goal: string) => {
+    const { currentWorkflowId } = get();
+    if (!currentWorkflowId) return;
+    set({ goal });
+    try {
+      await api.updateWorkflow(currentWorkflowId, { goal });
+    } catch (err) {
+      console.error("Failed to update workflow goal:", err);
     }
   },
 }));

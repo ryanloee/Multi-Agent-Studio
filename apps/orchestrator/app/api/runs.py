@@ -50,9 +50,14 @@ async def trigger_run(
 ):
     """Trigger workflow execution via the local DAG engine.
 
+    Supports two modes:
+    - "manual" (default): Compile the user-drawn DAG from dag_json and execute.
+    - "auto": Build a synthetic Planner node from workflow.goal, run it first,
+      then let the engine parse its output into a DAG and execute dynamically.
+
     Steps:
-    1. Look up workflow from DB to get DAG JSON.
-    2. Override DAG with request body if provided.
+    1. Look up workflow from DB to get DAG JSON, mode, and goal.
+    2. Route based on mode (auto vs manual).
     3. Compile DAG into execution layers via compiler.compile_dag().
     4. Convert layers into dicts for the LocalDAGExecutor.
     5. Start DAG execution in the background.
@@ -71,56 +76,86 @@ async def trigger_run(
     if workflow is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    # 2. Merge DAG: request override > stored DAG
     payload = body or TriggerRunRequest()
-    dag_json = payload.dag if payload.dag else (workflow.dag_json or {})
     global_config = payload.config or {}
+    workflow_mode = getattr(workflow, "mode", "manual") or "manual"
 
-    if not dag_json:
-        raise HTTPException(status_code=400, detail="No DAG definition found")
+    # 2. Route based on mode
+    if workflow_mode == "auto":
+        # Auto mode: goal is required; build a synthetic planner node
+        goal = getattr(workflow, "goal", "") or ""
+        if not goal:
+            raise HTTPException(
+                status_code=400,
+                detail="Auto mode requires a non-empty goal on the workflow",
+            )
 
-    # 3. Compile DAG into layers
-    try:
-        compiled_layers = compile_dag(dag_json)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        planner_node = {
+            "id": "planner",
+            "type": "plan",
+            "agent_type": "plan",
+            "data": {
+                "label": "Planner",
+                "agentType": "plan",
+                "prompt": goal,
+            },
+            "model_provider": "",
+            "model_id": "",
+            "prompt": goal,
+        }
+        layers_data = [[planner_node]]
+        global_config["_mode"] = "auto"
+        global_config["_goal"] = goal
+    else:
+        # Manual mode (default): compile the user-drawn DAG
+        dag_json = payload.dag if payload.dag else (workflow.dag_json or {})
+        if not dag_json:
+            raise HTTPException(status_code=400, detail="No DAG definition found")
 
-    # 4. Serialise layers into dicts for the engine
-    #    Frontend sends camelCase (agentType, modelProvider, modelId).
-    #    Engine expects snake_case — normalise here.
-    run_id = uuid4()
-    layers_data: list[dict] = []
-    for layer_nodes in compiled_layers:
-        layer_list = []
-        for node_def in layer_nodes:
-            node_data = node_def.get("data", node_def)
-            # Accept both camelCase (from frontend) and snake_case
-            agent_type = (
-                node_data.get("agent_type")
-                or node_data.get("agentType")
-                or "coder"
-            )
-            model_provider = (
-                node_data.get("model_provider")
-                or node_data.get("modelProvider")
-                or ""
-            )
-            model_id = (
-                node_data.get("model_id")
-                or node_data.get("modelId")
-                or ""
-            )
-            prompt = node_data.get("prompt", "")
-            layer_list.append({
-                "id": node_def.get("id", ""),
-                "agent_type": agent_type,
-                "model_provider": model_provider,
-                "model_id": model_id,
-                "prompt": prompt,
-            })
-        layers_data.append(layer_list)
+        # 3. Compile DAG into layers
+        try:
+            compiled_layers = compile_dag(dag_json)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        # 4. Serialise layers into dicts for the engine
+        #    Frontend sends camelCase (agentType, modelProvider, modelId).
+        #    Engine expects snake_case -- normalise here.
+        layers_data: list[dict] = []
+        for layer_nodes in compiled_layers:
+            layer_list = []
+            for node_def in layer_nodes:
+                node_data = node_def.get("data", node_def)
+                # Accept both camelCase (from frontend) and snake_case
+                agent_type = (
+                    node_data.get("agent_type")
+                    or node_data.get("agentType")
+                    or "coder"
+                )
+                model_provider = (
+                    node_data.get("model_provider")
+                    or node_data.get("modelProvider")
+                    or ""
+                )
+                model_id = (
+                    node_data.get("model_id")
+                    or node_data.get("modelId")
+                    or ""
+                )
+                prompt = node_data.get("prompt", "")
+                layer_list.append({
+                    "id": node_def.get("id", ""),
+                    "agent_type": agent_type,
+                    "model_provider": model_provider,
+                    "model_id": model_id,
+                    "prompt": prompt,
+                })
+            layers_data.append(layer_list)
+
+    global_config["_edges"] = dag_json.get("edges", []) if dag_json else []
 
     # 5. Start DAG execution via LocalDAGExecutor
+    run_id = uuid4()
     await engine.start_workflow(
         run_id=str(run_id),
         layers=layers_data,

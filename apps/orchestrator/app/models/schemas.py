@@ -27,6 +27,8 @@ class CreateWorkflowRequest(BaseModel):
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
     workspace_directory: Optional[str] = None
+    mode: Optional[str] = Field("manual", pattern="^(auto|manual)$")
+    goal: Optional[str] = None
 
 
 class UpdateWorkflowRequest(BaseModel):
@@ -34,6 +36,8 @@ class UpdateWorkflowRequest(BaseModel):
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
     workspace_directory: Optional[str] = None
+    mode: Optional[str] = Field(None, pattern="^(auto|manual)$")
+    goal: Optional[str] = None
     nodes: Optional[list[dict[str, Any]]] = None
     edges: Optional[list[dict[str, Any]]] = None
 
@@ -54,6 +58,8 @@ class WorkflowResponse(BaseModel):
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
     workspace_directory: Optional[str] = None
+    mode: str = "manual"
+    goal: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

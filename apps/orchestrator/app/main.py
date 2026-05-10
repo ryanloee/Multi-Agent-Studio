@@ -65,6 +65,12 @@ async def lifespan(app: FastAPI):
                     "will recreate database"
                 )
                 needs_reset = True
+            if "mode" not in columns or "goal" not in columns:
+                logger.info(
+                    "Schema migration: workflows table missing mode/goal, "
+                    "will recreate database"
+                )
+                needs_reset = True
         if needs_reset:
             await db_engine.dispose()
             db_path.unlink(missing_ok=True)

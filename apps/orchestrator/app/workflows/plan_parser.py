@@ -20,23 +20,22 @@ When your analysis is complete, output a JSON plan in this exact format at the e
 {
   "tasks": [
     {
+      "id": "step_1",
       "type": "coder",
-      "title": "Short task title",
-      "prompt": "Detailed task description for the agent",
-      "model": "cliproxy/glm-5.1",
-      "dependencies": []
+      "prompt": "Detailed task description",
+      "depends_on": []
     },
     {
-      "type": "explore",
-      "title": "Search for API endpoints",
-      "prompt": "What to search for",
-      "dependencies": [0]
+      "id": "step_2",
+      "type": "review",
+      "prompt": "Review the code",
+      "depends_on": ["step_1"]
     }
   ]
 }
 ```
-Each task must have: "type" (coder/explore/review/shell), "title" (short name), "prompt" (what the agent should do).
-Optional: "model" (provider/model format), "dependencies" (list of task indices that must complete first).
+Each task must have: "id" (unique string identifier like "step_1"), "type" (coder/explore/review/shell), "prompt" (what the agent should do).
+Optional: "depends_on" (list of task ID strings that must complete first).
 
 Alternatively, use todowrite to list your planned tasks — each todo item will be treated as a child task.
 """
@@ -204,6 +203,71 @@ def _infer_task_type(content: str) -> str:
     if any(kw in lower for kw in ("run", "execute", "command", "script", "运行", "执行")):
         return "shell"
     return "coder"
+
+
+def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
+    """Parse structured JSON plan output into (nodes, edges) for the DAG executor.
+
+    Returns None if the output doesn't contain valid structured JSON.
+    """
+    # Step 1: Try to find a JSON code block (```json ... ```)
+    json_block_pattern = r"```json\s*(\{[\s\S]*?\})\s*```"
+    match = re.search(json_block_pattern, plan_output)
+    raw_json = None
+
+    if match:
+        raw_json = match.group(1)
+
+    # Step 2: If no code block, try raw JSON (first { to last })
+    if raw_json is None:
+        first = plan_output.find("{")
+        last = plan_output.rfind("}")
+        if first != -1 and last > first:
+            raw_json = plan_output[first : last + 1]
+
+    if raw_json is None:
+        return None
+
+    # Step 3: Parse JSON and validate "tasks" array
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict) or "tasks" not in data:
+        return None
+    tasks = data["tasks"]
+    if not isinstance(tasks, list):
+        return None
+
+    # Step 4-7: Build nodes and edges
+    nodes: list[dict] = []
+    edges: list[dict] = []
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            return None
+        if "id" not in task or "type" not in task or "prompt" not in task or "depends_on" not in task:
+            return None
+
+        nodes.append({
+            "id": task["id"],
+            "type": task["type"],
+            "data": {
+                "label": task["id"],
+                "agent_type": task["type"],
+                "prompt": task["prompt"],
+            },
+        })
+
+        for dep in task["depends_on"]:
+            edges.append({
+                "id": f"e_{dep}_{task['id']}",
+                "source": dep,
+                "target": task["id"],
+            })
+
+    return (nodes, edges)
 
 
 def _validate_tasks(tasks: list) -> list[dict]:

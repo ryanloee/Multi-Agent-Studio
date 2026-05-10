@@ -43,6 +43,8 @@ async def create_workflow(
         description=body.description,
         dag_json=body.dag_json,
         workspace_directory=body.workspace_directory,
+        mode=body.mode or "manual",
+        goal=body.goal,
     )
     db.add(workflow)
     await db.flush()
@@ -106,6 +108,10 @@ async def update_workflow(
         workflow.dag_json = body.dag_json
     if body.workspace_directory is not None:
         workflow.workspace_directory = body.workspace_directory
+    if body.mode is not None:
+        workflow.mode = body.mode
+    if body.goal is not None:
+        workflow.goal = body.goal
 
     await db.flush()
     await db.refresh(workflow)

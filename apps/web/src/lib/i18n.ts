@@ -137,6 +137,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "node.review.description": "审查代码更改并提供反馈",
     "node.human.label": "人工",
     "node.human.description": "暂停等待人工审批或输入",
+
+    // ─── Workflow Dual Mode ───
+    "workflow.modeAuto": "自动规划",
+    "workflow.modeManual": "手动工作流",
+    "workflow.modeAutoDesc": "描述目标，Planner 自动构建工作流",
+    "workflow.modeManualDesc": "在画布上设计节点和连线",
+    "workflow.goalLabel": "目标",
+    "workflow.goalPlaceholder": "描述你想要实现的目标...",
   },
 
   en: {
@@ -275,5 +283,13 @@ export const translations: Record<Locale, Record<string, string>> = {
     "node.review.description": "Reviews code changes and provides feedback",
     "node.human.label": "Human",
     "node.human.description": "Pauses for human approval or input",
+
+    // ─── Workflow Dual Mode ───
+    "workflow.modeAuto": "Auto Plan",
+    "workflow.modeManual": "Manual Workflow",
+    "workflow.modeAutoDesc": "Describe your goal, Planner builds the workflow",
+    "workflow.modeManualDesc": "Design nodes and connections on canvas",
+    "workflow.goalLabel": "Goal",
+    "workflow.goalPlaceholder": "Describe what you want to achieve...",
   },
 };

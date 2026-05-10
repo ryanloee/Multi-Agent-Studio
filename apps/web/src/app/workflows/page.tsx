@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2, Workflow, Clock, Play, ArrowRight } from "lucide-react";
+import { Plus, Trash2, Workflow, Clock, Play, ArrowRight, Target, PenLine } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLocaleStore } from "@/stores/localeStore";
 import type { WorkflowSummary, RunInfo } from "@/types/api";
@@ -16,6 +16,19 @@ export default function WorkflowListPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [showCreateMenu, setShowCreateMenu] = useState(false);
+  const createMenuRef = useRef<HTMLDivElement>(null);
+
+  // Close create menu on outside click
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (createMenuRef.current && !createMenuRef.current.contains(e.target as Node)) {
+        setShowCreateMenu(false);
+      }
+    }
+    if (showCreateMenu) document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showCreateMenu]);
 
   useEffect(() => {
     let cancelled = false;
@@ -46,12 +59,13 @@ export default function WorkflowListPage() {
     [runs]
   );
 
-  const handleCreate = useCallback(async () => {
+  const handleCreate = useCallback(async (mode: "auto" | "manual" = "manual") => {
     setCreating(true);
     try {
       const newWf = await api.createWorkflow({
         name: `${t("wfList.newWorkflow")} ${workflows.length + 1}`,
         description: "",
+        mode,
       });
       router.push(`/workflows/${newWf.id}`);
     } catch (err) {
@@ -130,20 +144,49 @@ export default function WorkflowListPage() {
   if (workflows.length === 0) {
     return (
       <div className="min-h-screen bg-gradient-to-br from-gray-50 to-blue-50/30 flex items-center justify-center p-6">
-        <div className="bg-white rounded-2xl shadow-lg p-10 max-w-lg w-full text-center">
+        <div className="bg-white rounded-2xl shadow-lg p-10 max-w-2xl w-full text-center">
           <div className="w-20 h-20 bg-gradient-to-br from-blue-100 to-indigo-100 rounded-2xl flex items-center justify-center mx-auto mb-6">
             <Workflow size={36} className="text-blue-500" />
           </div>
           <h2 className="text-2xl font-bold text-gray-800 mb-3">{t("wfList.emptyTitle")}</h2>
           <p className="text-gray-500 mb-8 leading-relaxed">{t("wfList.emptyDesc")}</p>
-          <button
-            onClick={handleCreate}
-            disabled={creating}
-            className="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-md hover:shadow-lg disabled:opacity-50"
-          >
-            <Plus size={18} />
-            {t("wfList.createFirst")}
-          </button>
+
+          {/* Dual-mode creation cards */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-lg mx-auto">
+            {/* Auto mode card */}
+            <button
+              onClick={() => handleCreate("auto")}
+              disabled={creating}
+              className="group flex flex-col items-center gap-3 p-6 rounded-xl border-2 border-blue-200 bg-gradient-to-br from-blue-50 to-indigo-50 hover:border-blue-400 hover:shadow-lg transition-all disabled:opacity-50"
+            >
+              <div className="w-12 h-12 rounded-xl bg-blue-100 flex items-center justify-center group-hover:bg-blue-200 transition-colors">
+                <Target size={24} className="text-blue-600" />
+              </div>
+              <span className="text-sm font-semibold text-blue-700">
+                {t("workflow.modeAuto")}
+              </span>
+              <span className="text-xs text-blue-500 leading-relaxed">
+                {t("workflow.modeAutoDesc")}
+              </span>
+            </button>
+
+            {/* Manual mode card */}
+            <button
+              onClick={() => handleCreate("manual")}
+              disabled={creating}
+              className="group flex flex-col items-center gap-3 p-6 rounded-xl border-2 border-gray-200 bg-gradient-to-br from-gray-50 to-slate-50 hover:border-gray-400 hover:shadow-lg transition-all disabled:opacity-50"
+            >
+              <div className="w-12 h-12 rounded-xl bg-gray-100 flex items-center justify-center group-hover:bg-gray-200 transition-colors">
+                <PenLine size={24} className="text-gray-600" />
+              </div>
+              <span className="text-sm font-semibold text-gray-700">
+                {t("workflow.modeManual")}
+              </span>
+              <span className="text-xs text-gray-500 leading-relaxed">
+                {t("workflow.modeManualDesc")}
+              </span>
+            </button>
+          </div>
         </div>
       </div>
     );
@@ -164,14 +207,45 @@ export default function WorkflowListPage() {
               <p className="text-xs text-gray-400">AI Multi-Agent Workflow Platform</p>
             </div>
           </div>
-          <button
-            onClick={handleCreate}
-            disabled={creating}
-            className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50"
-          >
-            <Plus size={16} />
-            {t("wfList.newWorkflow")}
-          </button>
+          <div className="relative" ref={createMenuRef}>
+            <button
+              onClick={() => setShowCreateMenu((v) => !v)}
+              disabled={creating}
+              className="inline-flex items-center gap-2 px-5 py-2.5 text-sm font-semibold rounded-xl bg-gradient-to-r from-blue-600 to-indigo-600 text-white hover:from-blue-700 hover:to-indigo-700 transition-all shadow-sm hover:shadow-md disabled:opacity-50"
+            >
+              <Plus size={16} />
+              {t("wfList.newWorkflow")}
+            </button>
+
+            {showCreateMenu && (
+              <div className="absolute right-0 mt-2 w-64 bg-white rounded-xl shadow-lg border border-gray-200 py-2 z-20">
+                <button
+                  onClick={() => { setShowCreateMenu(false); handleCreate("auto"); }}
+                  className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-blue-50 transition-colors"
+                >
+                  <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center shrink-0">
+                    <Target size={16} className="text-blue-600" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-gray-800">{t("workflow.modeAuto")}</p>
+                    <p className="text-xs text-gray-400 mt-0.5">{t("workflow.modeAutoDesc")}</p>
+                  </div>
+                </button>
+                <button
+                  onClick={() => { setShowCreateMenu(false); handleCreate("manual"); }}
+                  className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-gray-50 transition-colors"
+                >
+                  <div className="w-8 h-8 rounded-lg bg-gray-100 flex items-center justify-center shrink-0">
+                    <PenLine size={16} className="text-gray-600" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-gray-800">{t("workflow.modeManual")}</p>
+                    <p className="text-xs text-gray-400 mt-0.5">{t("workflow.modeManualDesc")}</p>
+                  </div>
+                </button>
+              </div>
+            )}
+          </div>
         </div>
       </header>
 

@@ -15,6 +15,7 @@ import "@xyflow/react/dist/style.css";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { nodeTypes } from "@/components/canvas/nodeTypes";
+import GoalInput from "@/components/canvas/GoalInput";
 import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow";
 import { NODE_META } from "@/lib/constants";
 import type { ChildCreatedEvent } from "@/types/events";
@@ -29,10 +30,15 @@ export default function FlowCanvas() {
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
   const focusNodeId = useWorkflowStore((s) => s.focusNodeId);
   const setFocusNode = useWorkflowStore((s) => s.setFocusNode);
+  const mode = useWorkflowStore((s) => s.mode);
 
+  const runStatus = useRunStore((s) => s.status);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const allEvents = useRunStore((s) => s.events);
   const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
+
+  // Derive whether the workflow is actively running
+  const isRunning = runStatus === "running" || runStatus === "pending" || runStatus === "paused";
 
   // ---- Sync child_created events into workflowStore as real nodes ----
   useEffect(() => {
@@ -125,6 +131,11 @@ export default function FlowCanvas() {
   // ---- Child nodes are added to workflowStore via addDynamicNode ----
   // No merge needed — staticNodes already contains them.
 
+  // Auto mode + NOT running: show GoalInput instead of canvas
+  if (mode === "auto" && !isRunning) {
+    return <GoalInput />;
+  }
+
   return (
     <div className="w-full h-full relative">
       <ReactFlow
@@ -134,8 +145,8 @@ export default function FlowCanvas() {
         onEdgesChange={onEdgesChange}
         onConnect={onConnect}
         onInit={setRfInstance}
-        onDragOver={onDragOver}
-        onDrop={onDrop}
+        onDragOver={mode === "auto" ? undefined : onDragOver}
+        onDrop={mode === "auto" ? undefined : onDrop}
         onNodeClick={onNodeClick}
         onPaneClick={onPaneClick}
         nodeTypes={nodeTypes}
@@ -144,6 +155,10 @@ export default function FlowCanvas() {
         fitView
         minZoom={0.2}
         maxZoom={2}
+        nodesDraggable={mode !== "auto"}
+        nodesConnectable={mode !== "auto"}
+        elementsSelectable={mode !== "auto"}
+        deleteKeyCode={mode === "auto" ? null : undefined}
       >
         <Background gap={16} size={1} />
         <Controls />

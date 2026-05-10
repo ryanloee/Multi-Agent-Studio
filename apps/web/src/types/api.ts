@@ -48,6 +48,10 @@ export interface WorkflowDetail {
   name: string;
   description: string;
   workspace_directory?: string;
+  /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
+  mode?: string;
+  /** Natural-language goal for auto-mode workflows */
+  goal?: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   updated_at: string;
@@ -59,6 +63,10 @@ export interface CreateWorkflowRequest {
   name: string;
   description?: string;
   workspace_directory?: string;
+  /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
+  mode?: "auto" | "manual";
+  /** Natural-language goal for auto-mode workflows */
+  goal?: string;
 }
 
 /** Request body for PUT /api/workflows/:id */
@@ -66,6 +74,8 @@ export interface UpdateWorkflowRequest {
   name?: string;
   description?: string;
   workspace_directory?: string;
+  mode?: "auto" | "manual";
+  goal?: string;
   nodes?: WorkflowNode[];
   edges?: WorkflowEdge[];
 }

@@ -28,7 +28,7 @@ from app.core.local_sandbox import LocalSandbox
 from app.core.task_scheduler import TaskScheduler, ESCALATION_MARKER, PROGRESS_MARKER
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
-from app.workflows.plan_parser import parse_plan_output, PLAN_SYSTEM_SUFFIX
+from app.workflows.plan_parser import parse_plan_output, parse_plan_to_dag, PLAN_SYSTEM_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +181,47 @@ class LocalDAGExecutor:
                 parts.append(ev.get("content", ""))
         return "".join(parts)
 
+    def _build_upstream_context(
+        self,
+        node_id: str,
+        edges: list[dict],
+        layer_results: dict[str, Any],
+    ) -> str:
+        """Build a formatted string summarising upstream node outputs.
+
+        For each upstream edge targeting *node_id*, extracts the
+        ``result_summary`` from the upstream result, or falls back to the
+        last 2 000 characters of LLM text in ``raw_output``.
+        Returns an empty string when there are no upstream edges.
+        """
+        upstream_edges = [e for e in edges if e.get("target") == node_id]
+        if not upstream_edges:
+            return ""
+
+        sections: list[str] = []
+        for edge in upstream_edges:
+            source_id = edge.get("source", "")
+            if not source_id:
+                continue
+            source_result = layer_results.get(source_id)
+            if not source_result or not isinstance(source_result, dict):
+                continue
+
+            summary = source_result.get("result_summary", "")
+            if not summary:
+                raw = source_result.get("raw_output", "")
+                if raw:
+                    full_text = self._extract_llm_text(raw)
+                    summary = full_text[-2000:]
+
+            if summary:
+                sections.append(f"### {source_id}\n{summary}")
+
+        if not sections:
+            return ""
+
+        return "\n\n## 上游节点输出\n" + "\n".join(sections) + "\n"
+
     async def _execute_dag(
         self,
         run_id: str,
@@ -194,6 +235,10 @@ class LocalDAGExecutor:
         try:
             await self._emit("run_started", run_id, "")
             layer_results: dict[str, Any] = {}
+
+            # Dual-mode: track sandbox reuse and upstream data passing
+            sandbox_map: dict[str, str] = {}  # node_id -> sandbox_id
+            edges = global_config.get("_edges", [])
 
             for layer_idx, layer in enumerate(layers):
                 if cancel_event.is_set():
@@ -214,11 +259,40 @@ class LocalDAGExecutor:
                     run_id, layer_idx, len(nodes),
                 )
 
+                # -- Resolve sandbox reuse strategy for each node in the layer --
+                # For parallel fan-out (same upstream reused by multiple nodes
+                # in the same layer), only the first node reuses the sandbox;
+                # the rest get new sandboxes to avoid concurrent writes.
+                layer_sandbox_assignments: dict[str, str | None] = {}
+                reused_upstream_ids: set[str] = set()  # upstream ids already claimed
+
+                for node in nodes:
+                    n_id = node.get("id", node.get("node_id", ""))
+                    upstream_ids = [
+                        e["source"] for e in edges
+                        if e.get("target") == n_id
+                    ]
+                    resolved_sid: str | None = None
+                    if len(upstream_ids) == 1:
+                        candidate = sandbox_map.get(upstream_ids[0])
+                        if candidate and upstream_ids[0] not in reused_upstream_ids:
+                            resolved_sid = candidate
+                            reused_upstream_ids.add(upstream_ids[0])
+                    # else: 0 upstreams -> new sandbox; >1 -> new sandbox
+                    layer_sandbox_assignments[n_id] = resolved_sid
+
                 # Execute all nodes in this layer concurrently
                 tasks = [
                     self._execute_node(
                         run_id, node, layer_results, global_config, cancel_event,
                         workspace_directory=workspace_directory,
+                        sandbox_id=layer_sandbox_assignments.get(
+                            node.get("id", node.get("node_id", "")),
+                        ),
+                        upstream_context=self._build_upstream_context(
+                            node.get("id", node.get("node_id", "")),
+                            edges, layer_results,
+                        ),
                     )
                     for node in nodes
                 ]
@@ -239,6 +313,11 @@ class LocalDAGExecutor:
                         }
                     else:
                         layer_results[node_id] = result
+                        # Track sandbox for downstream reuse
+                        _sid = result.get("sandbox_id")
+                        if _sid:
+                            sandbox_map[node_id] = _sid
+
                         # Plan node: parse output and execute dynamic children
                         _node_data = node.get("data", {})
                         _atype = (
@@ -313,20 +392,34 @@ class LocalDAGExecutor:
         global_config: dict,
         cancel_event: asyncio.Event,
         workspace_directory: str | None = None,
+        sandbox_id: str | None = None,
+        upstream_context: str = "",
     ) -> dict:
-        """Execute a single DAG node: create sandbox, run agent, stream events."""
+        """Execute a single DAG node: create sandbox, run agent, stream events.
+
+        Args:
+            sandbox_id: If provided, reuse this existing sandbox instead of
+                creating a new one.  The caller is responsible for its lifecycle.
+            upstream_context: Formatted text describing upstream node outputs;
+                appended to the prompt before writing prompt.txt.
+        """
         node_id: str = node.get("id", node.get("node_id", ""))
-        workspace_id = f"ws-{node_id}-{uuid4().hex[:8]}"
         subprocess_env = _build_subprocess_env()
 
         await self._emit("node_started", run_id, node_id)
         await self._emit("status", run_id, node_id, content="running")
 
         # 1. Create sandbox container (use workspace_directory as template if set)
-        sandbox_id = await self._sandbox.create(
-            workspace_id, template_dir=workspace_directory,
-        )
-        logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
+        _owns_sandbox = False
+        if sandbox_id is None:
+            workspace_id = f"ws-{node_id}-{uuid4().hex[:8]}"
+            sandbox_id = await self._sandbox.create(
+                workspace_id, template_dir=workspace_directory,
+            )
+            _owns_sandbox = True
+            logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
+        else:
+            logger.info("Reusing sandbox %s for node %s", sandbox_id[:12], node_id)
 
         stream_file = "/workspace/.agent/stream.jsonl"
 
@@ -373,6 +466,10 @@ class LocalDAGExecutor:
 
             if agent_type == "plan":
                 prompt = prompt + PLAN_SYSTEM_SUFFIX
+
+            # Append upstream context when provided (dual-mode data passing)
+            if upstream_context:
+                prompt = prompt + upstream_context
 
             # Resolve provider URL + API key from models.json
             from app.api.models import load_provider_config
@@ -452,6 +549,7 @@ class LocalDAGExecutor:
                 "exit_code": exit_code,
                 "node_id": node_id,
                 "exec_id": exec_id,
+                "sandbox_id": sandbox_id,
             }
 
             # Capture stderr on failure for debugging
@@ -492,11 +590,12 @@ class LocalDAGExecutor:
                         sandbox_id[:12], workspace_directory, exc_info=True,
                     )
 
-            # Always clean up the sandbox
-            try:
-                await self._sandbox.destroy(sandbox_id)
-            except Exception:
-                pass
+            # Only destroy the sandbox if we created it
+            if _owns_sandbox:
+                try:
+                    await self._sandbox.destroy(sandbox_id)
+                except Exception:
+                    pass
 
     async def _stream_log_lines(
         self,
@@ -575,7 +674,7 @@ class LocalDAGExecutor:
             logger.warning("_execute_dynamic_plan: no raw_output for parent %s", parent_node_id)
             return {}
 
-        # Extract LLM text from stream.jsonl — the parser needs plain text,
+        # Extract LLM text from stream.jsonl -- the parser needs plain text,
         # not raw JSONL event lines
         extracted_text = self._extract_llm_text(raw_output)
         logger.info(
@@ -583,7 +682,40 @@ class LocalDAGExecutor:
             len(extracted_text), len(raw_output),
         )
 
-        parsed_tasks = parse_plan_output(extracted_text)
+        # In auto mode, try structured DAG parsing first
+        auto_mode = global_config.get("_mode") == "auto"
+        parsed_tasks: list[dict] = []
+
+        if auto_mode:
+            dag_result = parse_plan_to_dag(extracted_text)
+            if dag_result:
+                child_nodes, child_edges = dag_result
+                logger.info(
+                    "_execute_dynamic_plan (auto): parse_plan_to_dag returned %d nodes, %d edges",
+                    len(child_nodes), len(child_edges),
+                )
+                # Convert DAG nodes to the flat task format expected by the
+                # task scheduler below.  Each node becomes a dict with at
+                # least type, prompt, and an optional model field.
+                for dag_node in child_nodes:
+                    nd = dag_node.get("data", {})
+                    task_entry: dict = {
+                        "type": nd.get("agent_type") or dag_node.get("type", "coder"),
+                        "prompt": nd.get("prompt", ""),
+                    }
+                    if nd.get("model"):
+                        task_entry["model"] = nd["model"]
+                    parsed_tasks.append(task_entry)
+            else:
+                logger.info(
+                    "_execute_dynamic_plan (auto): parse_plan_to_dag returned None, "
+                    "falling back to parse_plan_output",
+                )
+
+        # If not auto mode, or auto mode fell back, use the legacy parser
+        if not parsed_tasks:
+            parsed_tasks = parse_plan_output(extracted_text)
+
         if not parsed_tasks:
             logger.info(
                 "Plan node %s produced no child tasks", parent_node_id,
