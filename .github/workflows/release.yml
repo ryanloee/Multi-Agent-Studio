@@ -1,0 +1,145 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Build the Windows distribution and upload it as a GitHub Release.
+  # -----------------------------------------------------------------------
+  build:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -------------------------------------------------------------------
+      # Frontend: pnpm + Node
+      # -------------------------------------------------------------------
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: apps/web/pnpm-lock.yaml
+
+      - name: Build frontend (static export)
+        run: |
+          cd apps/web
+          pnpm install --frozen-lockfile
+          pnpm build
+          # Verify the static export produced output
+          if (-not (Test-Path ".\out\index.html")) {
+            Write-Error "next build did not produce out/index.html"
+            exit 1
+          }
+        shell: pwsh
+
+      # -------------------------------------------------------------------
+      # Python: Poetry + PyInstaller
+      # -------------------------------------------------------------------
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python tooling
+        run: pip install poetry pyinstaller
+
+      - name: Install orchestrator dependencies
+        run: cd apps/orchestrator && poetry install --no-interaction
+
+      # -------------------------------------------------------------------
+      # PyInstaller
+      # -------------------------------------------------------------------
+      - name: Build executable
+        run: |
+          $webOut   = "apps/web/out"
+          $agentPkg = "apps/agent/mas_agent"
+
+          pyinstaller --noconfirm --onedir `
+            --name "MAS-Studio" `
+            --add-data "$webOut;static" `
+            --add-data "$agentPkg;mas_agent" `
+            --hidden-import uvicorn.logging `
+            --hidden-import uvicorn.loops.auto `
+            --hidden-import uvicorn.protocols.http.auto `
+            --hidden-import uvicorn.protocols.websockets.auto `
+            --hidden-import uvicorn.lifespan.on `
+            --hidden-import app.main `
+            --hidden-import app.config `
+            --hidden-import app.api.workflows `
+            --hidden-import app.api.runs `
+            --hidden-import app.api.models `
+            --hidden-import app.api.tasks `
+            --hidden-import app.api.planner_chat `
+            --hidden-import app.api.settings `
+            --hidden-import app.core.local_engine `
+            --hidden-import app.core.local_sandbox `
+            --hidden-import app.core.local_bus `
+            --hidden-import app.core.database `
+            --hidden-import app.core.task_scheduler `
+            --hidden-import app.workflows.compiler `
+            --hidden-import app.workflows.plan_parser `
+            --hidden-import app.models.db `
+            --hidden-import app.models.schemas `
+            --hidden-import app.models.task `
+            --hidden-import app.sandbox.checkpoint `
+            --hidden-import app.sandbox.provision `
+            --hidden-import app.ws.hub `
+            --hidden-import mas_agent `
+            --hidden-import mas_agent.loop `
+            --hidden-import mas_agent.providers `
+            --hidden-import mas_agent.providers.base `
+            --hidden-import mas_agent.providers.anthropic_provider `
+            --hidden-import mas_agent.tools `
+            --hidden-import mas_agent.tools.glob_tool `
+            --hidden-import mas_agent.tools.grep_tool `
+            --hidden-import mas_agent.tools.read_tool `
+            --hidden-import mas_agent.tools.write_tool `
+            --hidden-import mas_agent.tools.edit_tool `
+            --hidden-import mas_agent.tools.shell_tool `
+            --hidden-import mas_agent.tools.apply_patch_tool `
+            --hidden-import mas_agent.tools.output_utils `
+            --hidden-import mas_agent.prompts `
+            --hidden-import mas_agent.events `
+            --hidden-import mas_agent.permission `
+            --hidden-import mas_agent.compaction `
+            --hidden-import mas_agent.snapshot `
+            --hidden-import mas_agent.tool_repair `
+            --hidden-import mas_agent.types `
+            --hidden-import aiosqlite `
+            --collect-all aiosqlite `
+            "apps/orchestrator/app/launcher.py"
+        shell: pwsh
+
+      # -------------------------------------------------------------------
+      # Package
+      # -------------------------------------------------------------------
+      - name: Create ZIP archive
+        run: |
+          $version = "${{ github.ref_name }}"
+          $archive = "dist/MAS-Studio-$version-win64.zip"
+          if (Test-Path $archive) { Remove-Item $archive -Force }
+          Compress-Archive -Path dist/MAS-Studio -DestinationPath $archive
+          Write-Host "Created $archive ($(Get-Item $archive).Length / 1MB MB)"
+        shell: pwsh
+
+      # -------------------------------------------------------------------
+      # Release
+      # -------------------------------------------------------------------
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/MAS-Studio-*.zip
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
