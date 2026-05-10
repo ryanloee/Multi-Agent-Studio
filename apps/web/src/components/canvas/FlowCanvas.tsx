@@ -28,7 +28,6 @@ export default function FlowCanvas() {
   const addNode = useWorkflowStore((s) => s.addNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
 
-  const runStatus = useRunStore((s) => s.status);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const allEvents = useRunStore((s) => s.events);
   const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
@@ -91,11 +90,9 @@ export default function FlowCanvas() {
   const onNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {
       setSelectedNode(node.id);
-      if (runStatus === "running" || runStatus === "paused") {
-        setSelectedRunNode(node.id);
-      }
+      setSelectedRunNode(node.id);
     },
-    [setSelectedNode, runStatus, setSelectedRunNode]
+    [setSelectedNode, setSelectedRunNode]
   );
 
   // ---- Pane click: deselect ----
