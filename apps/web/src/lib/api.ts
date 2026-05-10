@@ -13,7 +13,7 @@ import type {
 // Configuration
 // ---------------------------------------------------------------------------
 const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api";
+  process.env.NEXT_PUBLIC_API_URL || "/api";
 
 // ---------------------------------------------------------------------------
 // Custom error class — wraps API errors with structured data
@@ -220,10 +220,9 @@ export const api = {
   // ---- Runs ----
 
   /** Trigger a new run for a workflow */
-  triggerRun: (workflowId: string, input?: Record<string, unknown>): Promise<TriggerRunResponse> =>
-    request<TriggerRunResponse>(`/workflows/${workflowId}/run`, {
+  triggerRun: (workflowId: string): Promise<TriggerRunResponse> =>
+    request<TriggerRunResponse>(`/runs/${workflowId}/run`, {
       method: "POST",
-      body: JSON.stringify({ input }),
     }),
 
   /** Get run details by ID */
@@ -253,6 +252,8 @@ export const api = {
   // ---- Models ----
 
   /** List available LLM models */
-  listModels: (): Promise<ModelInfo[]> =>
-    request<ModelInfo[]>("/models"),
+  listModels: async (): Promise<ModelInfo[]> => {
+    const data = await request<{ models: ModelInfo[] }>("/models");
+    return data.models ?? [];
+  },
 };

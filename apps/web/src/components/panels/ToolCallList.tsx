@@ -159,12 +159,15 @@ function ToolCallItem({ pair }: { pair: PairedToolCall }) {
 // ---------------------------------------------------------------------------
 export default function ToolCallList({ nodeId = "" }: ToolCallListProps) {
   const t = useLocaleStore((s) => s.t);
-  const events = useRunStore((s) =>
-    s.events.filter(
-      (e) =>
-        (e.type === "tool_call" || e.type === "tool_result") &&
-        (nodeId === "" || e.node_id === nodeId)
-    )
+  const allEvents = useRunStore((s) => s.events);
+  const events = useMemo(
+    () =>
+      allEvents.filter(
+        (e) =>
+          (e.type === "tool_call" || e.type === "tool_result") &&
+          (nodeId === "" || e.node_id === nodeId)
+      ),
+    [allEvents, nodeId]
   );
 
   // Pair tool_calls with their results by matching tool_name + node_id + proximity

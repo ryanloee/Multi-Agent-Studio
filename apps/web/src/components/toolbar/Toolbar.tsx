@@ -51,8 +51,10 @@ export default function Toolbar({
 
   const STATUS_LABELS: Record<RunStatus, string> = {
     idle: t("toolbar.status.idle"),
+    pending: t("toolbar.status.idle"),
     running: t("toolbar.status.running"),
     paused: t("toolbar.status.paused"),
+    cancelling: t("toolbar.status.cancel"),
     completed: t("toolbar.status.completed"),
     failed: t("toolbar.status.failed"),
   };
@@ -77,7 +79,7 @@ export default function Toolbar({
     try {
       clearEvents();
       const result = await api.triggerRun(workflowId);
-      setRunId(result.run_id);
+      setRunId(result.id);
       setStatus("running");
     } catch (err) {
       console.error("Run trigger failed:", err);

@@ -1,6 +1,7 @@
 import { create } from "zustand";
+import { useMemo } from "react";
 import type { RunStatus } from "@/types/workflow";
-import type { StreamEvent, StreamEventType, StatusEvent } from "@/types/events";
+import type { StreamEvent, StreamEventType, StatusEvent, ChildCreatedEvent, ChildCompletedEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -11,6 +12,10 @@ interface RunState {
   events: StreamEvent[];
   /** Per-node run status, keyed by node_id */
   nodeStatuses: Record<string, RunStatus>;
+  /** Currently selected node for run detail view in bottom panel */
+  selectedRunNodeId: string | null;
+  /** Parent-to-children mapping: parentId → childNodeIds */
+  parentChildMap: Record<string, string[]>;
 
   // Actions
   setRunId: (id: string | null) => void;
@@ -18,13 +23,16 @@ interface RunState {
   addEvent: (event: StreamEvent) => void;
   clearEvents: () => void;
   setNodeStatus: (nodeId: string, status: RunStatus) => void;
+  setSelectedRunNode: (id: string | null) => void;
+  /** Register a child node under a parent planner */
+  registerChild: (parentId: string, childId: string) => void;
 }
 
 // ---------------------------------------------------------------------------
 // Helper: derive RunStatus from event content string
 // ---------------------------------------------------------------------------
 function parseRunStatus(raw: string): RunStatus | null {
-  const valid: RunStatus[] = ["idle", "running", "paused", "completed", "failed"];
+  const valid: RunStatus[] = ["idle", "pending", "running", "paused", "cancelling", "completed", "failed"];
   if (valid.includes(raw as RunStatus)) return raw as RunStatus;
   return null;
 }
@@ -37,6 +45,8 @@ export const useRunStore = create<RunState>((set, get) => ({
   status: "idle",
   events: [],
   nodeStatuses: {},
+  selectedRunNodeId: null,
+  parentChildMap: {},
 
   setRunId: (id) => set({ runId: id }),
 
@@ -98,14 +108,80 @@ export const useRunStore = create<RunState>((set, get) => ({
       return;
     }
 
+    // Handle child_created — register parent-child relationship, set child status to running
+    if (event.type === "child_created") {
+      const childEvent = event as ChildCreatedEvent;
+      const parentId = event.node_id;
+      const childId = childEvent.child_node_id;
+      if (parentId && childId) {
+        const existing = state.parentChildMap[parentId] ?? [];
+        set({
+          events: [...state.events, event],
+          parentChildMap: {
+            ...state.parentChildMap,
+            [parentId]: [...existing, childId],
+          },
+          nodeStatuses: {
+            ...state.nodeStatuses,
+            [childId]: "running",
+          },
+        });
+        return;
+      }
+    }
+
+    // Handle child_completed — mark child as completed
+    if (event.type === "child_completed") {
+      const childEvent = event as ChildCompletedEvent;
+      const childId = childEvent.child_node_id;
+      if (childId) {
+        set({
+          events: [...state.events, event],
+          nodeStatuses: {
+            ...state.nodeStatuses,
+            [childId]: "completed",
+          },
+        });
+        return;
+      }
+    }
+
+    // Infer node running status from activity events
+    // (node_started may be missed if WS connected after it was published)
+    if (event.node_id) {
+      const currentStatus = state.nodeStatuses[event.node_id];
+      if (!currentStatus || currentStatus === "idle") {
+        set({
+          events: [...state.events, event],
+          nodeStatuses: {
+            ...state.nodeStatuses,
+            [event.node_id]: "running",
+          },
+        });
+        return;
+      }
+    }
+
     // Default: just append the event
     set({ events: [...state.events, event] });
   },
 
-  clearEvents: () => set({ events: [], nodeStatuses: {} }),
+  clearEvents: () => set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {} }),
 
   setNodeStatus: (nodeId: string, status: RunStatus) => {
     set({ nodeStatuses: { ...get().nodeStatuses, [nodeId]: status } });
+  },
+
+  setSelectedRunNode: (id) => set({ selectedRunNodeId: id }),
+
+  registerChild: (parentId: string, childId: string) => {
+    const existing = get().parentChildMap[parentId] ?? [];
+    set({
+      parentChildMap: {
+        ...get().parentChildMap,
+        [parentId]: [...existing, childId],
+      },
+    });
   },
 }));
 
@@ -115,14 +191,14 @@ export const useRunStore = create<RunState>((set, get) => ({
 
 /** Select events filtered by type */
 export function useEventsByType(type: StreamEventType): StreamEvent[] {
-  return useRunStore((state) => state.events.filter((e) => e.type === type));
+  const all = useRunStore((s) => s.events);
+  return useMemo(() => all.filter((e) => e.type === type), [all, type]);
 }
 
 /** Select events filtered by node_id */
 export function useEventsByNode(nodeId: string): StreamEvent[] {
-  return useRunStore((state) =>
-    state.events.filter((e) => e.node_id === nodeId)
-  );
+  const all = useRunStore((s) => s.events);
+  return useMemo(() => all.filter((e) => e.node_id === nodeId), [all, nodeId]);
 }
 
 /** Select the current RunStatus for a specific node */
@@ -130,4 +206,10 @@ export function useNodeStatus(nodeId: string): RunStatus {
   return useRunStore(
     (state) => state.nodeStatuses[nodeId] ?? "idle"
   );
+}
+
+/** Select child node IDs for a given parent planner node */
+export function useChildrenOfNode(parentId: string): string[] {
+  const children = useRunStore((state) => state.parentChildMap[parentId]);
+  return useMemo(() => children ?? [], [children]);
 }

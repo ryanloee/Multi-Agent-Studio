@@ -12,7 +12,9 @@ const CoderNode = memo(function CoderNode(props: NodeProps) {
   return (
     <BaseNode {...props}>
       {data.modelId && (
-        <span className="text-gray-400">{data.modelId}</span>
+        <span className="text-gray-400">
+          {data.modelProvider ? `${data.modelProvider}/${data.modelId}` : data.modelId}
+        </span>
       )}
     </BaseNode>
   );

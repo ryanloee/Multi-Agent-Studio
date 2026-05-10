@@ -31,7 +31,7 @@ export function useWebSocket(
   runId: string | null,
   options: UseWebSocketOptions = {},
 ): UseWebSocketReturn {
-  const { baseUrl = "ws://localhost:8000", autoReconnect = true } = options;
+  const { baseUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000", autoReconnect = true } = options;
 
   const wsRef = useRef<WebSocket | null>(null);
   const addEvent = useRunStore((s) => s.addEvent);
@@ -79,7 +79,7 @@ export function useWebSocket(
     function connect() {
       if (cancelled || manualCloseRef.current) return;
 
-      const url = `${baseUrl}/runs/${runId}/stream`;
+      const url = `${baseUrl}/ws/runs/${runId}/stream`;
       const ws = new WebSocket(url);
 
       ws.onopen = () => {

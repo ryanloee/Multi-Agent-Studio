@@ -17,7 +17,10 @@ export type StreamEventType =
   | "run_failed"
   | "node_started"
   | "node_completed"
-  | "node_failed";
+  | "node_failed"
+  | "child_created"
+  | "child_completed"
+  | "ping";
 
 // ---------------------------------------------------------------------------
 // Base event shape — every event carries these fields
@@ -138,6 +141,28 @@ export interface NodeFailedEvent extends StreamEvent {
   content: string;
 }
 
+/** Planner dynamically created a child node */
+export interface ChildCreatedEvent extends StreamEvent {
+  type: "child_created";
+  /** The newly created child node's ID */
+  child_node_id: string;
+  /** The agent type of the child node */
+  child_type: string;
+  /** The prompt assigned to the child */
+  child_prompt: string;
+  /** The model assigned to the child */
+  child_model: string;
+}
+
+/** A dynamically created child node has completed */
+export interface ChildCompletedEvent extends StreamEvent {
+  type: "child_completed";
+  /** The child node that completed */
+  child_node_id: string;
+  /** Summary of the child's output */
+  content?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Event map — maps type discriminator to the concrete event interface
 // ---------------------------------------------------------------------------
@@ -156,4 +181,6 @@ export interface StreamEventMap {
   node_started: NodeStartedEvent;
   node_completed: NodeCompletedEvent;
   node_failed: NodeFailedEvent;
+  child_created: ChildCreatedEvent;
+  child_completed: ChildCompletedEvent;
 }

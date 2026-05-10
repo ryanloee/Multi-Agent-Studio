@@ -13,6 +13,7 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import { useWorkflowStore } from "@/stores/workflowStore";
+import { useRunStore } from "@/stores/runStore";
 import { nodeTypes } from "@/components/canvas/nodeTypes";
 import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow";
 import { NODE_META } from "@/lib/constants";
@@ -25,6 +26,9 @@ export default function FlowCanvas() {
   const onConnect = useWorkflowStore((s) => s.onConnect);
   const addNode = useWorkflowStore((s) => s.addNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
+
+  const runStatus = useRunStore((s) => s.status);
+  const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
 
   // ---- React Flow instance ref (for screenToFlowPosition in onDrop) ----
   const rfInstanceRef = useRef<ReactFlowInstance<WorkflowNode, WorkflowEdge> | null>(null);
@@ -59,18 +63,22 @@ export default function FlowCanvas() {
     [addNode]
   );
 
-  // ---- Node click: select node ----
+  // ---- Node click: select node (+ set run node during active run) ----
   const onNodeClick: NodeMouseHandler = useCallback(
     (_event, node) => {
       setSelectedNode(node.id);
+      if (runStatus === "running" || runStatus === "paused") {
+        setSelectedRunNode(node.id);
+      }
     },
-    [setSelectedNode]
+    [setSelectedNode, runStatus, setSelectedRunNode]
   );
 
   // ---- Pane click: deselect ----
   const onPaneClick = useCallback(() => {
     setSelectedNode(null);
-  }, [setSelectedNode]);
+    setSelectedRunNode(null);
+  }, [setSelectedNode, setSelectedRunNode]);
 
   return (
     <div className="w-full h-full relative">

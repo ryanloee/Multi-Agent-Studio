@@ -1,10 +1,21 @@
 """Pydantic request / response schemas for the REST API."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, Field, computed_field, field_validator, model_validator
+
+
+def _ensure_utc(dt: datetime) -> datetime:
+    """Ensure datetime has UTC timezone info for correct JSON serialization.
+
+    SQLite stores datetimes as naive (no tz), but they are actually UTC.
+    This prevents the 8-hour offset bug when the frontend interprets them.
+    """
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +54,11 @@ class WorkflowResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _utc_aware(cls, v: datetime) -> datetime:
+        return _ensure_utc(v)
+
     @computed_field
     @property
     def nodes(self) -> list[dict[str, Any]]:
@@ -69,9 +85,14 @@ class RunResponse(BaseModel):
     id: UUID
     workflow_id: UUID
     status: str
-    temporal_workflow_id: Optional[str] = None
+    engine_workflow_id: Optional[str] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
+
+    @field_validator("created_at", "completed_at", mode="before")
+    @classmethod
+    def _utc_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        return _ensure_utc(v) if v is not None else None
 
     model_config = {"from_attributes": True}
 
@@ -86,5 +107,10 @@ class NodeExecutionResponse(BaseModel):
     completed_at: Optional[datetime] = None
     exit_code: Optional[int] = None
     error_message: Optional[str] = None
+
+    @field_validator("started_at", "completed_at", mode="before")
+    @classmethod
+    def _utc_aware(cls, v: Optional[datetime]) -> Optional[datetime]:
+        return _ensure_utc(v) if v is not None else None
 
     model_config = {"from_attributes": True}

@@ -8,32 +8,38 @@ GET    /{run_id}/diff         - Get Git diff (Human-in-the-Loop)
 GET    /{run_id}/nodes        - Get node execution details
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from temporalio.client import Client
 
-from app.config import settings
 from app.core.database import get_db
 from app.models.db import Run, NodeExecution
 from app.models.schemas import TriggerRunRequest, RunResponse, NodeExecutionResponse
 
+if TYPE_CHECKING:
+    from app.core.local_engine import LocalDAGExecutor
+
 router = APIRouter()
 
-# Lazy Temporal client singleton
-_temporal_client: Client | None = None
+# Module-level engine singleton — initialised by main.py lifespan
+_engine: LocalDAGExecutor | None = None
 
 
-async def _get_temporal_client() -> Client:
-    global _temporal_client
-    if _temporal_client is None:
-        _temporal_client = await Client.connect(
-            settings.temporal_host,
-            namespace=settings.temporal_namespace,
-        )
-    return _temporal_client
+def init_engine(engine: LocalDAGExecutor) -> None:
+    """Set the module-level DAG executor.  Called once during app startup."""
+    global _engine
+    _engine = engine
+
+
+def _require_engine() -> LocalDAGExecutor:
+    if _engine is None:
+        raise HTTPException(status_code=503, detail="Workflow engine not initialised")
+    return _engine
 
 
 @router.post("/{workflow_id}/run", response_model=RunResponse, status_code=201)
@@ -42,18 +48,19 @@ async def trigger_run(
     body: TriggerRunRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Trigger workflow execution via Temporal DAGWorkflow.
+    """Trigger workflow execution via the local DAG engine.
 
     Steps:
     1. Look up workflow from DB to get DAG JSON.
     2. Override DAG with request body if provided.
     3. Compile DAG into execution layers via compiler.compile_dag().
-    4. Convert layers into DAGParams.
-    5. Start DAGWorkflow as a Temporal workflow.
+    4. Convert layers into dicts for the LocalDAGExecutor.
+    5. Start DAG execution in the background.
     6. Persist run record to DB and return it.
     """
     from app.workflows.compiler import compile_dag
-    from app.workflows.dag_workflow import DAGParams, DAGLayer, DAGNode, DAGWorkflow
+
+    engine = _require_engine()
 
     # 1. Fetch workflow
     from app.models.db import Workflow
@@ -78,37 +85,46 @@ async def trigger_run(
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # 4. Convert to DAGParams
+    # 4. Serialise layers into dicts for the engine
+    #    Frontend sends camelCase (agentType, modelProvider, modelId).
+    #    Engine expects snake_case — normalise here.
     run_id = uuid4()
-    layers: list[DAGLayer] = []
+    layers_data: list[dict] = []
     for layer_nodes in compiled_layers:
-        dag_nodes = []
+        layer_list = []
         for node_def in layer_nodes:
             node_data = node_def.get("data", node_def)
-            dag_nodes.append(DAGNode(
-                id=node_def.get("id", ""),
-                agent_type=node_data.get("agent_type", "build"),
-                model_provider=node_data.get("model_provider", ""),
-                model_id=node_data.get("model_id", ""),
-                prompt=node_data.get("prompt", ""),
-                upstream_ids=node_data.get("upstream_ids", []),
-                extra=node_data.get("extra", {}),
-            ))
-        layers.append(DAGLayer(nodes=dag_nodes))
+            # Accept both camelCase (from frontend) and snake_case
+            agent_type = (
+                node_data.get("agent_type")
+                or node_data.get("agentType")
+                or "coder"
+            )
+            model_provider = (
+                node_data.get("model_provider")
+                or node_data.get("modelProvider")
+                or ""
+            )
+            model_id = (
+                node_data.get("model_id")
+                or node_data.get("modelId")
+                or ""
+            )
+            prompt = node_data.get("prompt", "")
+            layer_list.append({
+                "id": node_def.get("id", ""),
+                "agent_type": agent_type,
+                "model_provider": model_provider,
+                "model_id": model_id,
+                "prompt": prompt,
+            })
+        layers_data.append(layer_list)
 
-    params = DAGParams(
+    # 5. Start DAG execution via LocalDAGExecutor
+    await engine.start_workflow(
         run_id=str(run_id),
-        layers=layers,
+        layers=layers_data,
         global_config=global_config,
-    )
-
-    # 5. Start DAGWorkflow via Temporal
-    client = await _get_temporal_client()
-    handle = await client.start_workflow(
-        DAGWorkflow.run,
-        params,
-        id=f"dag-{workflow_id}-{run_id}",
-        task_queue=settings.temporal_task_queue,
     )
 
     # 6. Persist run record
@@ -116,7 +132,7 @@ async def trigger_run(
         id=run_id,
         workflow_id=workflow_id,
         status="running",
-        temporal_workflow_id=handle.id,
+        engine_workflow_id=str(run_id),
     )
     db.add(run)
     await db.flush()
@@ -153,22 +169,15 @@ async def get_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    # Optionally enrich with Temporal status
-    if run.temporal_workflow_id and run.status == "running":
+    # Enrich with engine status if the run is still running
+    if run.status == "running" and _engine is not None:
         try:
-            client = await _get_temporal_client()
-            handle = client.get_workflow_handle(run.temporal_workflow_id)
-            descr = await handle.describe()
-            if descr.status:
-                temporal_status = str(descr.status.name).lower()
-                if temporal_status == "completed":
-                    run.status = "completed"
-                elif temporal_status == "failed":
-                    run.status = "failed"
-                elif temporal_status == "cancelled":
-                    run.status = "cancelled"
+            engine_status = await _engine.get_status(str(run.id))
+            engine_state = engine_status.get("status", "")
+            if engine_state in ("completed", "failed", "cancelled"):
+                run.status = engine_state
         except Exception:
-            pass  # Temporal not available, return DB status
+            pass  # Engine not available, return DB status
 
     return run
 
@@ -178,7 +187,7 @@ async def cancel_run(
     run_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Cancel a running workflow via Temporal."""
+    """Cancel a running workflow."""
     result = await db.execute(
         select(Run).where(Run.id == run_id)
     )
@@ -189,13 +198,10 @@ async def cancel_run(
     if run.status not in ("running", "pending"):
         raise HTTPException(status_code=400, detail=f"Cannot cancel run in status '{run.status}'")
 
-    if not run.temporal_workflow_id:
-        raise HTTPException(status_code=400, detail="No Temporal workflow associated")
+    engine = _require_engine()
 
-    # Cancel via Temporal
-    client = await _get_temporal_client()
-    handle = client.get_workflow_handle(run.temporal_workflow_id)
-    await handle.cancel()
+    # Cancel via LocalDAGExecutor
+    await engine.cancel(str(run.id))
 
     # Update DB
     run.status = "cancelling"
@@ -230,6 +236,6 @@ async def get_run_nodes(
 
 @router.post("/{run_id}/approve")
 async def approve_run(run_id: str):
-    """Human-in-the-Loop approval via Temporal Signal."""
-    # TODO: Send Temporal Signal for HITL approval
+    """Human-in-the-Loop approval."""
+    # TODO: Implement HITL approval via engine
     return {"status": "approved", "run_id": run_id}

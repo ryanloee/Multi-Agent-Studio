@@ -1,5 +1,6 @@
 # Multi-Agent Studio - Windows Setup Script (PowerShell)
 # Run this once after cloning the repository
+# Requires: Python 3.10+ and Node.js 18+ (no Docker needed)
 
 $ErrorActionPreference = "Stop"
 
@@ -12,15 +13,9 @@ Write-Host "Project root: $ProjectRoot" -ForegroundColor Gray
 Write-Host ""
 
 # 1. Check prerequisites
-Write-Host "[1/5] Checking prerequisites..." -ForegroundColor Yellow
+Write-Host "[1/4] Checking prerequisites..." -ForegroundColor Yellow
 
 $missing = @()
-
-if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    $missing += "docker"
-} else {
-    Write-Host "  docker: $(docker --version)" -ForegroundColor Green
-}
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue) -and -not (Get-Command python3 -ErrorAction SilentlyContinue)) {
     $missing += "python"
@@ -50,8 +45,7 @@ if ($missing.Count -gt 0) {
     Write-Host "Please install them first:" -ForegroundColor Red
     foreach ($m in $missing) {
         switch ($m) {
-            "docker" { Write-Host "  - Docker Desktop: https://docs.docker.com/desktop/install/windows-install/" }
-            "python" { Write-Host "  - Python 3.11+: https://www.python.org/downloads/" }
+            "python" { Write-Host "  - Python 3.10+: https://www.python.org/downloads/" }
             "node"   { Write-Host "  - Node.js 18+: https://nodejs.org/" }
         }
     }
@@ -59,7 +53,7 @@ if ($missing.Count -gt 0) {
 }
 
 # 2. Install frontend dependencies
-Write-Host "[2/5] Installing frontend dependencies..." -ForegroundColor Yellow
+Write-Host "[2/4] Installing frontend dependencies..." -ForegroundColor Yellow
 Set-Location "$ProjectRoot\apps\web"
 if (Get-Command pnpm -ErrorAction SilentlyContinue) {
     pnpm install
@@ -69,7 +63,7 @@ if (Get-Command pnpm -ErrorAction SilentlyContinue) {
 Set-Location $ProjectRoot
 
 # 3. Install Python dependencies
-Write-Host "[3/5] Installing Python dependencies..." -ForegroundColor Yellow
+Write-Host "[3/4] Installing Python dependencies..." -ForegroundColor Yellow
 Set-Location "$ProjectRoot\apps\orchestrator"
 
 if (-not (Get-Command poetry -ErrorAction SilentlyContinue)) {
@@ -77,7 +71,6 @@ if (-not (Get-Command poetry -ErrorAction SilentlyContinue)) {
     pip install poetry
 }
 
-# Detect poetry command
 $PoetryCmd = "poetry"
 $PoetryArgs = @()
 if (-not (Get-Command poetry -ErrorAction SilentlyContinue)) {
@@ -94,13 +87,15 @@ if (-not (Test-Path "README.md")) {
 & $PoetryCmd ($PoetryArgs + @("install", "--no-root"))
 Set-Location $ProjectRoot
 
-# 4. Build sandbox Docker image
-Write-Host "[4/5] Building sandbox base image (this may take 5-10 minutes)..." -ForegroundColor Yellow
-docker build -t multi-agent-studio/sandbox-base:latest "$ProjectRoot\infra\sandbox-images\base"
-
-# 5. Start infrastructure
-Write-Host "[5/5] Starting infrastructure (PostgreSQL, Redis, Temporal, MinIO)..." -ForegroundColor Yellow
-docker compose -f "$ProjectRoot\infra\docker-compose.yml" up -d
+# 4. Create SQLite data directory
+Write-Host "[4/4] Creating data directory..." -ForegroundColor Yellow
+$DataDir = Join-Path $ProjectRoot "apps\orchestrator\data"
+if (-not (Test-Path $DataDir)) {
+    New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
+    Write-Host "  Created: $DataDir" -ForegroundColor Green
+} else {
+    Write-Host "  Already exists: $DataDir" -ForegroundColor Green
+}
 
 Write-Host ""
 Write-Host "=== Setup Complete ===" -ForegroundColor Green
@@ -110,9 +105,7 @@ Write-Host "  .\scripts\dev.ps1" -ForegroundColor White
 Write-Host ""
 Write-Host "Or start services manually in separate terminals:" -ForegroundColor Cyan
 Write-Host "  Terminal 1: cd apps\orchestrator ; poetry run python -m app.main" -ForegroundColor White
-Write-Host "  Terminal 2: cd apps\orchestrator ; poetry run python -m app.workflows.worker" -ForegroundColor White
-Write-Host "  Terminal 3: cd apps\web ; pnpm dev" -ForegroundColor White
+Write-Host "  Terminal 2: cd apps\web ; pnpm dev" -ForegroundColor White
 Write-Host ""
-Write-Host "  Frontend:     http://localhost:3000" -ForegroundColor White
-Write-Host "  API Docs:     http://localhost:8000/docs" -ForegroundColor White
-Write-Host "  Temporal UI:  http://localhost:8088" -ForegroundColor White
+Write-Host "  Frontend: http://localhost:3000" -ForegroundColor White
+Write-Host "  API Docs: http://localhost:8000/docs" -ForegroundColor White

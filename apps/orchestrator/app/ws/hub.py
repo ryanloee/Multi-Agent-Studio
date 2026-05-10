@@ -1,102 +1,65 @@
-"""WebSocket Hub: subscribes to Redis Pub/Sub channels and pushes events
+"""WebSocket Hub: subscribes to the in-process event bus and pushes events
 to all connected WebSocket clients for a given run.
 
 Features:
-- Lazy Redis connection (created on first subscriber).
-- Per-run pubsub: first client connects -> subscribe; last disconnects -> unsubscribe.
+- Per-run subscription: first client connects -> subscribe; last disconnects -> unsubscribe.
 - 30-second heartbeat pings to keep connections alive.
 """
 
 import asyncio
 import json
 import logging
+from collections import deque
 from typing import Any
 
-import redis.asyncio as redis
 from fastapi import WebSocket
 
-from app.config import settings
+from app.core.local_bus import InProcessEventBus
 
 logger = logging.getLogger(__name__)
 
 # Heartbeat interval in seconds
 _HEARTBEAT_INTERVAL = 30
 
+# Max buffered events per run (prevents unbounded memory growth)
+_MAX_BUFFER_SIZE = 500
+
 
 class WebSocketHub:
-    """Manages WebSocket connections grouped by run_id and bridges Redis
-    pub/sub messages to those connections."""
+    """Manages WebSocket connections grouped by run_id and bridges
+    in-process event bus messages to those connections."""
 
-    def __init__(self):
+    def __init__(self, event_bus: InProcessEventBus):
         self._connections: dict[str, list[WebSocket]] = {}  # run_id -> [ws]
-        self._redis: redis.Redis | None = None
-        self._pubsub: redis.client.PubSub | None = None
-        self._sub_tasks: dict[str, asyncio.Task] = {}  # run_id -> listener task
+        self._event_bus = event_bus
         self._heartbeat_tasks: dict[str, asyncio.Task] = {}  # run_id -> heartbeat task
+        self._event_buffer: dict[str, deque[dict]] = {}  # run_id -> buffered events
 
     # ------------------------------------------------------------------
-    # Redis helpers
+    # Event bus helpers
     # ------------------------------------------------------------------
-
-    async def _get_redis(self) -> redis.Redis:
-        if self._redis is None:
-            self._redis = redis.from_url(settings.redis_url, decode_responses=True)
-        return self._redis
 
     @staticmethod
     def _channel_name(run_id: str) -> str:
         return f"run:{run_id}:stream"
 
-    async def _start_pubsub(self, run_id: str) -> None:
-        """Subscribe to Redis channel for *run_id* and start the listener."""
-        if run_id in self._sub_tasks:
-            return  # Already subscribed
-
-        r = await self._get_redis()
-        if self._pubsub is None:
-            self._pubsub = r.pubsub()
-
+    async def _start_listening(self, run_id: str) -> None:
+        """Subscribe to event bus channel for *run_id*."""
+        if run_id in self._connections and len(self._connections[run_id]) > 1:
+            return  # Already listening
         channel = self._channel_name(run_id)
-        await self._pubsub.subscribe(channel)
-        self._sub_tasks[run_id] = asyncio.create_task(
-            self._listen(run_id), name=f"pubsub-{run_id}"
-        )
-        logger.info("Subscribed to Redis channel %s", channel)
 
-    async def _stop_pubsub(self, run_id: str) -> None:
-        """Unsubscribe from Redis channel for *run_id* and cancel listener."""
-        task = self._sub_tasks.pop(run_id, None)
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+        async def callback(event: dict):
+            await self.broadcast(run_id, event)
 
-        if self._pubsub is not None:
-            channel = self._channel_name(run_id)
-            await self._pubsub.unsubscribe(channel)
-            logger.info("Unsubscribed from Redis channel %s", channel)
+        await self._event_bus.subscribe(channel, callback)
+        logger.info("Subscribed to event bus channel %s", channel)
 
-    async def _listen(self, run_id: str) -> None:
-        """Background task: read messages from Redis pub/sub and broadcast."""
+    async def _stop_listening(self, run_id: str) -> None:
+        """Unsubscribe from event bus channel for *run_id*."""
         channel = self._channel_name(run_id)
-        try:
-            while True:
-                message = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=1.0
-                )
-                if message and message["type"] == "message":
-                    try:
-                        data = json.loads(message["data"])
-                    except (json.JSONDecodeError, TypeError):
-                        data = {"type": "raw", "content": message["data"]}
-                    await self.broadcast(run_id, data)
-                await asyncio.sleep(0.05)  # Small sleep to avoid busy loop
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Redis listener error for run %s", run_id)
+        await self._event_bus.unsubscribe(channel)
+        logger.info("Unsubscribed from event bus channel %s", channel)
 
     # ------------------------------------------------------------------
     # Heartbeat
@@ -136,23 +99,36 @@ class WebSocketHub:
     async def connect(self, websocket: WebSocket, run_id: str) -> None:
         """Accept a WebSocket connection and register it for *run_id*.
 
-        On first connection for a run, also starts the Redis pubsub listener
-        and heartbeat task.
+        On first connection for a run, also starts the event bus listener
+        and heartbeat task.  Flushes any buffered events to the new client.
         """
         await websocket.accept()
         if run_id not in self._connections:
             self._connections[run_id] = []
-            # First client -> start Redis subscription + heartbeat
-            await self._start_pubsub(run_id)
+            # First client -> start event bus subscription + heartbeat
+            await self._start_listening(run_id)
             await self._start_heartbeat(run_id)
         self._connections[run_id].append(websocket)
+
+        # Flush buffered events so late-connecting clients don't miss early ones
+        buffer = self._event_buffer.get(run_id)
+        if buffer:
+            logger.info(
+                "Flushing %d buffered events for run %s", len(buffer), run_id
+            )
+            for msg in buffer:
+                try:
+                    await websocket.send_text(json.dumps(msg))
+                except Exception:
+                    break
+
         logger.info(
             "WebSocket connected for run %s (%d clients)",
             run_id, len(self._connections[run_id]),
         )
 
     def disconnect(self, websocket: WebSocket, run_id: str) -> None:
-        """Remove a WebSocket connection. Stops Redis subscription and
+        """Remove a WebSocket connection. Stops event bus subscription and
         heartbeat when the last client disconnects."""
         if run_id in self._connections:
             try:
@@ -171,12 +147,21 @@ class WebSocketHub:
                 )
 
     async def _cleanup_run(self, run_id: str) -> None:
-        """Stop pubsub and heartbeat when no clients remain."""
-        await self._stop_pubsub(run_id)
+        """Stop event bus listener and heartbeat when no clients remain."""
+        await self._stop_listening(run_id)
         await self._stop_heartbeat(run_id)
+        self._event_buffer.pop(run_id, None)
 
     async def broadcast(self, run_id: str, message: dict[str, Any]) -> None:
-        """Send a JSON message to every WebSocket connected for *run_id*."""
+        """Send a JSON message to every WebSocket connected for *run_id*.
+
+        Also buffers events so late-connecting clients can replay them.
+        """
+        # Buffer for late-connecting clients
+        if run_id not in self._event_buffer:
+            self._event_buffer[run_id] = deque(maxlen=_MAX_BUFFER_SIZE)
+        self._event_buffer[run_id].append(message)
+
         if run_id not in self._connections:
             return
         data = json.dumps(message)
@@ -190,15 +175,7 @@ class WebSocketHub:
             self.disconnect(ws, run_id)
 
     async def close(self) -> None:
-        """Shutdown: cancel all tasks, close Redis connection."""
-        for run_id in list(self._sub_tasks.keys()):
-            await self._stop_pubsub(run_id)
+        """Shutdown: cancel all heartbeat tasks and close event bus."""
         for run_id in list(self._heartbeat_tasks.keys()):
             await self._stop_heartbeat(run_id)
-        if self._pubsub is not None:
-            await self._pubsub.close()
-            self._pubsub = None
-        if self._redis is not None:
-            await self._redis.close()
-            self._redis = None
         logger.info("WebSocketHub closed")

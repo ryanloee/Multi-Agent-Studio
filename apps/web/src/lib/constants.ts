@@ -26,8 +26,8 @@ export const NODE_META: Record<
     defaultData: {
       label: "Coder",
       agentType: "coder",
-      modelProvider: "openai",
-      modelId: "gpt-4o",
+      modelProvider: "mimo",
+      modelId: "mimo-v2.5",
       prompt: "",
       permissions: {},
       command: "",
@@ -42,8 +42,8 @@ export const NODE_META: Record<
     defaultData: {
       label: "Planner",
       agentType: "plan",
-      modelProvider: "openai",
-      modelId: "gpt-4o",
+      modelProvider: "mimo",
+      modelId: "mimo-v2.5",
       prompt: "",
       permissions: {},
       command: "",
@@ -58,8 +58,8 @@ export const NODE_META: Record<
     defaultData: {
       label: "Explorer",
       agentType: "explore",
-      modelProvider: "openai",
-      modelId: "gpt-4o",
+      modelProvider: "mimo",
+      modelId: "mimo-v2.5",
       prompt: "",
       permissions: {},
       command: "",
@@ -90,8 +90,8 @@ export const NODE_META: Record<
     defaultData: {
       label: "Reviewer",
       agentType: "review",
-      modelProvider: "openai",
-      modelId: "gpt-4o",
+      modelProvider: "mimo",
+      modelId: "mimo-v2.5",
       prompt: "",
       permissions: {},
       command: "",
@@ -173,8 +173,10 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
 // ---------------------------------------------------------------------------
 export const STATUS_COLORS: Record<RunStatus, string> = {
   idle: "bg-gray-200 text-gray-700",
+  pending: "bg-yellow-100 text-yellow-700",
   running: "bg-blue-100 text-blue-700 animate-pulse",
   paused: "bg-yellow-100 text-yellow-700",
+  cancelling: "bg-orange-100 text-orange-700",
   completed: "bg-green-100 text-green-700",
   failed: "bg-red-100 text-red-700",
 };

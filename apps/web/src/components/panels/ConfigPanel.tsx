@@ -9,6 +9,7 @@ import {
   FileCheck,
   User,
   X,
+  Trash2,
   type LucideProps,
 } from "lucide-react";
 import type { AgentNodeType } from "@/types/workflow";
@@ -55,12 +56,18 @@ export default function ConfigPanel() {
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
+  const removeNode = useWorkflowStore((s) => s.removeNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
   const t = useLocaleStore((s) => s.t);
 
   const node = nodes.find((n) => n.id === selectedNodeId);
 
   const handleClose = useCallback(() => setSelectedNode(null), [setSelectedNode]);
+  const handleDelete = useCallback(() => {
+    if (selectedNodeId) {
+      removeNode(selectedNodeId);
+    }
+  }, [selectedNodeId, removeNode]);
 
   if (!selectedNodeId || !node) return null;
 
@@ -86,6 +93,13 @@ export default function ConfigPanel() {
             {t(`node.${nodeType}.description`)}
           </span>
         </div>
+        <button
+          onClick={handleDelete}
+          className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors"
+          aria-label={t("config.deleteNode")}
+        >
+          <Trash2 size={16} />
+        </button>
         <button
           onClick={handleClose}
           className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
@@ -126,8 +140,18 @@ export default function ConfigPanel() {
         {/* Model */}
         {features.model && (
           <ModelSelector
-            value={data.modelId}
-            onChange={(modelId) => updateNodeData(node.id, { modelId })}
+            value={data.modelProvider && data.modelId ? `${data.modelProvider}/${data.modelId}` : ""}
+            onChange={(fullId) => {
+              const slash = fullId.indexOf("/");
+              if (slash >= 0) {
+                updateNodeData(node.id, {
+                  modelProvider: fullId.slice(0, slash),
+                  modelId: fullId.slice(slash + 1),
+                });
+              } else {
+                updateNodeData(node.id, { modelProvider: "", modelId: fullId });
+              }
+            }}
           />
         )}
 

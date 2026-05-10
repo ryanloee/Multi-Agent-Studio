@@ -29,14 +29,34 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.description": "描述",
     "config.descriptionPlaceholder": "描述此人工步骤需要验证或审批的内容...",
     "config.closePanel": "关闭面板",
+    "config.deleteNode": "删除节点",
 
     // ─── OutputPanel ───
     "output.tab.llm": "LLM",
     "output.tab.shell": "终端",
     "output.tab.tools": "工具",
+    "output.tab.comm": "通讯",
     "output.filter.allNodes": "所有节点",
     "output.collapse": "收起面板",
     "output.expand": "展开面板",
+    "output.clearNodeFilter": "清除节点筛选",
+
+    // ─── PlanNode ───
+    "planNode.childTasks": "创建了 {n} 个子任务",
+    "planNode.readonly": "规划模式",
+
+    // ─── CommunicationPanel ───
+    "comm.selectNode": "选择一个节点查看通讯记录",
+    "comm.noRecords": "暂无通讯记录",
+    "comm.receivedLlm": "收到 LLM 输出",
+    "comm.sentLlm": "发送 LLM 输出",
+    "comm.receivedToolCall": "收到工具调用",
+    "comm.sentToolCall": "调用工具",
+    "comm.receivedToolResult": "收到工具结果",
+    "comm.sentToolResult": "返回工具结果",
+    "comm.createdChild": "创建子任务",
+    "comm.receivedChild": "子任务已创建",
+    "comm.childCompleted": "子任务完成",
 
     // ─── ApprovalModal ───
     "approval.title": "需要人工审批",
@@ -139,14 +159,34 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.description": "Description",
     "config.descriptionPlaceholder": "Describe what this human step should verify or approve...",
     "config.closePanel": "Close panel",
+    "config.deleteNode": "Delete node",
 
     // ─── OutputPanel ───
     "output.tab.llm": "LLM",
     "output.tab.shell": "Shell",
     "output.tab.tools": "Tools",
+    "output.tab.comm": "Comm",
     "output.filter.allNodes": "All Nodes",
     "output.collapse": "Collapse panel",
     "output.expand": "Expand panel",
+    "output.clearNodeFilter": "Clear node filter",
+
+    // ─── PlanNode ───
+    "planNode.childTasks": "{n} child task(s) created",
+    "planNode.readonly": "Planning mode",
+
+    // ─── CommunicationPanel ───
+    "comm.selectNode": "Select a node to view communication records",
+    "comm.noRecords": "No communication records",
+    "comm.receivedLlm": "Received LLM output",
+    "comm.sentLlm": "Sent LLM output",
+    "comm.receivedToolCall": "Received tool call",
+    "comm.sentToolCall": "Called tool",
+    "comm.receivedToolResult": "Received tool result",
+    "comm.sentToolResult": "Returned tool result",
+    "comm.createdChild": "Created child task",
+    "comm.receivedChild": "Child task created",
+    "comm.childCompleted": "Child task completed",
 
     // ─── ApprovalModal ───
     "approval.title": "Human Approval Required",

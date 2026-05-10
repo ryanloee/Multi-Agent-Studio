@@ -38,6 +38,17 @@ interface WorkflowState {
   updateNodeData: (id: string, data: Partial<NodeData>) => void;
   removeNode: (id: string) => void;
 
+  // Dynamic node creation (planner children at runtime)
+  addDynamicNode: (
+    parentId: string,
+    childDef: {
+      id: string;
+      type: AgentNodeType;
+      prompt: string;
+      model: string;
+    }
+  ) => void;
+
   // Connection handler with validation
   onConnect: OnConnect;
 
@@ -113,6 +124,87 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       nodes: get().nodes.filter((node) => node.id !== id),
       edges: get().edges.filter((edge) => edge.source !== id && edge.target !== id),
       selectedNodeId: get().selectedNodeId === id ? null : get().selectedNodeId,
+    });
+  },
+
+  // ---- Dynamic node creation (planner children) ----
+  addDynamicNode: (
+    parentId: string,
+    childDef: {
+      id: string;
+      type: AgentNodeType;
+      prompt: string;
+      model: string;
+    }
+  ) => {
+    const { nodes } = get();
+    const parentNode = nodes.find((n) => n.id === parentId);
+    if (!parentNode) return;
+
+    // Calculate existing children count for positioning
+    const existingChildren = nodes.filter(
+      (n) => (n.data as NodeData).parentNodeId === parentId
+    );
+    const offset = existingChildren.length;
+
+    // Position child below and to the right of parent, staggered
+    const childX = parentNode.position.x + 220;
+    const childY = parentNode.position.y + offset * 120;
+
+    // Parse model string into provider/modelId
+    const modelParts = childDef.model.split("/");
+    const modelProvider = modelParts.length > 1 ? modelParts[0] : "";
+    const modelId = modelParts.length > 1 ? modelParts.slice(1).join("/") : childDef.model;
+
+    const meta = NODE_META[childDef.type];
+    const { locale } = useLocaleStore.getState();
+    const t = (key: string) => translations[locale][key] || key;
+
+    const newNode: WorkflowNode = {
+      id: childDef.id,
+      type: childDef.type,
+      position: { x: childX, y: childY },
+      data: {
+        label: `${t(`node.${childDef.type}.label`)} #${offset + 1}`,
+        agentType: childDef.type,
+        modelProvider,
+        modelId,
+        prompt: childDef.prompt,
+        permissions: meta.defaultData.permissions ?? {},
+        command: "",
+        description: "",
+        parentNodeId: parentId,
+        isDynamic: true,
+      },
+    };
+
+    // Create a dashed "dynamic" edge from parent to child
+    const newEdge: WorkflowEdge = {
+      id: `e_dynamic_${parentId}-${childDef.id}`,
+      source: parentId,
+      target: childDef.id,
+      style: { strokeDasharray: "5 5", stroke: "#22c55e" },
+      animated: true,
+    };
+
+    // Update parent node's childNodeIds
+    const updatedNodes = nodes.map((node) => {
+      if (node.id === parentId) {
+        const currentChildIds = (node.data as NodeData).childNodeIds ?? [];
+        return {
+          ...node,
+          data: {
+            ...node.data,
+            childNodeIds: [...currentChildIds, childDef.id],
+          },
+        };
+      }
+      return node;
+    });
+
+    set({
+      nodes: [...updatedNodes, newNode],
+      edges: [...get().edges, newEdge],
     });
   },
 

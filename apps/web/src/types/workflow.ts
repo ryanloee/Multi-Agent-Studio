@@ -33,6 +33,12 @@ export interface NodeData {
   command: string;
   /** Free-text description (used primarily for human nodes) */
   description: string;
+  /** IDs of dynamically created children (planner only) */
+  childNodeIds?: string[];
+  /** ID of the planner that created this node */
+  parentNodeId?: string;
+  /** true if this node was created at runtime by a planner */
+  isDynamic?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,8 +52,10 @@ export type WorkflowEdge = Edge;
 // ---------------------------------------------------------------------------
 export type RunStatus =
   | "idle"
+  | "pending"
   | "running"
   | "paused"
+  | "cancelling"
   | "completed"
   | "failed";
 

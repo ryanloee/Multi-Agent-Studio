@@ -4,26 +4,27 @@ import type { WorkflowNode, WorkflowEdge, RunStatus } from "./workflow";
 // Model types
 // ---------------------------------------------------------------------------
 
-/** Supported LLM providers */
-export type ModelProvider =
-  | "openai"
-  | "anthropic"
-  | "ollama"
-  | "google"
-  | "deepseek";
+/** Supported LLM providers — dynamically sourced from config */
+export type ModelProvider = string;
 
 /** Model metadata returned by GET /api/models */
 export interface ModelInfo {
-  /** Unique model identifier, e.g. "gpt-4o" */
+  /** Model ID within provider, e.g. "minimax-m2.5-free" */
   id: string;
+  /** Full ID in provider/model format, e.g. "opencode/minimax-m2.5-free" */
+  full_id: string;
   /** Human-readable name */
   name: string;
   /** Which provider hosts this model */
-  provider: ModelProvider;
+  provider: string;
+  /** Display label for the provider */
+  provider_label?: string;
   /** Maximum context window length in tokens */
-  context_length: number;
+  context_length?: number;
   /** Maximum output tokens per request */
-  max_tokens: number;
+  max_tokens?: number;
+  /** Whether this model is free to use */
+  free?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,10 +82,14 @@ export interface RunInfo {
   completed_at: string | null;
 }
 
-/** Response body for POST /api/workflows/:id/run */
+/** Response body for POST /api/runs/:id/run */
 export interface TriggerRunResponse {
-  run_id: string;
-  status: RunStatus;
+  id: string;
+  workflow_id: string;
+  status: string;
+  engine_workflow_id?: string;
+  created_at: string;
+  completed_at?: string | null;
 }
 
 // ---------------------------------------------------------------------------

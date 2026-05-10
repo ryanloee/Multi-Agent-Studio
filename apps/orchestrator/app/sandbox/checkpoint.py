@@ -8,11 +8,11 @@ class GitCheckpointManager:
     GIT_DIR = "/sandbox-meta/.git"
     WORK_TREE = "/workspace"
 
-    def __init__(self, sandbox_manager: "app.sandbox.manager.SandboxManager"):
+    def __init__(self, sandbox_manager: "app.core.local_sandbox.LocalSandbox"):
         self.sandbox = sandbox_manager
 
     def _git_cmd(self, *args: str) -> str:
-        return f"git --git-dir={self.GIT_DIR} --work-tree={self.WORK_TREE} {' '.join(args)}"
+        return f"git --git-dir=\"{self.GIT_DIR}\" --work-tree=\"{self.WORK_TREE}\" {' '.join(args)}"
 
     async def init_repo(self, sandbox_id: str) -> None:
         """Initialize separated Git repo in sandbox."""

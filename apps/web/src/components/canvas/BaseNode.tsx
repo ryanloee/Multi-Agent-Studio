@@ -1,9 +1,10 @@
-import React, { memo } from "react";
+import React, { memo, useMemo } from "react";
 import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { AgentNodeType, NodeData, RunStatus } from "@/types/workflow";
 import { NODE_META, STATUS_COLORS } from "@/lib/constants";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
+import type { StreamEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
 // Color mapping — NODE_META stores Tailwind color names, we map to actual CSS
@@ -64,6 +65,28 @@ const ICON_MAP: Record<string, JSX.Element> = {
 };
 
 // ---------------------------------------------------------------------------
+// Derive current action label from the most recent event for a node
+// ---------------------------------------------------------------------------
+function getCurrentAction(events: StreamEvent[]): string {
+  if (events.length === 0) return "运行中...";
+  const last = events[events.length - 1];
+  const t = last.type as string;
+  if (t === "llm_token" || t === "llm_chunk" || t === "text" || t === "step_start") {
+    return "正在思考...";
+  }
+  if (t === "tool_call" || t === "tool_use") {
+    return "正在使用工具...";
+  }
+  if (t === "shell_stdout" || t === "shell_stderr") {
+    return "正在执行...";
+  }
+  if (t === "step_finish") {
+    return "步骤完成";
+  }
+  return "运行中...";
+}
+
+// ---------------------------------------------------------------------------
 // Props for BaseNode
 // ---------------------------------------------------------------------------
 export interface BaseNodeProps extends NodeProps {
@@ -87,10 +110,18 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
   );
   const statusClasses = STATUS_COLORS[nodeStatus];
 
+  // Get node events to derive current action
+  const allEvents = useRunStore((s) => s.events);
+  const nodeEvents = useMemo(
+    () => allEvents.filter((e) => e.node_id === id),
+    [allEvents, id]
+  );
+  const currentAction = nodeStatus === "running" ? getCurrentAction(nodeEvents) : "";
+
   return (
     <div
       className={[
-        "relative rounded-md border bg-white shadow-sm transition-shadow",
+        "relative rounded-md border bg-white shadow-sm transition-shadow overflow-hidden",
         selected ? "ring-2 ring-blue-500" : "",
       ].join(" ")}
       style={{ width: 200 }}
@@ -103,10 +134,7 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
       />
 
       {/* Top color bar */}
-      <div
-        className="h-1.5 rounded-t-md"
-        style={{ backgroundColor: colorHex }}
-      />
+      <div className="h-1.5" style={{ backgroundColor: colorHex }} />
 
       {/* Header: icon + label */}
       <div className="flex items-center gap-2 px-3 py-2">
@@ -118,15 +146,49 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
 
       {/* Status indicator bar */}
       {nodeStatus !== "idle" && (
-        <div className="mx-3 mb-1">
-          <span
-            className={[
-              "inline-block rounded-full px-2 py-0.5 text-xs font-medium",
-              statusClasses,
-            ].join(" ")}
-          >
-            {nodeStatus}
-          </span>
+        <div className="mx-3 mb-1 flex items-center gap-1.5">
+          {nodeStatus === "running" && (
+            <>
+              {/* Blue pulsing dot */}
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+              </span>
+              {/* Current action text */}
+              <span className="text-xs text-blue-600 font-medium truncate">
+                {currentAction}
+              </span>
+            </>
+          )}
+          {nodeStatus === "completed" && (
+            <>
+              {/* Green checkmark */}
+              <svg className="w-3.5 h-3.5 text-green-500 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              <span className="text-xs text-green-600 font-medium">completed</span>
+            </>
+          )}
+          {nodeStatus === "failed" && (
+            <>
+              {/* Red X */}
+              <svg className="w-3.5 h-3.5 text-red-500 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+              <span className="text-xs text-red-600 font-medium">failed</span>
+            </>
+          )}
+          {nodeStatus === "paused" && (
+            <span
+              className={[
+                "inline-block rounded-full px-2 py-0.5 text-xs font-medium",
+                statusClasses,
+              ].join(" ")}
+            >
+              {nodeStatus}
+            </span>
+          )}
         </div>
       )}
 
