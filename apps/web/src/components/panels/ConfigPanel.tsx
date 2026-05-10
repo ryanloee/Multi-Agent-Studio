@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useRef, type ComponentType } from "react";
+import { useState, useCallback, useRef, useEffect, type ComponentType } from "react";
 import {
   Code,
   Map,
@@ -11,6 +11,7 @@ import {
   X,
   Trash2,
   Settings,
+  FolderOpen,
   type LucideProps,
 } from "lucide-react";
 import type { AgentNodeType } from "@/types/workflow";
@@ -60,7 +61,27 @@ export default function ConfigPanel() {
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
   const removeNode = useWorkflowStore((s) => s.removeNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
+  const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
+  const updateWorkspaceDirectory = useWorkflowStore((s) => s.updateWorkspaceDirectory);
   const t = useLocaleStore((s) => s.t);
+
+  // Local state for workspace directory input (allows debounced saving)
+  const [localDir, setLocalDir] = useState(workspaceDirectory);
+
+  // Sync local state when store value changes (e.g. on workflow load)
+  useEffect(() => {
+    setLocalDir(workspaceDirectory);
+  }, [workspaceDirectory]);
+
+  // Debounced save for workspace directory
+  const dirTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const handleDirChange = useCallback((value: string) => {
+    setLocalDir(value);
+    if (dirTimerRef.current) clearTimeout(dirTimerRef.current);
+    dirTimerRef.current = setTimeout(() => {
+      updateWorkspaceDirectory(value);
+    }, 800);
+  }, [updateWorkspaceDirectory]);
 
   const node = nodes.find((n) => n.id === selectedNodeId);
 
@@ -208,9 +229,35 @@ export default function ConfigPanel() {
           </div>
         </>
       ) : (
-        <div className="flex-1 flex items-center justify-center p-6">
-          <p className="text-xs text-gray-400 text-center">
-            {t("config.selectNodeHint") || "在画布上选择节点以编辑配置"}
+        <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5">
+          {/* Workflow Settings header */}
+          <div className="flex items-center gap-3 px-0 py-2">
+            <div className="w-8 h-8 rounded-lg bg-gray-50 flex items-center justify-center">
+              <FolderOpen size={16} className="text-gray-500" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <span className="text-sm font-semibold text-gray-800 block">
+                {t("config.workflowSettings")}
+              </span>
+            </div>
+          </div>
+
+          {/* Workspace Directory input */}
+          <div className="space-y-1.5">
+            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+              {t("config.workspaceDirectory")}
+            </label>
+            <input
+              type="text"
+              value={localDir}
+              onChange={(e) => handleDirChange(e.target.value)}
+              placeholder={t("config.workspaceDirectoryPlaceholder")}
+              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+            />
+          </div>
+
+          <p className="text-xs text-gray-400 text-center mt-4">
+            {t("config.selectNodeHint") || "Select a node on the canvas to edit its configuration"}
           </p>
         </div>
       )}

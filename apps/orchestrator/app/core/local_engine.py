@@ -95,11 +95,15 @@ class LocalDAGExecutor:
         run_id: str,
         layers: list[dict],
         global_config: dict | None = None,
+        workspace_directory: str | None = None,
     ) -> str:
         """Start DAG execution as a background asyncio task."""
         cancel_event = asyncio.Event()
         task = asyncio.create_task(
-            self._execute_dag(run_id, layers, global_config or {}, cancel_event),
+            self._execute_dag(
+                run_id, layers, global_config or {}, cancel_event,
+                workspace_directory=workspace_directory,
+            ),
             name=f"dag-{run_id}",
         )
 
@@ -183,6 +187,7 @@ class LocalDAGExecutor:
         layers: list[dict],
         global_config: dict,
         cancel_event: asyncio.Event,
+        workspace_directory: str | None = None,
     ) -> None:
         """Core DAG execution loop: layers sequential, nodes parallel."""
         logger.info("DAG execution STARTED for run %s, %d layers", run_id, len(layers))
@@ -211,7 +216,10 @@ class LocalDAGExecutor:
 
                 # Execute all nodes in this layer concurrently
                 tasks = [
-                    self._execute_node(run_id, node, layer_results, global_config, cancel_event)
+                    self._execute_node(
+                        run_id, node, layer_results, global_config, cancel_event,
+                        workspace_directory=workspace_directory,
+                    )
                     for node in nodes
                 ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -304,6 +312,7 @@ class LocalDAGExecutor:
         layer_results: dict[str, Any],
         global_config: dict,
         cancel_event: asyncio.Event,
+        workspace_directory: str | None = None,
     ) -> dict:
         """Execute a single DAG node: create sandbox, run agent, stream events."""
         node_id: str = node.get("id", node.get("node_id", ""))
@@ -313,8 +322,10 @@ class LocalDAGExecutor:
         await self._emit("node_started", run_id, node_id)
         await self._emit("status", run_id, node_id, content="running")
 
-        # 1. Create sandbox container
-        sandbox_id = await self._sandbox.create(workspace_id)
+        # 1. Create sandbox container (use workspace_directory as template if set)
+        sandbox_id = await self._sandbox.create(
+            workspace_id, template_dir=workspace_directory,
+        )
         logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
 
         stream_file = "/workspace/.agent/stream.jsonl"
@@ -471,6 +482,16 @@ class LocalDAGExecutor:
             return result
 
         finally:
+            # Sync sandbox changes back to the workspace directory if configured
+            if workspace_directory:
+                try:
+                    await self._sandbox.sync_back(sandbox_id, workspace_directory)
+                except Exception:
+                    logger.warning(
+                        "sync_back failed for sandbox %s -> %s",
+                        sandbox_id[:12], workspace_directory, exc_info=True,
+                    )
+
             # Always clean up the sandbox
             try:
                 await self._sandbox.destroy(sandbox_id)

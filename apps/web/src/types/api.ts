@@ -47,6 +47,7 @@ export interface WorkflowDetail {
   id: string;
   name: string;
   description: string;
+  workspace_directory?: string;
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   updated_at: string;
@@ -57,12 +58,14 @@ export interface WorkflowDetail {
 export interface CreateWorkflowRequest {
   name: string;
   description?: string;
+  workspace_directory?: string;
 }
 
 /** Request body for PUT /api/workflows/:id */
 export interface UpdateWorkflowRequest {
   name?: string;
   description?: string;
+  workspace_directory?: string;
   nodes?: WorkflowNode[];
   edges?: WorkflowEdge[];
 }

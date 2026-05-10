@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import platform
+import shlex
 import shutil
 import subprocess
 import tarfile
@@ -164,8 +165,13 @@ class LocalSandbox:
     # Container lifecycle
     # ------------------------------------------------------------------
 
-    async def create(self, workspace_id: str, template: str = "base") -> str:
+    async def create(self, workspace_id: str, template: str = "base", template_dir: str | None = None) -> str:
         """Create a local sandbox directory layout.
+
+        If *template_dir* is provided and the directory exists on the host,
+        its contents are copied into the sandbox workspace (overwriting any
+        existing files).  A git repository is then initialised with an initial
+        commit so that ``sync_back`` can later compute a diff.
 
         Returns *workspace_id* as the sandbox identifier (matching the
         convention that callers treat the return value as an opaque sandbox
@@ -178,16 +184,98 @@ class LocalSandbox:
         (root / "workspace").mkdir(parents=True, exist_ok=True)
         (root / "sandbox-meta" / ".git").mkdir(parents=True, exist_ok=True)
 
+        # If a template directory is provided, copy its contents into the sandbox
+        if template_dir is not None and Path(template_dir).is_dir():
+            logger.info("Copying template dir %s into sandbox %s", template_dir, sandbox_id)
+            await asyncio.to_thread(
+                shutil.copytree, template_dir, str(root / "workspace"), **{"dirs_exist_ok": True},
+            )
+            # Initialise git and create an initial commit so we can diff later
+            await self._git_init_with_commit(root / "workspace")
+
         state = _SandboxState(root, workspace_id)
         self._sandboxes[sandbox_id] = state
 
         logger.info(
-            "Created local sandbox %s at %s (template=%s)",
+            "Created local sandbox %s at %s (template=%s, template_dir=%s)",
             sandbox_id,
             root,
             template,
+            template_dir,
         )
         return sandbox_id
+
+    async def _git_init_with_commit(self, workspace_path: Path) -> None:
+        """Initialise a git repo in *workspace_path* and commit all contents."""
+        shell = self._shell_prefix()
+
+        def _run(cmd: str) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                [*shell, cmd],
+                cwd=str(workspace_path),
+                capture_output=True,
+            )
+
+        await asyncio.to_thread(_run, "git init")
+        await asyncio.to_thread(_run, "git add -A")
+        await asyncio.to_thread(
+            _run, 'git commit -m "initial snapshot from template" --allow-empty',
+        )
+
+    async def sync_back(self, sandbox_id: str, target_dir: str) -> bool:
+        """Sync changes from the sandbox back to *target_dir* using git diff/apply.
+
+        Computes ``git diff HEAD`` inside the sandbox workspace, then applies
+        that patch to *target_dir*.  Returns ``True`` on success, ``False`` on
+        failure (or if there is nothing to sync).
+        """
+        state = self._state(sandbox_id)
+        workspace = state.workspace_dir
+        shell = self._shell_prefix()
+
+        # 1. Compute diff inside the sandbox
+        def _get_diff() -> str:
+            result = subprocess.run(
+                [*shell, "git diff HEAD"],
+                cwd=str(workspace),
+                capture_output=True,
+            )
+            return result.stdout.decode("utf-8", errors="replace")
+
+        diff_text = await asyncio.to_thread(_get_diff)
+        if not diff_text.strip():
+            logger.info("sync_back: no diff for sandbox %s, nothing to sync", sandbox_id)
+            return True
+
+        # 2. Write diff to a temp file
+        import tempfile
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".patch", delete=False, prefix="sync_back_",
+        ) as tmp:
+            tmp.write(diff_text)
+            tmp_path = tmp.name
+
+        try:
+            # 3. Apply the patch in the target directory
+            posix_tmp = self._to_posix(Path(tmp_path))
+
+            def _apply_patch() -> int:
+                result = subprocess.run(
+                    [*shell, f"git apply {shlex.quote(posix_tmp)}"],
+                    cwd=str(target_dir),
+                    capture_output=True,
+                )
+                return result.returncode
+
+            rc = await asyncio.to_thread(_apply_patch)
+            if rc == 0:
+                logger.info("sync_back: applied patch to %s", target_dir)
+                return True
+            else:
+                logger.warning("sync_back: git apply failed (rc=%d) for %s", rc, target_dir)
+                return False
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
 
     async def destroy(self, sandbox_id: str) -> None:
         """Remove sandbox directories and kill any remaining processes."""

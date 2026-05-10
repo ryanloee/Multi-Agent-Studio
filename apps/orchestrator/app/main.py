@@ -48,6 +48,27 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
+
+    # MVP schema migration: SQLite doesn't support ALTER TABLE well, so we
+    # detect schema changes and recreate the database.  Safe for the MVP
+    # because data is ephemeral.
+    db_path = Path(settings.database_url.split("///")[-1])
+    if db_path.exists():
+        needs_reset = False
+        async with db_engine.begin() as conn:
+            from sqlalchemy import text as sa_text
+            result = await conn.execute(sa_text("PRAGMA table_info(workflows)"))
+            columns = {row[1] for row in result.fetchall()}
+            if "workspace_directory" not in columns:
+                logger.info(
+                    "Schema migration: workflows table missing workspace_directory, "
+                    "will recreate database"
+                )
+                needs_reset = True
+        if needs_reset:
+            await db_engine.dispose()
+            db_path.unlink(missing_ok=True)
+
     async with db_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("Database tables verified / created")

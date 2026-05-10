@@ -35,6 +35,9 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.descriptionPlaceholder": "描述此人工步骤需要验证或审批的内容...",
     "config.closePanel": "关闭面板",
     "config.deleteNode": "删除节点",
+    "config.workflowSettings": "工作流设置",
+    "config.workspaceDirectory": "工作区目录",
+    "config.workspaceDirectoryPlaceholder": "例如: /path/to/project 或 C:\\workspace",
 
     // ─── OutputPanel ───
     "output.tab.llm": "LLM",
@@ -170,6 +173,9 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.descriptionPlaceholder": "Describe what this human step should verify or approve...",
     "config.closePanel": "Close panel",
     "config.deleteNode": "Delete node",
+    "config.workflowSettings": "Workflow Settings",
+    "config.workspaceDirectory": "Workspace Directory",
+    "config.workspaceDirectoryPlaceholder": "e.g. /path/to/project or C:\\workspace",
 
     // ─── OutputPanel ───
     "output.tab.llm": "LLM",

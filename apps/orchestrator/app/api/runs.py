@@ -125,6 +125,7 @@ async def trigger_run(
         run_id=str(run_id),
         layers=layers_data,
         global_config=global_config,
+        workspace_directory=workflow.workspace_directory,
     )
 
     # 6. Persist run record

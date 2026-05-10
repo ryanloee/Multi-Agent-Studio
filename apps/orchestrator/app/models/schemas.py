@@ -26,12 +26,14 @@ class CreateWorkflowRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
+    workspace_directory: Optional[str] = None
 
 
 class UpdateWorkflowRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
+    workspace_directory: Optional[str] = None
     nodes: Optional[list[dict[str, Any]]] = None
     edges: Optional[list[dict[str, Any]]] = None
 
@@ -51,6 +53,7 @@ class WorkflowResponse(BaseModel):
     name: str
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
+    workspace_directory: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

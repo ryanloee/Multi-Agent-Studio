@@ -20,6 +20,7 @@ import type { WorkflowDetail } from "@/types/api";
 import { NODE_META, VALID_CONNECTIONS } from "@/lib/constants";
 import { translations } from "@/lib/i18n";
 import { useLocaleStore } from "./localeStore";
+import { api } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -28,6 +29,10 @@ interface WorkflowState {
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   selectedNodeId: string | null;
+
+  // Current workflow identity + workspace directory
+  currentWorkflowId: string | null;
+  workspaceDirectory: string;
 
   // React Flow change handlers
   onNodesChange: OnNodesChange<WorkflowNode>;
@@ -62,6 +67,9 @@ interface WorkflowState {
   // Focus + highlight a node on the canvas (triggers fitView animation)
   focusNodeId: string | null;
   setFocusNode: (id: string | null) => void;
+
+  // Workspace directory
+  updateWorkspaceDirectory: (dir: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +89,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   edges: [],
   selectedNodeId: null,
   focusNodeId: null,
+  currentWorkflowId: null,
+  workspaceDirectory: "",
 
   // ---- React Flow change handlers ----
   onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
@@ -263,6 +273,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       nodes: workflow.nodes as WorkflowNode[],
       edges: workflow.edges as WorkflowEdge[],
       selectedNodeId: null,
+      currentWorkflowId: workflow.id,
+      workspaceDirectory: workflow.workspace_directory ?? "",
     });
   },
 
@@ -282,5 +294,17 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   // ---- Focus node on canvas ----
   setFocusNode: (id: string | null) => {
     set({ focusNodeId: id, selectedNodeId: id });
+  },
+
+  // ---- Workspace directory ----
+  updateWorkspaceDirectory: async (dir: string) => {
+    const { currentWorkflowId } = get();
+    if (!currentWorkflowId) return;
+    set({ workspaceDirectory: dir });
+    try {
+      await api.updateWorkflow(currentWorkflowId, { workspace_directory: dir });
+    } catch (err) {
+      console.error("Failed to update workspace directory:", err);
+    }
   },
 }));

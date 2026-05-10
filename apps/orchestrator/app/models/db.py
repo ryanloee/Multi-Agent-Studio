@@ -26,6 +26,7 @@ class Workflow(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dag_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    workspace_directory: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         server_default=func.now(),
