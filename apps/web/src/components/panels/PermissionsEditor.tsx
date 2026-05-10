@@ -20,11 +20,13 @@ type PermissionValue = "allow" | "deny" | "ask";
 interface PermissionsEditorProps {
   value: Record<string, PermissionValue>;
   onChange: (v: Record<string, PermissionValue>) => void;
+  disabled?: boolean;
 }
 
 export default function PermissionsEditor({
   value,
   onChange,
+  disabled,
 }: PermissionsEditorProps) {
   const t = useLocaleStore((s) => s.t);
 
@@ -64,7 +66,8 @@ export default function PermissionsEditor({
                       name={`perm-${tool}`}
                       checked={current === perm}
                       onChange={() => handleChange(tool, perm)}
-                      className="accent-blue-500"
+                      disabled={disabled}
+                      className="accent-blue-500 disabled:opacity-50"
                     />
                   </td>
                 ))}

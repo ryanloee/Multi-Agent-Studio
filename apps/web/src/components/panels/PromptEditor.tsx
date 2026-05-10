@@ -6,9 +6,10 @@ interface PromptEditorProps {
   value: string;
   onChange: (prompt: string) => void;
   maxLength?: number;
+  disabled?: boolean;
 }
 
-export default function PromptEditor({ value, onChange, maxLength = 8000 }: PromptEditorProps) {
+export default function PromptEditor({ value, onChange, maxLength = 8000, disabled }: PromptEditorProps) {
   const t = useLocaleStore((s) => s.t);
   const charCount = value.length;
   const isNearLimit = charCount > maxLength * 0.9;
@@ -24,7 +25,8 @@ export default function PromptEditor({ value, onChange, maxLength = 8000 }: Prom
         onChange={(e) => onChange(e.target.value)}
         placeholder={t("prompt.placeholder")}
         rows={6}
-        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-1 focus:ring-blue-400 focus:outline-none"
+        disabled={disabled}
+        className="w-full rounded-md border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-1 focus:ring-blue-400 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
       <div className="flex justify-end">
         <span

@@ -143,6 +143,21 @@ class AgentLoop:
         if not tool:
             return f"Error: unknown tool '{name}'"
 
+        # Agent-type-level parameter validation
+        warnings = ToolRegistry.validate_execution(
+            self.config.agent_type, name, args
+        )
+        if warnings:
+            if "Permission denied" in warnings[0]:
+                logger.warning("Tool blocked: %s", warnings[0])
+                self.stream.emit_tool_call(name, json.dumps(args, ensure_ascii=False)[:2000])
+                msg = f"BLOCKED: {warnings[0]}"
+                self.stream.emit_tool_result(name, msg)
+                return msg
+            # Soft constraints — log but allow execution
+            for w in warnings:
+                logger.warning("Tool warning: %s", w)
+
         # Permission check — gate execution on security-sensitive operations
         action = await self._permission.check(name, args)
         if action == PermissionAction.DENY:

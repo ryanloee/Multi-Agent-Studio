@@ -270,6 +270,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       id: `e_${connection.source}-${connection.target}`,
       source: connection.source,
       target: connection.target,
+      data: {
+        transfer_files: true,
+        transfer_summary: true,
+        transfer_format: "summary",
+      },
       ...(connection.sourceHandle && { sourceHandle: connection.sourceHandle }),
       ...(connection.targetHandle && { targetHandle: connection.targetHandle }),
     };

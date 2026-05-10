@@ -205,6 +205,48 @@ class LocalSandbox:
         )
         return sandbox_id
 
+    async def clone(self, source_sandbox_id: str, new_workspace_id: str) -> str:
+        """Clone an existing sandbox into a new one with a copy of its workspace.
+
+        Creates a new sandbox with *new_workspace_id*, copies the entire workspace
+        directory from the source sandbox (including the git meta directory), and
+        registers the new sandbox state.  Returns the new sandbox_id.
+        """
+        source_state = self._state(source_sandbox_id)
+        sandbox_id = new_workspace_id
+        root = self.root / new_workspace_id
+
+        # Create base directories for the new sandbox
+        (root / "workspace").mkdir(parents=True, exist_ok=True)
+        (root / "sandbox-meta").mkdir(parents=True, exist_ok=True)
+
+        # Copy workspace directory from source sandbox
+        await asyncio.to_thread(
+            shutil.copytree,
+            str(source_state.workspace_dir),
+            str(root / "workspace"),
+            dirs_exist_ok=True,
+        )
+
+        # Copy sandbox-meta directory (preserves git history / checkpoints)
+        meta_src = source_state.root / "sandbox-meta"
+        if meta_src.is_dir():
+            await asyncio.to_thread(
+                shutil.copytree,
+                str(meta_src),
+                str(root / "sandbox-meta"),
+                dirs_exist_ok=True,
+            )
+
+        # Register the new sandbox state
+        state = _SandboxState(root, new_workspace_id)
+        self._sandboxes[sandbox_id] = state
+
+        logger.info(
+            "Cloned sandbox %s -> %s", source_sandbox_id, sandbox_id,
+        )
+        return sandbox_id
+
     async def _git_init_with_commit(self, workspace_path: Path) -> None:
         """Initialise a git repo in *workspace_path* and commit all contents."""
         shell = self._shell_prefix()

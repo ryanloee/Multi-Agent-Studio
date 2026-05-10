@@ -63,6 +63,7 @@ export default function ConfigPanel() {
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
   const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
   const updateWorkspaceDirectory = useWorkflowStore((s) => s.updateWorkspaceDirectory);
+  const mode = useWorkflowStore((s) => s.mode);
   const t = useLocaleStore((s) => s.t);
 
   // Local state for workspace directory input (allows debounced saving)
@@ -132,13 +133,15 @@ export default function ConfigPanel() {
                 {t(`node.${nodeType}.description`)}
               </span>
             </div>
-            <button
-              onClick={handleDelete}
-              className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors"
-              aria-label={t("config.deleteNode")}
-            >
-              <Trash2 size={16} />
-            </button>
+            {mode !== "auto" && (
+              <button
+                onClick={handleDelete}
+                className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors"
+                aria-label={t("config.deleteNode")}
+              >
+                <Trash2 size={16} />
+              </button>
+            )}
           </div>
 
           {/* Body */}
@@ -152,7 +155,8 @@ export default function ConfigPanel() {
                 type="text"
                 value={data.label}
                 onChange={(e) => updateNodeData(node.id, { label: e.target.value })}
-                className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+                disabled={mode === "auto"}
+                className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all disabled:opacity-50 disabled:cursor-not-allowed"
               />
             </div>
 
@@ -184,6 +188,7 @@ export default function ConfigPanel() {
                     updateNodeData(node.id, { modelProvider: "", modelId: fullId });
                   }
                 }}
+                disabled={mode === "auto"}
               />
             )}
 
@@ -192,6 +197,7 @@ export default function ConfigPanel() {
               <PromptEditor
                 value={data.prompt}
                 onChange={(prompt) => updateNodeData(node.id, { prompt })}
+                disabled={mode === "auto"}
               />
             )}
 
@@ -200,6 +206,7 @@ export default function ConfigPanel() {
               <PermissionsEditor
                 value={data.permissions}
                 onChange={(permissions) => updateNodeData(node.id, { permissions })}
+                disabled={mode === "auto"}
               />
             )}
 
@@ -208,6 +215,7 @@ export default function ConfigPanel() {
               <CommandEditor
                 value={data.command}
                 onChange={(command) => updateNodeData(node.id, { command })}
+                disabled={mode === "auto"}
               />
             )}
 
@@ -222,7 +230,8 @@ export default function ConfigPanel() {
                   onChange={(e) => updateNodeData(node.id, { description: e.target.value })}
                   placeholder={t("config.descriptionPlaceholder")}
                   rows={4}
-                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+                  disabled={mode === "auto"}
+                  className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                 />
               </div>
             )}
@@ -252,7 +261,8 @@ export default function ConfigPanel() {
               value={localDir}
               onChange={(e) => handleDirChange(e.target.value)}
               placeholder={t("config.workspaceDirectoryPlaceholder")}
-              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+              disabled={mode === "auto"}
+              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all disabled:opacity-50 disabled:cursor-not-allowed"
             />
           </div>
 

@@ -50,6 +50,72 @@ class ToolRegistry:
         return [t.to_api_schema() for t in cls._tools.values()]
 
     @classmethod
+    def validate_execution(
+        cls, agent_type: str, tool_name: str, arguments: dict[str, Any]
+    ) -> list[str]:
+        """Validate tool execution against agent-type-specific constraints.
+
+        Returns a list of warning/error strings.  An empty list means the
+        invocation is fully allowed.  If any entry starts with
+        ``"Permission denied"`` the call should be blocked; all other
+        entries are advisory warnings.
+        """
+        warnings: list[str] = []
+        tool = cls.get(tool_name)
+        if not tool:
+            return [f"Unknown tool: {tool_name}"]
+
+        # Coarse check: agent type allowed at all?
+        if tool.allowed_agent_types and agent_type not in tool.allowed_agent_types:
+            return [f"Permission denied: {agent_type} cannot use {tool_name}"]
+
+        # --- Fine-grained parameter checks ---
+
+        if tool_name == "edit" and agent_type == "review":
+            # Reviewer: max ~10 lines changed (roughly 200 chars diff)
+            old_text = arguments.get("old_text", "")
+            new_text = arguments.get("new_text", "")
+            if abs(len(new_text) - len(old_text)) > 200:
+                warnings.append(
+                    "Reviewer edit limited to ~10 lines per change"
+                )
+
+        if tool_name == "write" and agent_type == "plan":
+            # Planner: only planning-related file types
+            path = arguments.get("path", "")
+            valid_exts = (".md", ".txt", ".json", ".markdown")
+            if path and not any(path.endswith(ext) for ext in valid_exts):
+                warnings.append(
+                    f"Planner can only write planning files (.md/.txt/.json), not: {path}"
+                )
+
+        if tool_name == "write" and agent_type == "shell":
+            # Shell: no code files
+            path = arguments.get("path", "")
+            code_exts = (
+                ".py", ".ts", ".js", ".tsx", ".jsx",
+                ".go", ".rs", ".java", ".c", ".cpp",
+            )
+            if path and any(path.endswith(ext) for ext in code_exts):
+                warnings.append(
+                    f"Shell cannot write code files, use edit tool or delegate to Coder: {path}"
+                )
+
+        if tool_name == "edit" and agent_type == "shell":
+            # Shell: only config files
+            path = arguments.get("path", "")
+            config_exts = (
+                ".yml", ".yaml", ".json", ".toml",
+                ".ini", ".cfg", ".env", ".xml",
+            )
+            if path and not any(path.endswith(ext) for ext in config_exts):
+                warnings.append(
+                    f"Shell edit limited to config files, not: {path}"
+                )
+
+        return warnings
+
+    @classmethod
     def for_agent_type(cls, agent_type: str) -> list[dict[str, Any]]:
         """Return API schemas for tools available to this agent type.
 

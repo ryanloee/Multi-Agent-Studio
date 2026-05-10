@@ -8,9 +8,10 @@ import { useLocaleStore } from "@/stores/localeStore";
 interface ModelSelectorProps {
   value: string;
   onChange: (modelId: string) => void;
+  disabled?: boolean;
 }
 
-export default function ModelSelector({ value, onChange }: ModelSelectorProps) {
+export default function ModelSelector({ value, onChange, disabled }: ModelSelectorProps) {
   const t = useLocaleStore((s) => s.t);
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,7 +52,7 @@ export default function ModelSelector({ value, onChange }: ModelSelectorProps) {
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        disabled={loading}
+        disabled={disabled || loading}
         className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-800 focus:border-blue-400 focus:ring-1 focus:ring-blue-400 focus:outline-none disabled:opacity-50"
       >
         <option value="">{t("model.selectPlaceholder")}</option>

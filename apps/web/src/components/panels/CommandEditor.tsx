@@ -5,9 +5,10 @@ import { useLocaleStore } from "@/stores/localeStore";
 interface CommandEditorProps {
   value: string;
   onChange: (v: string) => void;
+  disabled?: boolean;
 }
 
-export default function CommandEditor({ value, onChange }: CommandEditorProps) {
+export default function CommandEditor({ value, onChange, disabled }: CommandEditorProps) {
   const t = useLocaleStore((s) => s.t);
 
   return (
@@ -20,7 +21,8 @@ export default function CommandEditor({ value, onChange }: CommandEditorProps) {
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={t("command.placeholder")}
-        className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-800 placeholder-gray-300 font-mono focus:border-blue-400 focus:ring-1 focus:ring-blue-400 focus:outline-none"
+        disabled={disabled}
+        className="w-full rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm text-gray-800 placeholder-gray-300 font-mono focus:border-blue-400 focus:ring-1 focus:ring-blue-400 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
     </div>
   );
