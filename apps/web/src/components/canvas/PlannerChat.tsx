@@ -255,6 +255,9 @@ export default function PlannerChat() {
       const result = await api.triggerRun(currentWorkflowId);
       useRunStore.getState().setRunId(result.id);
       useRunStore.getState().setStatus("running");
+      // Reload workflow so auto-mode planner node (saved to dag_json by backend) appears on canvas
+      const updated = await api.getWorkflow(currentWorkflowId);
+      useWorkflowStore.getState().loadWorkflow(updated);
     } catch (err) {
       console.error("Failed to trigger run:", err);
     }

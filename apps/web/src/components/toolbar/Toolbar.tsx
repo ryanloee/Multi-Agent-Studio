@@ -78,6 +78,8 @@ export default function Toolbar({
     }
   }, [workflowId, workflowName, nodes, edges, onSave]);
 
+  const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
+
   const handleRun = useCallback(async () => {
     setTriggering(true);
     try {
@@ -85,13 +87,16 @@ export default function Toolbar({
       const result = await api.triggerRun(workflowId);
       setRunId(result.id);
       setStatus("running");
+      // Reload workflow so auto-mode planner node (saved to dag_json by backend) appears on canvas
+      const updated = await api.getWorkflow(workflowId);
+      loadWorkflow(updated);
     } catch (err) {
       console.error("Run trigger failed:", err);
       setStatus("failed");
     } finally {
       setTriggering(false);
     }
-  }, [workflowId, clearEvents, setRunId, setStatus]);
+  }, [workflowId, clearEvents, setRunId, setStatus, loadWorkflow]);
 
   const handleCancel = useCallback(async () => {
     if (!runId) return;

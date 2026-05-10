@@ -109,6 +109,7 @@ async def trigger_run(
     payload = body or TriggerRunRequest()
     global_config = payload.config or {}
     workflow_mode = getattr(workflow, "mode", "manual") or "manual"
+    dag_json: dict | None = None
 
     # 2. Route based on mode
     if workflow_mode == "auto":
@@ -136,6 +137,25 @@ async def trigger_run(
         layers_data = [[planner_node]]
         global_config["_mode"] = "auto"
         global_config["_goal"] = goal
+
+        # Save planner node to dag_json so frontend can render it on canvas
+        workflow.dag_json = {
+            "nodes": [
+                {
+                    "id": "planner",
+                    "type": "plan",
+                    "position": {"x": 400, "y": 200},
+                    "data": {
+                        "label": "Planner",
+                        "agentType": "plan",
+                        "prompt": goal,
+                    },
+                }
+            ],
+            "edges": [],
+        }
+        db.add(workflow)
+        await db.flush()
     else:
         # Manual mode (default): compile the user-drawn DAG
         dag_json = payload.dag if payload.dag else (workflow.dag_json or {})
@@ -182,7 +202,7 @@ async def trigger_run(
                 })
             layers_data.append(layer_list)
 
-    global_config["_edges"] = dag_json.get("edges", []) if dag_json else []
+    global_config["_edges"] = (dag_json or workflow.dag_json or {}).get("edges", [])
 
     # 5. Start DAG execution via LocalDAGExecutor
     run_id = uuid4()
