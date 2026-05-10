@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from mas_agent.snapshot import SnapshotManager
 from mas_agent.tools import Tool
 
 
@@ -33,6 +34,11 @@ class WriteTool(Tool):
             return "Error: path is required"
 
         full_path = os.path.join(workspace, rel_path)
+
+        # Best-effort auto-commit before mutating the file
+        snapshot = SnapshotManager(workspace)
+        await snapshot.auto_commit("write", rel_path)
+
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
         try:

@@ -7,6 +7,7 @@ import sys
 from typing import Any
 
 from mas_agent.tools import Tool
+from mas_agent.tools.output_utils import truncate_output
 
 
 class ShellTool(Tool):
@@ -58,12 +59,22 @@ class ShellTool(Tool):
         stdout_str = stdout.decode("utf-8", errors="replace").strip()
         stderr_str = stderr.decode("utf-8", errors="replace").strip()
 
+        combined = ""
+        if stdout_str:
+            combined += stdout_str
+        if stderr_str:
+            if combined:
+                combined += "\n"
+            combined += stderr_str
+
+        if not combined:
+            return "(no output)"
+
+        truncated = truncate_output(combined, workspace=workspace, label="shell")
+
         parts = []
         if proc.returncode != 0:
             parts.append(f"Exit code: {proc.returncode}")
-        if stdout_str:
-            parts.append(f"stdout:\n{stdout_str[:5000]}")
-        if stderr_str:
-            parts.append(f"stderr:\n{stderr_str[:5000]}")
+        parts.append(truncated)
 
-        return "\n\n".join(parts) if parts else "(no output)"
+        return "\n\n".join(parts)

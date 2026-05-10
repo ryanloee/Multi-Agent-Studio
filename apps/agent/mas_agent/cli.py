@@ -6,11 +6,24 @@ import asyncio
 import logging
 import sys
 
+from mas_agent.config import load_config
 from mas_agent.loop import AgentLoop
 from mas_agent.types import LoopConfig
 
+logger = logging.getLogger(__name__)
 
-def parse_args() -> argparse.Namespace:
+# Fields where argparse defaults overlap with config-file defaults.
+# We track these so we know which CLI values were explicitly provided vs.
+# just the argparse default.
+_CONFIG_OVERRIDABLE = {"max_turns", "max_tokens"}
+
+
+def parse_args() -> tuple[argparse.Namespace, set[str]]:
+    """Parse CLI arguments.
+
+    Returns the parsed namespace *and* the set of argument names that were
+    explicitly set by the user (i.e. not using the argparse default).
+    """
     parser = argparse.ArgumentParser(
         prog="mas_agent",
         description="MAS Agent — lightweight agentic loop",
@@ -27,13 +40,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-dir", default="/workspace/.agent", help="Stream output directory")
     parser.add_argument("--max-turns", type=int, default=50, help="Max LLM turns")
     parser.add_argument("--max-tokens", type=int, default=4096, help="Max tokens per LLM call")
-    return parser.parse_args()
+
+    args = parser.parse_args()
+
+    # Detect which overridable args were explicitly set on the command line.
+    # We compare the string representation — if the user didn't pass the flag
+    # the value stays at the parser default.
+    explicitly_set: set[str] = set()
+    for dest, action in parser._option_string_actions.items():  # noqa: SLF001
+        arg_dest = action.dest
+        if arg_dest in _CONFIG_OVERRIDABLE:
+            # Check whether the attribute still has the parser-supplied default
+            parser_default = parser.get_default(arg_dest)
+            if getattr(args, arg_dest) != parser_default or arg_dest in (args.__dict__):
+                # Heuristic: if it appears in sys.argv in any --xxx form, it was explicit
+                flag_forms = [dest]
+                # Also check the dashed form
+                if "_" in dest:
+                    pass
+                for token in sys.argv[1:]:
+                    if token == dest or token.startswith(dest + "="):
+                        explicitly_set.add(arg_dest)
+                        break
+
+    return args, explicitly_set
 
 
 async def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 
-    args = parse_args()
+    args, explicitly_set = parse_args()
 
     # Read prompt from file
     try:
@@ -43,6 +79,18 @@ async def main() -> int:
         print(f"Error: prompt file not found: {args.prompt_file}", file=sys.stderr)
         return 1
 
+    # Build CLI overrides — only include values the user explicitly passed.
+    cli_overrides: dict = {}
+    if "max_turns" in explicitly_set:
+        cli_overrides["max_turns"] = args.max_turns
+    if "max_tokens" in explicitly_set:
+        cli_overrides["max_tokens"] = args.max_tokens
+
+    # Load merged configuration (defaults → user config → project config → env → CLI)
+    merged = load_config(cli_overrides=cli_overrides or None)
+
+    # Build LoopConfig: CLI-required args win unconditionally; for
+    # overridable fields fall back to the merged config value.
     config = LoopConfig(
         run_id=args.run_id,
         node_id=args.node_id,
@@ -52,11 +100,13 @@ async def main() -> int:
         provider_url=args.provider_url,
         provider_key=args.provider_key,
         prompt=prompt,
-        max_turns=args.max_turns,
-        max_tokens=args.max_tokens,
+        max_turns=merged.get("max_turns", args.max_turns),
+        max_tokens=merged.get("max_tokens", args.max_tokens),
         workspace=args.workspace,
         stream_dir=args.stream_dir,
     )
+
+    logger.debug("LoopConfig max_turns=%s max_tokens=%s (from merged config)", config.max_turns, config.max_tokens)
 
     loop = AgentLoop(config)
     return await loop.run()

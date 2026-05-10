@@ -2,18 +2,27 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 from typing import Any
 
+from mas_agent.compaction import should_compact, compact_messages
 from mas_agent.events import StreamWriter
+from mas_agent.permission import PermissionAction, PermissionChecker
 from mas_agent.providers.base import StreamChunk
 from mas_agent.providers import create_provider
 from mas_agent.prompts import load_prompt
+from mas_agent.tool_repair import repair_tool_call
 from mas_agent.tools import ToolRegistry
 from mas_agent.types import LoopConfig, Message
 
 logger = logging.getLogger(__name__)
+
+# Doom-loop detection thresholds
+_DOOM_WARNING_THRESHOLD = 3   # consecutive identical calls before warning
+_DOOM_FATAL_THRESHOLD = 5     # consecutive identical calls before termination
+_DOOM_HISTORY_SIZE = 10       # max entries kept in tool-call history
 
 
 class AgentLoop:
@@ -23,6 +32,10 @@ class AgentLoop:
         self.config = config
         self.messages: list[dict[str, str]] = []
         self.stream = StreamWriter(config.stream_dir, config.run_id, config.node_id)
+        self._permission = PermissionChecker(self.stream, config.workspace)
+        # Doom-loop detection state
+        self._tool_call_history: list[tuple[str, str]] = []
+        self._doom_warned: bool = False
 
     def _build_system_prompt(self) -> str:
         return load_prompt(
@@ -74,14 +87,76 @@ class AgentLoop:
 
         return assistant_text, tool_calls
 
+    @staticmethod
+    def _hash_args(args: dict) -> str:
+        """Return a stable MD5 hex-digest for tool arguments."""
+        return hashlib.md5(json.dumps(args, sort_keys=True).encode()).hexdigest()
+
+    def _check_doom_loop(self, tool_name: str, args: dict) -> str | None:
+        """Check for repeated identical tool calls.
+
+        Returns ``"warning"`` if a doom-loop warning was injected,
+        ``"fatal"`` if the loop must terminate, or ``None`` if everything
+        looks normal.
+        """
+        args_hash = self._hash_args(args)
+        self._tool_call_history.append((tool_name, args_hash))
+        # Trim to bounded size
+        if len(self._tool_call_history) > _DOOM_HISTORY_SIZE:
+            self._tool_call_history = self._tool_call_history[-_DOOM_HISTORY_SIZE:]
+
+        # Count consecutive identical entries at the tail
+        consecutive = 0
+        for i in range(len(self._tool_call_history) - 1, -1, -1):
+            if self._tool_call_history[i] == (tool_name, args_hash):
+                consecutive += 1
+            else:
+                break
+
+        if consecutive >= _DOOM_FATAL_THRESHOLD:
+            self.stream.emit_status("doom_loop_fatal")
+            return "fatal"
+
+        if consecutive >= _DOOM_WARNING_THRESHOLD and not self._doom_warned:
+            self.stream.emit_status("doom_loop_detected")
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    "Warning: you have called the same tool with the same "
+                    "arguments 3 times in a row. Please try a different approach."
+                ),
+            })
+            self._doom_warned = True
+            return "warning"
+
+        return None
+
     async def _execute_tool(self, tool_call: dict) -> str:
         """Execute a single tool call and return the result string."""
-        name = tool_call["name"]
-        args = tool_call["input"]
+        # Repair common LLM formatting mistakes before lookup
+        name, args, repairs = repair_tool_call(tool_call["name"], tool_call["input"])
+        if repairs:
+            self.stream.emit_tool_call(name, json.dumps({"repairs": repairs})[:2000])
+
         tool = ToolRegistry.get(name)
 
         if not tool:
             return f"Error: unknown tool '{name}'"
+
+        # Permission check — gate execution on security-sensitive operations
+        action = await self._permission.check(name, args)
+        if action == PermissionAction.DENY:
+            msg = f"Permission denied: {name} on target"
+            self.stream.emit_tool_call(name, json.dumps(args, ensure_ascii=False)[:2000])
+            self.stream.emit_tool_result(name, msg)
+            return msg
+        if action == PermissionAction.ASK:
+            self.stream.emit_tool_call(name, json.dumps(args, ensure_ascii=False)[:2000])
+            approved = await self._permission.wait_for_approval(name, args)
+            if not approved:
+                msg = f"Permission denied (not approved): {name} on target"
+                self.stream.emit_tool_result(name, msg)
+                return msg
 
         self.stream.emit_tool_call(name, json.dumps(args, ensure_ascii=False)[:2000])
 
@@ -128,6 +203,12 @@ class AgentLoop:
 
                 # Execute all tool calls and add results
                 for tc in tool_calls:
+                    # Doom-loop check before execution
+                    doom_status = self._check_doom_loop(tc["name"], tc["input"])
+                    if doom_status == "fatal":
+                        self.stream.emit_status("failed")
+                        return 1
+
                     result = await self._execute_tool(tc)
                     tool_result_msg = {
                         "role": "user",
@@ -138,6 +219,11 @@ class AgentLoop:
                         }]),
                     }
                     self.messages.append(tool_result_msg)
+
+                # Compact message history if approaching context window limit
+                if should_compact(self.messages, self.config.max_tokens):
+                    self.messages = compact_messages(self.messages, self.config.max_tokens)
+                    self.stream.emit_status("context_compacted")
 
             self.stream.emit_status("completed")
             return 0
