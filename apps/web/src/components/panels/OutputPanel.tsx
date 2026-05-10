@@ -75,22 +75,31 @@ function StatusDot({ status }: { status: RunStatus }) {
 export default function OutputPanel() {
   const [expanded, setExpanded] = useState(false);
   const [activeTab, setActiveTab] = useState<TabKey>("shell");
-  const [manualNodeId, setManualNodeId] = useState<string>("");
   const autoExpandedRef = useRef(false);
 
   // Node list from workflow store for the filter dropdown
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const t = useLocaleStore((s) => s.t);
 
-  // Run state: selectedRunNodeId from clicking nodes during a run
+  // Run state
   const runStatus = useRunStore((s) => s.status);
   const selectedRunNodeId = useRunStore((s) => s.selectedRunNodeId);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const nodeStatuses = useRunStore((s) => s.nodeStatuses);
+  const events = useRunStore((s) => s.events);
 
   const isRunActive = runStatus === "running" || runStatus === "paused";
   const hasRunData = runStatus !== "idle";
-  const events = useRunStore((s) => s.events);
+
+  // Single source of truth for the active filter node.
+  // Syncs from selectedRunNodeId (canvas clicks) but can also be changed
+  // directly via the dropdown.
+  const [filterNodeId, setFilterNodeId] = useState<string>("");
+  useEffect(() => {
+    if (selectedRunNodeId) {
+      setFilterNodeId(selectedRunNodeId);
+    }
+  }, [selectedRunNodeId]);
 
   // Auto-expand when run starts and first events arrive
   useEffect(() => {
@@ -126,8 +135,6 @@ export default function OutputPanel() {
 
   // Effective nodeId: prefer selectedRunNodeId during/after a run,
   // otherwise fall back to the manual dropdown filter
-  const selectedNodeId = hasRunData && selectedRunNodeId ? selectedRunNodeId : manualNodeId;
-
   // Build node filter options
   const nodeOptions = useMemo(
     () => [
@@ -147,7 +154,7 @@ export default function OutputPanel() {
 
   const handleNodeFilter = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
-      setManualNodeId(e.target.value);
+      setFilterNodeId(e.target.value);
     },
     []
   );
@@ -156,15 +163,15 @@ export default function OutputPanel() {
 
   // Derive info for the selected run node header
   const runNode = useMemo(() => {
-    if (!selectedRunNodeId) return null;
-    return nodes.find((n) => n.id === selectedRunNodeId) ?? null;
-  }, [nodes, selectedRunNodeId]);
-  const runNodeStatus: RunStatus = selectedRunNodeId
-    ? (nodeStatuses[selectedRunNodeId] ?? "idle")
+    if (!filterNodeId) return null;
+    return nodes.find((n) => n.id === filterNodeId) ?? null;
+  }, [nodes, filterNodeId]);
+  const runNodeStatus: RunStatus = filterNodeId
+    ? (nodeStatuses[filterNodeId] ?? "idle")
     : "idle";
   const runNodeLabel = runNode
     ? (runNode.data as NodeData).label || t(`node.${(runNode.data as NodeData).agentType}.label`)
-    : selectedRunNodeId ?? "";
+    : filterNodeId ?? "";
 
   return (
     <div
@@ -205,7 +212,7 @@ export default function OutputPanel() {
         <div className="flex items-center gap-1 mr-1">
           <Filter size={12} className="text-gray-400" />
           <select
-            value={selectedNodeId}
+            value={filterNodeId}
             onChange={handleNodeFilter}
             className="text-xs border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400 max-w-[160px]"
           >
@@ -234,8 +241,8 @@ export default function OutputPanel() {
       {/* ---- Content area (only when expanded) ---- */}
       {expanded && (
         <>
-          {/* Node detail header (when a run node is selected) */}
-          {hasRunData && selectedRunNodeId && (
+          {/* Node detail header (when a node is selected) */}
+          {filterNodeId && (
             <div className="flex items-center gap-2 px-3 py-1.5 bg-gray-50 border-b border-gray-100 shrink-0">
               <StatusDot status={runNodeStatus} />
               <span className="text-xs font-medium text-gray-700 truncate">
@@ -255,7 +262,7 @@ export default function OutputPanel() {
                 {runNodeStatus}
               </span>
               <button
-                onClick={() => setSelectedRunNode(null)}
+                onClick={() => { setFilterNodeId(""); setSelectedRunNode(null); }}
                 className="ml-auto p-0.5 rounded hover:bg-gray-200 text-gray-400 hover:text-gray-600 transition-colors"
                 title={t("output.clearNodeFilter") || "Clear node filter"}
               >
@@ -265,10 +272,10 @@ export default function OutputPanel() {
           )}
           {/* Tab content */}
           <div className={`flex-1 overflow-hidden ${activeTab === "shell" ? "bg-[#1e1e1e]" : ""}`}>
-            {activeTab === "llm" && <LLMOutput nodeId={selectedNodeId} />}
-            {activeTab === "shell" && <XtermStream nodeId={selectedNodeId} />}
-            {activeTab === "tools" && <ToolCallList nodeId={selectedNodeId} />}
-            {activeTab === "comm" && <CommunicationPanel nodeId={selectedNodeId} />}
+            {activeTab === "llm" && <LLMOutput nodeId={filterNodeId} />}
+            {activeTab === "shell" && <XtermStream nodeId={filterNodeId} />}
+            {activeTab === "tools" && <ToolCallList nodeId={filterNodeId} />}
+            {activeTab === "comm" && <CommunicationPanel nodeId={filterNodeId} />}
           </div>
         </>
       )}
