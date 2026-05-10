@@ -9,6 +9,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+*.tsbuildinfo
 
 # Environment
 .env
@@ -20,13 +21,21 @@ build/
 .idea/
 *.swp
 *.swo
+.history/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Temporal
+# Databases
+*.db
+*.db-shm
+*.db-wal
 temporal.db/
+
+# Runtime
+apps/orchestrator/.sandboxes/
+apps/orchestrator/data/
 
 # Docker
 docker-compose.override.yml
@@ -34,6 +43,7 @@ docker-compose.override.yml
 # Logs
 *.log
 npm-debug.log*
+logs/
 
 # Testing
 coverage/
@@ -42,9 +52,6 @@ htmlcov/
 
 # Turbo
 .turbo/
-
-# Logs
-logs/
 
 # Dev temp
 .dev-bat/
