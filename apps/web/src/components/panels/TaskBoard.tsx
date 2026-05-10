@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, memo } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -16,12 +16,16 @@ import {
   X,
   Check,
   ExternalLink,
+  Plus,
+  Play,
+  ArrowRightLeft,
 } from "lucide-react";
 import { useTaskStore } from "@/stores/taskStore";
 import { useRunStore } from "@/stores/runStore";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import type { Task, TaskStatus, TaskMessage } from "@/types/task";
 import { TASK_STATUS_CONFIG } from "@/types/task";
+import type { NodeData } from "@/types/workflow";
 import type { LucideIcon } from "lucide-react";
 
 // ---------------------------------------------------------------------------
@@ -46,9 +50,9 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// TaskLeaf — single task with expand, edit, restart, agent link
+// TaskLeaf — single task with expand, edit, node reassignment, agent link
 // ---------------------------------------------------------------------------
-function TaskLeaf({
+const TaskLeaf = memo(function TaskLeaf({
   task,
   isSelected,
   onSelect,
@@ -56,6 +60,8 @@ function TaskLeaf({
   onSendMessage,
   onRestart,
   onUpdate,
+  onAssign,
+  workflowNodes,
 }: {
   task: Task;
   isSelected: boolean;
@@ -64,14 +70,18 @@ function TaskLeaf({
   onSendMessage: (text: string) => void;
   onRestart: () => void;
   onUpdate: (patch: Partial<Task>) => void;
+  onAssign: (nodeId: string, nodeLabel: string, agentType: string, modelProvider: string, modelId: string, prompt: string) => void;
+  workflowNodes: { id: string; label: string; agentType: string; modelProvider: string; modelId: string; prompt: string }[];
 }) {
   const [expanded, setExpanded] = useState(isSelected);
   const [editing, setEditing] = useState(false);
   const [editTitle, setEditTitle] = useState(task.title);
   const [editDesc, setEditDesc] = useState(task.description);
   const [input, setInput] = useState("");
+  const [assigning, setAssigning] = useState(false);
+  const [selectedAssignNode, setSelectedAssignNode] = useState("");
 
-  const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
+  const setFocusNode = useWorkflowStore((s) => s.setFocusNode);
 
   useEffect(() => {
     setExpanded(isSelected);
@@ -101,14 +111,27 @@ function TaskLeaf({
     (e: React.MouseEvent) => {
       e.stopPropagation();
       if (task.assigned_node_id) {
-        setSelectedNode(task.assigned_node_id);
+        setFocusNode(task.assigned_node_id);
       }
     },
-    [task.assigned_node_id, setSelectedNode]
+    [task.assigned_node_id, setFocusNode]
   );
+
+  const handleAssignSubmit = useCallback(() => {
+    if (!selectedAssignNode) return;
+    const node = workflowNodes.find((n) => n.id === selectedAssignNode);
+    if (node) {
+      onAssign(node.id, node.label, node.agentType, node.modelProvider, node.modelId, task.description || task.title);
+      setAssigning(false);
+      setSelectedAssignNode("");
+    }
+  }, [selectedAssignNode, workflowNodes, onAssign, task.description, task.title]);
 
   // Shorten title for the collapsed view
   const shortTitle = task.title.length > 80 ? task.title.slice(0, 80) + "..." : task.title;
+
+  // Can assign/reassign if task is pending, blocked, failed, or completed
+  const canAssign = ["pending", "blocked", "failed", "completed"].includes(task.status);
 
   return (
     <div
@@ -120,7 +143,7 @@ function TaskLeaf({
       <button
         className="w-full flex items-center gap-2 pl-3 pr-3 py-2 text-left"
         onClick={() => {
-          if (!editing) {
+          if (!editing && !assigning) {
             onSelect();
             setExpanded(!expanded);
           }
@@ -162,15 +185,69 @@ function TaskLeaf({
         </span>
       </button>
 
-      {/* Agent link — shown below the title */}
-      {task.assigned_worker_label && (
-        <div className="pl-7 pr-3 pb-1">
+      {/* Agent link / reassignment — shown below the title */}
+      {task.assigned_worker_label && !assigning && (
+        <div className="pl-7 pr-3 pb-1 flex items-center gap-2">
           <button
             onClick={handleAgentClick}
             className="flex items-center gap-1 text-[10px] text-blue-500 hover:text-blue-700 hover:underline"
           >
             <ExternalLink size={9} />
             {task.assigned_worker_label}
+          </button>
+          {canAssign && (
+            <button
+              onClick={(e) => { e.stopPropagation(); setAssigning(true); }}
+              className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-blue-500"
+              title="重新分配节点"
+            >
+              <ArrowRightLeft size={9} />
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Node assignment dropdown */}
+      {assigning && (
+        <div className="pl-7 pr-3 pb-2 space-y-1.5">
+          <select
+            value={selectedAssignNode}
+            onChange={(e) => setSelectedAssignNode(e.target.value)}
+            className="w-full text-[10px] border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+          >
+            <option value="">选择执行节点...</option>
+            {workflowNodes.map((node) => (
+              <option key={node.id} value={node.id}>
+                {node.label} ({node.agentType})
+              </option>
+            ))}
+          </select>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleAssignSubmit}
+              disabled={!selectedAssignNode}
+              className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40"
+            >
+              <Play size={9} /> 分配并执行
+            </button>
+            <button
+              onClick={() => { setAssigning(false); setSelectedAssignNode(""); }}
+              className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-500 hover:bg-gray-200"
+            >
+              <X size={9} /> 取消
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* No node assigned yet — show assign button for pending tasks */}
+      {!task.assigned_worker_label && !assigning && task.status === "pending" && (
+        <div className="pl-7 pr-3 pb-1">
+          <button
+            onClick={(e) => { e.stopPropagation(); setAssigning(true); }}
+            className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-blue-500"
+          >
+            <ArrowRightLeft size={9} /> 分配节点
           </button>
         </div>
       )}
@@ -303,6 +380,72 @@ function TaskLeaf({
       )}
     </div>
   );
+});
+
+// ---------------------------------------------------------------------------
+// NewTaskForm — inline form for creating tasks manually
+// ---------------------------------------------------------------------------
+function NewTaskForm({
+  onCreate,
+  workflowNodes,
+}: {
+  onCreate: (title: string, description: string, nodeId?: string, nodeLabel?: string) => void;
+  workflowNodes: { id: string; label: string; agentType: string; modelProvider: string; modelId: string; prompt: string }[];
+}) {
+  const [title, setTitle] = useState("");
+  const [desc, setDesc] = useState("");
+  const [nodeId, setNodeId] = useState("");
+
+  const handleSubmit = useCallback(() => {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    const node = workflowNodes.find((n) => n.id === nodeId);
+    onCreate(trimmed, desc.trim(), nodeId || undefined, node?.label);
+    setTitle("");
+    setDesc("");
+    setNodeId("");
+  }, [title, desc, nodeId, workflowNodes, onCreate]);
+
+  return (
+    <div className="px-3 py-2 border-b border-gray-100 space-y-1.5 bg-gray-50/50">
+      <input
+        type="text"
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="任务标题..."
+        className="w-full text-[11px] border border-gray-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-400"
+        onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
+      />
+      <textarea
+        value={desc}
+        onChange={(e) => setDesc(e.target.value)}
+        placeholder="任务描述（可选）..."
+        rows={2}
+        className="w-full text-[10px] border border-gray-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y"
+      />
+      <div className="flex items-center gap-1.5">
+        <select
+          value={nodeId}
+          onChange={(e) => setNodeId(e.target.value)}
+          className="flex-1 text-[10px] border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
+        >
+          <option value="">自动分配节点</option>
+          {workflowNodes.map((node) => (
+            <option key={node.id} value={node.id}>
+              {node.label} ({node.agentType})
+            </option>
+          ))}
+        </select>
+        <button
+          onClick={handleSubmit}
+          disabled={!title.trim()}
+          className="flex items-center gap-1 text-[10px] px-2.5 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 shrink-0"
+        >
+          <Plus size={10} /> 创建
+        </button>
+      </div>
+    </div>
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -313,12 +456,30 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
   const selectedTaskId = useTaskStore((s) => s.selectedTaskId);
   const selectTask = useTaskStore((s) => s.selectTask);
   const taskMessages = useTaskStore((s) => s.taskMessages);
+  const upsertTask = useTaskStore((s) => s.upsertTask);
   const optimisticUpdateTask = useTaskStore((s) => s.optimisticUpdateTask);
   const currentRunId = useTaskStore((s) => s.currentRunId);
   const runStatus = useRunStore((s) => s.status);
   const runId = useRunStore((s) => s.runId);
 
+  // Workflow nodes for assignment — use stable selector + useMemo to avoid
+  // creating new array references on every render (which causes infinite
+  // re-render loops via Zustand's useSyncExternalStore).
+  const rawNodes = useWorkflowStore((s) => s.nodes);
+  const workflowNodes = useMemo(() => (rawNodes ?? []).map((n) => {
+    const data = n.data as NodeData;
+    return {
+      id: n.id,
+      label: data?.label || n.id,
+      agentType: data?.agentType || "coder",
+      modelProvider: data?.modelProvider || "",
+      modelId: data?.modelId || "",
+      prompt: data?.prompt || "",
+    };
+  }), [rawNodes]);
+
   const [filterStatus, setFilterStatus] = useState<TaskStatus | "all">("all");
+  const [showNewTask, setShowNewTask] = useState(false);
 
   // On mount: find latest run with tasks
   useEffect(() => {
@@ -360,9 +521,6 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
 
     let cancelled = false;
     const fetchTasks = async () => {
-      const curTasks = useTaskStore.getState().tasks;
-      if (curTasks.length > 0) return;
-
       try {
         const { api } = await import("@/lib/api");
         const fetched = await api.listTasks(activeRunId);
@@ -431,8 +589,11 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
     async (taskId: string) => {
       const sendRunId = currentRunId || runId;
       if (!sendRunId) return;
+      // Find the task to check if it has an assigned node
+      const task = useTaskStore.getState().tasks.find((t) => t.id === taskId);
+      const nextStatus = task?.assigned_node_id ? "assigned" : "pending";
       optimisticUpdateTask(taskId, {
-        status: "pending",
+        status: nextStatus,
         progress: 0,
         result_summary: "",
       });
@@ -440,8 +601,8 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
         const { api } = await import("@/lib/api");
         const updated = await api.restartTask(sendRunId, taskId);
         optimisticUpdateTask(taskId, updated);
-      } catch {
-        // revert on error — already optimistic
+      } catch (err) {
+        console.error("[TaskBoard] restart failed:", err);
       }
     },
     [currentRunId, runId, optimisticUpdateTask]
@@ -463,6 +624,54 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
     [currentRunId, runId, optimisticUpdateTask]
   );
 
+  const handleAssignTask = useCallback(
+    async (taskId: string, nodeId: string, nodeLabel: string, agentType: string, modelProvider: string, modelId: string, prompt: string) => {
+      const sendRunId = currentRunId || runId;
+      if (!sendRunId) return;
+      optimisticUpdateTask(taskId, {
+        status: "assigned",
+        assigned_node_id: nodeId,
+        assigned_worker_label: nodeLabel,
+      });
+      try {
+        const { api } = await import("@/lib/api");
+        const updated = await api.assignTask(sendRunId, taskId, {
+          node_id: nodeId,
+          node_label: nodeLabel,
+          agent_type: agentType,
+          model_provider: modelProvider,
+          model_id: modelId,
+          prompt,
+        });
+        optimisticUpdateTask(taskId, updated);
+      } catch {
+        // ignore
+      }
+    },
+    [currentRunId, runId, optimisticUpdateTask]
+  );
+
+  const handleCreateTask = useCallback(
+    async (title: string, description: string, nodeId?: string, nodeLabel?: string) => {
+      const sendRunId = currentRunId || runId;
+      if (!sendRunId) return;
+      try {
+        const { api } = await import("@/lib/api");
+        const newTask = await api.createTask(sendRunId, {
+          title,
+          description,
+          assigned_node_id: nodeId,
+          assigned_worker_label: nodeLabel,
+        });
+        upsertTask(newTask);
+        setShowNewTask(false);
+      } catch {
+        // ignore
+      }
+    },
+    [currentRunId, runId, upsertTask]
+  );
+
   // Empty state
   const activeRunId = currentRunId || runId;
   if (!activeRunId || (runStatus === "idle" && tasks.length === 0)) {
@@ -482,7 +691,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
-      {/* Filter bar */}
+      {/* Filter bar + new task button */}
       <div className="flex items-center gap-1 px-3 py-2 border-b border-gray-100 flex-wrap">
         {(["all", "running", "pending", "blocked", "completed", "failed"] as const).map(
           (status) => (
@@ -500,7 +709,23 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
             </button>
           )
         )}
+        <div className="flex-1" />
+        <button
+          onClick={() => setShowNewTask(!showNewTask)}
+          className="flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors"
+        >
+          <Plus size={10} />
+          新任务
+        </button>
       </div>
+
+      {/* New task form */}
+      {showNewTask && (
+        <NewTaskForm
+          onCreate={handleCreateTask}
+          workflowNodes={workflowNodes}
+        />
+      )}
 
       {/* Flat task list — task-title-centric */}
       <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
@@ -521,6 +746,10 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
               onSendMessage={(text) => handleSendMessage(task.id, text)}
               onRestart={() => handleRestart(task.id)}
               onUpdate={(patch) => handleUpdateTask(task.id, patch)}
+              onAssign={(nodeId, nodeLabel, agentType, modelProvider, modelId, prompt) =>
+                handleAssignTask(task.id, nodeId, nodeLabel, agentType, modelProvider, modelId, prompt)
+              }
+              workflowNodes={workflowNodes}
             />
           ))
         )}

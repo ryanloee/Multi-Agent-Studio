@@ -23,9 +23,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "sidebar.title": "节点库",
     "sidebar.dragToCanvas": "拖拽到画布",
 
+    // ─── LeftPanel ───
+    "leftPanel.tasks": "任务",
+
     // ─── ConfigPanel ───
     "config.label": "标签",
     "config.agentType": "Agent 类型",
+    "config.title": "配置",
+    "config.selectNodeHint": "在画布上选择节点以编辑配置",
     "config.description": "描述",
     "config.descriptionPlaceholder": "描述此人工步骤需要验证或审批的内容...",
     "config.closePanel": "关闭面板",
@@ -153,9 +158,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "sidebar.title": "Nodes",
     "sidebar.dragToCanvas": "Drag to canvas",
 
+    // ─── LeftPanel ───
+    "leftPanel.tasks": "Tasks",
+
     // ─── ConfigPanel ───
     "config.label": "Label",
     "config.agentType": "Agent Type",
+    "config.title": "Config",
+    "config.selectNodeHint": "Select a node on the canvas to edit its configuration",
     "config.description": "Description",
     "config.descriptionPlaceholder": "Describe what this human step should verify or approve...",
     "config.closePanel": "Close panel",

@@ -58,6 +58,10 @@ interface WorkflowState {
 
   // Selection
   setSelectedNode: (id: string | null) => void;
+
+  // Focus + highlight a node on the canvas (triggers fitView animation)
+  focusNodeId: string | null;
+  setFocusNode: (id: string | null) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +80,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   nodes: [],
   edges: [],
   selectedNodeId: null,
+  focusNodeId: null,
 
   // ---- React Flow change handlers ----
   onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
@@ -272,5 +277,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   // ---- Selection ----
   setSelectedNode: (id: string | null) => {
     set({ selectedNodeId: id });
+  },
+
+  // ---- Focus node on canvas ----
+  setFocusNode: (id: string | null) => {
+    set({ focusNodeId: id, selectedNodeId: id });
   },
 }));

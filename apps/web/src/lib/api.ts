@@ -259,6 +259,21 @@ export const api = {
   getTask: (runId: string, taskId: string): Promise<import("@/types/task").Task> =>
     request<import("@/types/task").Task>(`/runs/${runId}/tasks/${taskId}`),
 
+  /** Create a new task manually */
+  createTask: (
+    runId: string,
+    body: {
+      title: string;
+      description?: string;
+      assigned_node_id?: string;
+      assigned_worker_label?: string;
+    },
+  ): Promise<import("@/types/task").Task> =>
+    request<import("@/types/task").Task>(`/runs/${runId}/tasks`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
   /** Update a task (user edits) */
   updateTask: (
     runId: string,
@@ -268,6 +283,24 @@ export const api = {
     request<import("@/types/task").Task>(`/runs/${runId}/tasks/${taskId}`, {
       method: "PATCH",
       body: JSON.stringify(patch),
+    }),
+
+  /** Assign a task to a specific node and start execution */
+  assignTask: (
+    runId: string,
+    taskId: string,
+    body: {
+      node_id: string;
+      node_label?: string;
+      agent_type?: string;
+      model_provider?: string;
+      model_id?: string;
+      prompt?: string;
+    },
+  ): Promise<import("@/types/task").Task> =>
+    request<import("@/types/task").Task>(`/runs/${runId}/tasks/${taskId}/assign`, {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
 
   /** Restart a failed/completed task */

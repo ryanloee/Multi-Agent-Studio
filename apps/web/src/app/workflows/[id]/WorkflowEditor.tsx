@@ -13,7 +13,7 @@ import type { AgentNodeType } from "@/types/workflow";
 import type { ChildCreatedEvent } from "@/types/events";
 
 import Toolbar from "@/components/toolbar/Toolbar";
-import Sidebar from "@/components/sidebar/Sidebar";
+import LeftPanel from "@/components/sidebar/LeftPanel";
 import FlowCanvas from "@/components/canvas/FlowCanvas";
 import ConfigPanel from "@/components/panels/ConfigPanel";
 import OutputPanel from "@/components/panels/OutputPanel";
@@ -216,10 +216,10 @@ export default function WorkflowEditor() {
         onSave={handleSave}
       />
 
-      {/* Body: Sidebar + Canvas area + ConfigPanel */}
+      {/* Body: LeftPanel + Canvas area + ConfigPanel */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left: Sidebar (240px) */}
-        <Sidebar />
+        {/* Left: LeftPanel (248px, tabs: 节点库 | 任务) */}
+        <LeftPanel workflowId={workflowId} />
 
         {/* Center: Canvas + OutputPanel */}
         <div className="flex-1 flex flex-col overflow-hidden">
@@ -232,8 +232,8 @@ export default function WorkflowEditor() {
           <OutputPanel />
         </div>
 
-        {/* Right: ConfigPanel (w-320px, shows Config or Tasks tab) */}
-        <ConfigPanel workflowId={workflowId} />
+        {/* Right: ConfigPanel (w-320px) */}
+        <ConfigPanel />
       </div>
 
       {/* Human-in-the-Loop Approval Modal */}

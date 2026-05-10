@@ -139,6 +139,16 @@ class TaskUpdate(BaseModel):
     result_summary: Optional[str] = None
 
 
+class TaskAssignRequest(BaseModel):
+    """Request body for assigning a task to a specific workflow node."""
+    node_id: str = Field(..., min_length=1)
+    node_label: Optional[str] = None
+    agent_type: Optional[str] = "coder"
+    model_provider: Optional[str] = ""
+    model_id: Optional[str] = ""
+    prompt: Optional[str] = ""
+
+
 class TaskResponse(BaseModel):
     id: UUID
     run_id: UUID

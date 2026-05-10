@@ -27,6 +27,8 @@ export default function FlowCanvas() {
   const onConnect = useWorkflowStore((s) => s.onConnect);
   const addNode = useWorkflowStore((s) => s.addNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
+  const focusNodeId = useWorkflowStore((s) => s.focusNodeId);
+  const setFocusNode = useWorkflowStore((s) => s.setFocusNode);
 
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const allEvents = useRunStore((s) => s.events);
@@ -100,6 +102,25 @@ export default function FlowCanvas() {
     setSelectedNode(null);
     setSelectedRunNode(null);
   }, [setSelectedNode, setSelectedRunNode]);
+
+  // ---- Focus node when focusNodeId changes (e.g. from TaskBoard click) ----
+  useEffect(() => {
+    if (!focusNodeId || !rfInstanceRef.current) return;
+    const rf = rfInstanceRef.current;
+    const node = staticNodes.find((n) => n.id === focusNodeId);
+    if (!node) return;
+
+    // Animate to center the node with some zoom
+    rf.fitView({
+      nodes: [{ id: focusNodeId }],
+      padding: 0.5,
+      duration: 400,
+      maxZoom: 1.2,
+    });
+
+    // Clear the focus trigger so it doesn't re-trigger
+    setFocusNode(null);
+  }, [focusNodeId, staticNodes, setFocusNode]);
 
   // ---- Child nodes are added to workflowStore via addDynamicNode ----
   // No merge needed — staticNodes already contains them.

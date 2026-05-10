@@ -2,15 +2,18 @@
 
 GET    /{run_id}/tasks              - List tasks for a run
 GET    /{run_id}/tasks/{task_id}    - Get task details
+POST   /{run_id}/tasks              - Create a new task (manual user creation)
 PATCH  /{run_id}/tasks/{task_id}    - Update task (user edits)
 POST   /{run_id}/tasks/{task_id}/restart  - Restart a failed task
+POST   /{run_id}/tasks/{task_id}/assign    - Assign a task to a specific node and execute
 POST   /{run_id}/tasks/{task_id}/messages  - Send a message to a task
 GET    /{run_id}/tasks/{task_id}/messages  - Get task messages
 """
 
 from __future__ import annotations
 
-from uuid import UUID
+import asyncio
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -19,13 +22,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 from app.models.task import Task, TaskMessage
 from app.models.schemas import (
+    TaskCreate,
     TaskResponse,
     TaskUpdate,
+    TaskAssignRequest,
     TaskMessageCreate,
     TaskMessageResponse,
 )
 
 router = APIRouter()
+
+# Module-level references set by main.py lifespan
+_engine = None
+_event_bus = None
+
+
+def init_task_deps(engine, event_bus) -> None:
+    """Set module-level references. Called once during app startup."""
+    global _engine, _event_bus
+    _engine = engine
+    _event_bus = event_bus
 
 
 @router.get("/{run_id}/tasks", response_model=list[TaskResponse])
@@ -58,6 +74,53 @@ async def get_task(
     return task
 
 
+@router.post("/{run_id}/tasks", response_model=TaskResponse, status_code=201)
+async def create_task(
+    run_id: UUID,
+    body: TaskCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new task manually (by the user).
+
+    This allows the user to add tasks that the planner didn't generate,
+    and assign them to specific workflow nodes.
+    """
+    from app.models.db import Run
+
+    # Verify run exists
+    run_result = await db.execute(select(Run).where(Run.id == run_id))
+    run = run_result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    task = Task(
+        id=uuid4(),
+        run_id=run_id,
+        parent_task_id=body.parent_task_id,
+        title=body.title,
+        description=body.description,
+        status="pending",
+        assigned_node_id=body.assigned_node_id,
+        assigned_worker_label=body.assigned_worker_label,
+    )
+    db.add(task)
+
+    # Record creation message
+    msg = TaskMessage(
+        id=uuid4(),
+        task_id=task.id,
+        sender_type="user",
+        sender_id="user",
+        message_type="assignment",
+        content=f"User created task: {body.title}",
+    )
+    db.add(msg)
+
+    await db.flush()
+    await db.refresh(task)
+    return task
+
+
 @router.patch("/{run_id}/tasks/{task_id}", response_model=TaskResponse)
 async def update_task(
     run_id: UUID,
@@ -65,7 +128,7 @@ async def update_task(
     body: TaskUpdate,
     db: AsyncSession = Depends(get_db),
 ):
-    """User edits a task (title, description, status, etc.)."""
+    """User edits a task (title, description, status, assigned_node_id, etc.)."""
     result = await db.execute(
         select(Task).where(Task.id == task_id, Task.run_id == run_id)
     )
@@ -99,7 +162,7 @@ async def restart_task(
     task_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Restart a failed/completed task — resets status to pending."""
+    """Restart a failed/completed task — resets status and re-executes on the same node."""
     result = await db.execute(
         select(Task).where(Task.id == task_id, Task.run_id == run_id)
     )
@@ -107,7 +170,15 @@ async def restart_task(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task.status = "pending"
+    if task.status not in ("failed", "completed", "blocked", "pending"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot restart task in status '{task.status}'. "
+                   f"Task must be failed, completed, blocked, or pending.",
+        )
+
+    node_id = task.assigned_node_id
+    task.status = "assigned" if node_id else "pending"
     task.progress = 0
     task.result_summary = ""
 
@@ -123,6 +194,198 @@ async def restart_task(
 
     await db.flush()
     await db.refresh(task)
+
+    # If the task has an assigned node, re-execute it in the background
+    if node_id and _engine and _event_bus:
+        # Look up the node config from the workflow's dag_json
+        from app.models.db import Run
+        from sqlalchemy.orm import selectinload
+
+        run_result = await db.execute(
+            select(Run)
+            .where(Run.id == run_id)
+            .options(selectinload(Run.workflow))
+        )
+        run_obj = run_result.scalar_one_or_none()
+
+        node_config = None
+        if run_obj and run_obj.workflow and run_obj.workflow.dag_json:
+            nodes_list = run_obj.workflow.dag_json.get("nodes", [])
+            for n in nodes_list:
+                if n.get("id") == node_id:
+                    node_config = n
+                    break
+
+        if node_config:
+            from app.core.task_scheduler import ManagedTask, ESCALATION_MARKER, PROGRESS_MARKER
+
+            node_data = node_config.get("data", {}) or {}
+            managed = ManagedTask(
+                db_id=str(task.id),
+                run_id=str(run_id),
+                title=task.title,
+                description=task.description,
+                status="assigned",
+                assigned_node_id=node_id,
+                assigned_worker_label=task.assigned_worker_label or node_id,
+            )
+
+            # Build worker node from the stored node config
+            worker_prompt = node_data.get("prompt", "") or task.description or task.title
+            worker_prompt += (
+                f"\n\n---\nTask ID: {node_id}\n"
+                f"When you need help or are stuck, output a line:\n"
+                f"{ESCALATION_MARKER} <your question>\n"
+                f"To report progress, output a line:\n"
+                f"{PROGRESS_MARKER} <0-100>\n"
+            )
+
+            worker_node = {
+                "id": node_id,
+                "agent_type": node_data.get("agentType", "coder"),
+                "model_provider": node_data.get("modelProvider", ""),
+                "model_id": node_data.get("modelId", ""),
+                "prompt": worker_prompt,
+            }
+
+            # Find planner node for escalation support
+            cancel_event = asyncio.Event()
+            planner_node = None
+
+            # Start execution in background
+            async def _run_task():
+                from app.core.task_scheduler import TaskScheduler
+                scheduler = TaskScheduler(
+                    sandbox=_engine._sandbox,
+                    event_bus=_event_bus,
+                    checkpoint=_engine._checkpoint,
+                    provisioner=_engine._provisioner,
+                    execute_node_fn=_engine._execute_node,
+                    emit_fn=_engine._emit,
+                )
+                await scheduler.run_worker_task(
+                    worker_node=worker_node,
+                    task=managed,
+                    global_config={},
+                    cancel_event=cancel_event,
+                    planner_node=planner_node,
+                )
+
+            asyncio.create_task(_run_task(), name=f"restart-{task_id}")
+
+    return task
+
+
+@router.post("/{run_id}/tasks/{task_id}/assign", response_model=TaskResponse)
+async def assign_task(
+    run_id: UUID,
+    task_id: UUID,
+    body: TaskAssignRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Assign a pending/blocked/failed task to a specific workflow node and start execution.
+
+    This allows:
+    - Reassigning a task to a different agent node
+    - Starting execution of a manually created task
+    - Re-running a failed task on a different node
+    """
+    result = await db.execute(
+        select(Task).where(Task.id == task_id, Task.run_id == run_id)
+    )
+    task = result.scalar_one_or_none()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    if task.status not in ("pending", "blocked", "failed", "completed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot assign task in status '{task.status}'. "
+                   f"Task must be pending, blocked, failed, or completed.",
+        )
+
+    # Update task assignment
+    task.assigned_node_id = body.node_id
+    task.assigned_worker_label = body.node_label or body.node_id
+    task.status = "assigned"
+    task.progress = 0
+    task.result_summary = ""
+
+    # Record assignment message
+    msg = TaskMessage(
+        task_id=task_id,
+        sender_type="user",
+        sender_id="user",
+        message_type="assignment",
+        content=f"User assigned task to {body.node_label or body.node_id}",
+    )
+    db.add(msg)
+
+    await db.flush()
+    await db.refresh(task)
+
+    # If the engine is available, start the task execution in the background
+    if _engine and _event_bus and body.prompt:
+        from app.core.task_scheduler import ManagedTask, ESCALATION_MARKER, PROGRESS_MARKER
+
+        managed = ManagedTask(
+            db_id=str(task.id),
+            run_id=str(run_id),
+            title=task.title,
+            description=task.description,
+            status="assigned",
+            assigned_node_id=body.node_id,
+            assigned_worker_label=body.node_label or body.node_id,
+        )
+
+        # Build worker node from the assignment request
+        worker_prompt = body.prompt
+        worker_prompt += (
+            f"\n\n---\nTask ID: {body.node_id}\n"
+            f"When you need help or are stuck, output a line:\n"
+            f"{ESCALATION_MARKER} <your question>\n"
+            f"To report progress, output a line:\n"
+            f"{PROGRESS_MARKER} <0-100>\n"
+        )
+
+        worker_node = {
+            "id": body.node_id,
+            "agent_type": body.agent_type or "coder",
+            "model_provider": body.model_provider or "",
+            "model_id": body.model_id or "",
+            "prompt": worker_prompt,
+        }
+
+        # Find planner node for escalation support
+        cancel_event = asyncio.Event()
+        planner_node = None
+        if _engine and _engine._runs:
+            # Try to find the plan node from the workflow
+            for rid, _run_info in _engine._runs.items():
+                if rid == str(run_id):
+                    break
+
+        # Start execution in background
+        async def _run_task():
+            from app.core.task_scheduler import TaskScheduler
+            scheduler = TaskScheduler(
+                sandbox=_engine._sandbox,
+                event_bus=_event_bus,
+                checkpoint=_engine._checkpoint,
+                provisioner=_engine._provisioner,
+                execute_node_fn=_engine._execute_node,
+                emit_fn=_engine._emit,
+            )
+            await scheduler.run_worker_task(
+                worker_node=worker_node,
+                task=managed,
+                global_config={},
+                cancel_event=cancel_event,
+                planner_node=planner_node,
+            )
+
+        asyncio.create_task(_run_task(), name=f"assign-{task_id}")
+
     return task
 
 

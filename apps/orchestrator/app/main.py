@@ -29,7 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.models import router as models_router
 from app.api.runs import router as runs_router, init_engine as init_runs_engine
-from app.api.tasks import router as tasks_router
+from app.api.tasks import router as tasks_router, init_task_deps as init_tasks_deps
 from app.api.workflows import router as workflows_router
 from app.config import settings
 from app.core.database import engine as db_engine
@@ -72,6 +72,7 @@ async def lifespan(app: FastAPI):
         provisioner=provisioner,
     )
     init_runs_engine(dag_executor)
+    init_tasks_deps(dag_executor, event_bus)
     logger.info("Local DAG executor initialised (no Docker/Temporal/Redis)")
 
     yield
