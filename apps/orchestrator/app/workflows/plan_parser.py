@@ -19,12 +19,24 @@ When your analysis is complete, output a JSON plan in this exact format at the e
 ```json
 {
   "tasks": [
-    {"type": "coder", "prompt": "task description for the coder", "model": "cliproxy/glm-5.1"},
-    {"type": "explore", "prompt": "what to search for"}
+    {
+      "type": "coder",
+      "title": "Short task title",
+      "prompt": "Detailed task description for the agent",
+      "model": "cliproxy/glm-5.1",
+      "dependencies": []
+    },
+    {
+      "type": "explore",
+      "title": "Search for API endpoints",
+      "prompt": "What to search for",
+      "dependencies": [0]
+    }
   ]
 }
 ```
-Each task must have: "type" (coder/explore/review/shell), "prompt" (what the agent should do), and optionally "model" (provider/model format).
+Each task must have: "type" (coder/explore/review/shell), "title" (short name), "prompt" (what the agent should do).
+Optional: "model" (provider/model format), "dependencies" (list of task indices that must complete first).
 
 Alternatively, use todowrite to list your planned tasks — each todo item will be treated as a child task.
 """
@@ -72,6 +84,10 @@ def parse_plan_json(raw_output: str) -> list[dict]:
         }
         if obj.get("model"):
             task["model"] = obj["model"]
+        if obj.get("title"):
+            task["title"] = obj["title"]
+        if obj.get("dependencies"):
+            task["dependencies"] = obj["dependencies"]
 
         tasks.append(task)
 
@@ -210,5 +226,10 @@ def _validate_tasks(tasks: list) -> list[dict]:
         }
         if task.get("model"):
             validated["model"] = task["model"]
+        # Structured task fields for the task board
+        if task.get("title"):
+            validated["title"] = task["title"]
+        if task.get("dependencies"):
+            validated["dependencies"] = task["dependencies"]
         result.append(validated)
     return result

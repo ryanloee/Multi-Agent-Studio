@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useRunStore } from "@/stores/runStore";
+import { useTaskStore } from "@/stores/taskStore";
 
 // ---------------------------------------------------------------------------
 // useWebSocket — connects to a run event stream via WebSocket
@@ -83,13 +84,58 @@ export function useWebSocket(
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
-        if (!cancelled) setIsConnected(true);
+        if (!cancelled) {
+          setIsConnected(true);
+          useTaskStore.getState().setCurrentRunId(runId);
+        }
       };
 
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
           addEvent(data);
+
+          // Handle task-related events
+          const taskStore = useTaskStore.getState();
+          if (data.type === "task_created") {
+            taskStore.upsertTask({
+              id: data.task_id,
+              run_id: runId!,
+              parent_task_id: null,
+              title: data.task_title || "",
+              description: data.task_description || "",
+              status: data.status || "pending",
+              assigned_node_id: data.child_node_id || null,
+              assigned_worker_label: null,
+              progress: 0,
+              result_summary: "",
+              created_at: new Date().toISOString(),
+              updated_at: new Date().toISOString(),
+            });
+          } else if (data.type === "task_updated") {
+            const existing = taskStore.tasks.find((t) => t.id === data.task_id);
+            if (existing) {
+              taskStore.upsertTask({
+                ...existing,
+                status: data.status || existing.status,
+                progress: data.progress ?? existing.progress,
+                assigned_node_id: data.assigned_node_id || existing.assigned_node_id,
+                assigned_worker_label: data.assigned_worker_label || existing.assigned_worker_label,
+                result_summary: data.result_summary || existing.result_summary,
+                updated_at: new Date().toISOString(),
+              });
+            }
+          } else if (data.type === "task_message") {
+            taskStore.appendMessage(data.task_id, {
+              id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              task_id: data.task_id,
+              sender_type: data.sender_type,
+              sender_id: data.sender_id,
+              message_type: data.message_type,
+              content: data.content,
+              created_at: new Date().toISOString(),
+            });
+          }
         } catch {
           // skip non-JSON messages
         }

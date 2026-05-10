@@ -338,6 +338,14 @@ class LocalSandbox:
         # Not found in any sandbox -- treat as already finished
         return ProcessInfo(running=False, exit_code=-1)
 
+    def _find_process(self, exec_id: str) -> "_AsyncProcessShim | None":
+        """Find the raw process shim by exec_id (synchronous)."""
+        for state in self._sandboxes.values():
+            proc = state.processes.get(exec_id)
+            if proc is not None:
+                return proc
+        return None
+
     # ------------------------------------------------------------------
     # File I/O
     # ------------------------------------------------------------------

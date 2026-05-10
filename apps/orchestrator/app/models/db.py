@@ -71,6 +71,9 @@ class Run(Base):
     node_executions: Mapped[list["NodeExecution"]] = relationship(
         "NodeExecution", back_populates="run", cascade="all, delete-orphan",
     )
+    tasks: Mapped[list["Task"]] = relationship(
+        "Task", back_populates="run", cascade="all, delete-orphan",
+    )
 
 
 class NodeExecution(Base):

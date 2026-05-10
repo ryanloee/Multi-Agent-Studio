@@ -3,6 +3,7 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 import type { AgentNodeType, NodeData, RunStatus } from "@/types/workflow";
 import { NODE_META, STATUS_COLORS } from "@/lib/constants";
 import { useRunStore } from "@/stores/runStore";
+import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import type { StreamEvent } from "@/types/events";
 
@@ -118,6 +119,11 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
   );
   const currentAction = nodeStatus === "running" ? getCurrentAction(nodeEvents) : "";
 
+  // Task status from taskStore (for dynamic worker nodes)
+  const taskForNode = useTaskStore((s) =>
+    s.tasks.find((t) => t.assigned_node_id === id)
+  );
+
   return (
     <div
       className={[
@@ -187,6 +193,21 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
               ].join(" ")}
             >
               {nodeStatus}
+            </span>
+          )}
+          {/* Task-specific status: blocked (escalation) or progress */}
+          {taskForNode && taskForNode.status === "blocked" && (
+            <>
+              <span className="relative flex h-2 w-2">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
+                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
+              </span>
+              <span className="text-xs text-amber-600 font-medium">escalating...</span>
+            </>
+          )}
+          {taskForNode && taskForNode.status === "running" && taskForNode.progress > 0 && (
+            <span className="text-[10px] font-mono text-blue-500 ml-auto">
+              {taskForNode.progress}%
             </span>
           )}
         </div>

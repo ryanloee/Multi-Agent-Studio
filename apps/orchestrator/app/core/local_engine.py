@@ -18,12 +18,14 @@ import json
 import logging
 import os
 import shlex
+import uuid
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from app.core.local_bus import InProcessEventBus
 from app.core.local_sandbox import LocalSandbox
+from app.core.task_scheduler import TaskScheduler, ESCALATION_MARKER, PROGRESS_MARKER
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
 from app.workflows.plan_parser import parse_plan_output, PLAN_SYSTEM_SUFFIX
@@ -35,6 +37,7 @@ _KNOWN_EVENT_TYPES = frozenset({
     "llm_token", "llm_chunk", "tool_call", "tool_result", "shell_stdout",
     "shell_stderr", "status", "error", "node_started", "node_completed",
     "node_failed", "child_created", "child_completed",
+    "task_created", "task_updated", "task_message", "worker_escalation",
 })
 
 # Resolve the mas_agent package directory: apps/agent/ relative to project root
@@ -72,6 +75,16 @@ class LocalDAGExecutor:
         self._provisioner = provisioner
         # run_id -> {"status": str, "task": asyncio.Task, "cancel_event": asyncio.Event}
         self._runs: dict[str, dict[str, Any]] = {}
+
+        # Task scheduler for dynamic task-driven execution
+        self._task_scheduler = TaskScheduler(
+            sandbox=sandbox,
+            event_bus=event_bus,
+            checkpoint=checkpoint,
+            provisioner=provisioner,
+            execute_node_fn=self._execute_node,
+            emit_fn=self._emit,
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -236,6 +249,7 @@ class LocalDAGExecutor:
                         ):
                             plan_results = await self._execute_dynamic_plan(
                                 run_id, node_id, result, global_config, cancel_event,
+                                planner_node=node,
                             )
                             layer_results.update(plan_results)
 
@@ -248,10 +262,11 @@ class LocalDAGExecutor:
             try:
                 from app.core.database import async_session_factory
                 from app.models.db import Run as RunModel
+                from uuid import UUID as _UUID
                 async with async_session_factory() as session:
                     from sqlalchemy import select
                     result = await session.execute(
-                        select(RunModel).where(RunModel.id == run_id)
+                        select(RunModel).where(RunModel.id == _UUID(run_id))
                     )
                     run_row = result.scalar_one_or_none()
                     if run_row is not None:
@@ -269,10 +284,11 @@ class LocalDAGExecutor:
             try:
                 from app.core.database import async_session_factory
                 from app.models.db import Run as RunModel
+                from uuid import UUID as _UUID
                 async with async_session_factory() as session:
                     from sqlalchemy import select
                     result = await session.execute(
-                        select(RunModel).where(RunModel.id == run_id)
+                        select(RunModel).where(RunModel.id == _UUID(run_id))
                     )
                     run_row = result.scalar_one_or_none()
                     if run_row is not None:
@@ -427,6 +443,19 @@ class LocalDAGExecutor:
                 "exec_id": exec_id,
             }
 
+            # Capture stderr on failure for debugging
+            if state == "failed":
+                try:
+                    shim = self._sandbox._find_process(exec_id)
+                    if shim and shim._proc.stderr:
+                        stderr_bytes = shim._proc.stderr.read()
+                        stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:2000]
+                        if stderr_text.strip():
+                            result["error"] = stderr_text.strip()
+                            logger.error("Node %s stderr: %s", node_id, stderr_text[:500])
+                except Exception:
+                    pass
+
             # Plan nodes: capture raw output for child-task parsing
             if agent_type == "plan" and state == "completed":
                 try:
@@ -513,9 +542,10 @@ class LocalDAGExecutor:
         parent_result: dict,
         global_config: dict,
         cancel_event: asyncio.Event,
+        planner_node: dict | None = None,
     ) -> dict[str, Any]:
-        """After a planner node completes, parse its output for child tasks
-        and execute them in parallel.
+        """After a planner node completes, parse its output for child tasks,
+        persist them as Task rows, and execute via the TaskScheduler.
 
         Returns a dict mapping child node_id -> result.
         """
@@ -532,62 +562,150 @@ class LocalDAGExecutor:
             len(extracted_text), len(raw_output),
         )
 
-        tasks = parse_plan_output(extracted_text)
-        if not tasks:
+        parsed_tasks = parse_plan_output(extracted_text)
+        if not parsed_tasks:
             logger.info(
                 "Plan node %s produced no child tasks", parent_node_id,
             )
             return {}
 
         logger.info(
-            "Plan node %s produced %d child tasks", parent_node_id, len(tasks),
+            "Plan node %s produced %d child tasks", parent_node_id, len(parsed_tasks),
         )
 
-        child_tasks = []
-        child_node_ids = []
-        for idx, task in enumerate(tasks):
-            child_node_id = f"{parent_node_id}_child_{idx}"
-            child_node_ids.append(child_node_id)
+        # Persist tasks to DB and emit events
+        from app.core.database import async_session_factory
+        from app.models.task import Task as TaskModel
+        from uuid import uuid4
 
-            # Emit child_created event
-            await self._emit(
-                "child_created", run_id, parent_node_id,
-                child_node_id=child_node_id,
-                child_type=task.get("type", "coder"),
-                child_prompt=task.get("prompt", ""),
-                child_model=task.get("model", ""),
-            )
-
-            # Parse "provider/model" from the task's model field
-            model_str = task.get("model", "")
-            model_parts = model_str.split("/", 1) if model_str else ("", "")
-            model_provider = model_parts[0] if len(model_parts) > 1 else ""
-            model_id = model_parts[1] if len(model_parts) > 1 else model_str
-
-            child_node = {
-                "id": child_node_id,
-                "agent_type": task.get("type", "coder"),
-                "model_provider": model_provider,
-                "model_id": model_id,
-                "prompt": task.get("prompt", ""),
-            }
-            child_tasks.append(
-                self._execute_node(
-                    run_id, child_node, {}, global_config, cancel_event,
-                )
-            )
-
-        results = await asyncio.gather(*child_tasks, return_exceptions=True)
-
+        managed_tasks: list = []
         child_results: dict[str, Any] = {}
-        for child_node_id, result in zip(child_node_ids, results):
-            if isinstance(result, Exception):
-                child_results[child_node_id] = {
-                    "state": "failed",
-                    "error": str(result),
+
+        async with async_session_factory() as session:
+            for idx, parsed in enumerate(parsed_tasks):
+                child_node_id = f"{parent_node_id}_child_{idx}"
+
+                # Create DB task
+                task_id = uuid4()
+                task_type = parsed.get("type", "coder")
+                worker_label = f"{task_type} #{idx + 1}"
+                db_task = TaskModel(
+                    id=task_id,
+                    run_id=uuid.UUID(run_id),
+                    title=parsed.get("prompt", "")[:200],
+                    description=parsed.get("prompt", ""),
+                    status="pending",
+                    assigned_node_id=child_node_id,
+                    assigned_worker_label=worker_label,
+                )
+                session.add(db_task)
+                await session.commit()
+
+                # Emit task_created event
+                await self._emit(
+                    "task_created", run_id, parent_node_id,
+                    task_id=str(task_id),
+                    task_title=db_task.title,
+                    task_description=db_task.description,
+                    status="pending",
+                    child_node_id=child_node_id,
+                )
+
+                # Also emit child_created for backward compat (frontend canvas)
+                await self._emit(
+                    "child_created", run_id, parent_node_id,
+                    child_node_id=child_node_id,
+                    child_type=parsed.get("type", "coder"),
+                    child_prompt=parsed.get("prompt", ""),
+                    child_model=parsed.get("model", ""),
+                )
+
+                # Build the worker node dict
+                model_str = parsed.get("model", "")
+                model_parts = model_str.split("/", 1) if model_str else ("", "")
+                model_provider = model_parts[0] if len(model_parts) > 1 else ""
+                model_id = model_parts[1] if len(model_parts) > 1 else model_str
+
+                # Inherit planner's model config as fallback when task doesn't specify one
+                if not model_provider or not model_id:
+                    p_data = planner_node.get("data", {}) if planner_node else {}
+                    fallback_provider = (
+                        planner_node.get("model_provider", "")
+                        if planner_node else ""
+                    ) or (p_data.get("modelProvider", "") if isinstance(p_data, dict) else "")
+                    fallback_model = (
+                        planner_node.get("model_id", "")
+                        if planner_node else ""
+                    ) or (p_data.get("modelId", "") if isinstance(p_data, dict) else "")
+                    if not model_provider and fallback_provider:
+                        model_provider = fallback_provider
+                    if not model_id and fallback_model:
+                        model_id = fallback_model
+
+                # Inject escalation protocol into worker prompt
+                worker_prompt = parsed.get("prompt", "")
+                worker_prompt += (
+                    f"\n\n---\nTask ID: {child_node_id}\n"
+                    f"When you need help or are stuck, output a line:\n"
+                    f"{ESCALATION_MARKER} <your question>\n"
+                    f"To report progress, output a line:\n"
+                    f"{PROGRESS_MARKER} <0-100>\n"
+                )
+
+                worker_node = {
+                    "id": child_node_id,
+                    "agent_type": parsed.get("type", "coder"),
+                    "model_provider": model_provider,
+                    "model_id": model_id,
+                    "prompt": worker_prompt,
                 }
-            else:
+
+                # Create managed task for the scheduler
+                from app.core.task_scheduler import ManagedTask
+                managed = ManagedTask(
+                    db_id=str(task_id),
+                    run_id=run_id,
+                    title=db_task.title,
+                    description=db_task.description,
+                    status="pending",
+                    assigned_node_id=child_node_id,
+                )
+                managed_tasks.append((managed, worker_node))
+
+            # Run all tasks via the scheduler (with escalation support)
+            for managed, worker_node in managed_tasks:
+                managed.worker_task = asyncio.create_task(
+                    self._task_scheduler.run_worker_task(
+                        worker_node=worker_node,
+                        task=managed,
+                        global_config=global_config,
+                        cancel_event=cancel_event,
+                        db_session=session,
+                        planner_node=planner_node,
+                    ),
+                    name=f"worker-{managed.assigned_node_id}",
+                )
+
+            # Wait for all workers to complete
+            for managed, worker_node in managed_tasks:
+                try:
+                    result = await asyncio.wait_for(
+                        managed.worker_task, timeout=300,
+                    )
+                except asyncio.TimeoutError:
+                    result = {"state": "failed", "error": "timeout"}
+                    await self._task_scheduler.update_task_status(
+                        managed, "failed", session, result_summary="timeout",
+                    )
+                except Exception as exc:
+                    result = {"state": "failed", "error": str(exc)}
+                    await self._task_scheduler.update_task_status(
+                        managed, "failed", session, result_summary=str(exc),
+                    )
+
+                child_node_id = managed.assigned_node_id or ""
                 child_results[child_node_id] = result
+
                 await self._emit(
                     "child_completed", run_id, parent_node_id,
                     child_node_id=child_node_id,

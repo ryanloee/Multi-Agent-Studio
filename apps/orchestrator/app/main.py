@@ -29,6 +29,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.models import router as models_router
 from app.api.runs import router as runs_router, init_engine as init_runs_engine
+from app.api.tasks import router as tasks_router
 from app.api.workflows import router as workflows_router
 from app.config import settings
 from app.core.database import engine as db_engine
@@ -36,6 +37,7 @@ from app.core.local_bus import InProcessEventBus
 from app.core.local_engine import LocalDAGExecutor
 from app.core.local_sandbox import LocalSandbox
 from app.models.db import Base
+from app.models.task import Task, TaskMessage  # noqa: F401 — ensure tables are registered
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
 from app.ws.hub import WebSocketHub
@@ -98,6 +100,7 @@ app.add_middleware(
 
 app.include_router(workflows_router, prefix="/api/workflows", tags=["workflows"])
 app.include_router(runs_router, prefix="/api/runs", tags=["runs"])
+app.include_router(tasks_router, prefix="/api/runs", tags=["tasks"])
 app.include_router(models_router, prefix="/api/models", tags=["models"])
 
 

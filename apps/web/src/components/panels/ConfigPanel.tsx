@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, type ComponentType } from "react";
+import { useState, useCallback, useRef, type ComponentType } from "react";
 import {
   Code,
   Map,
@@ -10,16 +10,20 @@ import {
   User,
   X,
   Trash2,
+  ListTodo,
+  Settings,
   type LucideProps,
 } from "lucide-react";
 import type { AgentNodeType } from "@/types/workflow";
 import { useWorkflowStore } from "@/stores/workflowStore";
+import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { NODE_META } from "@/lib/constants";
 import ModelSelector from "./ModelSelector";
 import PromptEditor from "./PromptEditor";
 import PermissionsEditor from "./PermissionsEditor";
 import CommandEditor from "./CommandEditor";
+import TaskBoard from "./TaskBoard";
 
 const ICON_MAP: Record<string, ComponentType<LucideProps>> = {
   Code, Map, Search, Terminal, FileCheck, User,
@@ -52,13 +56,29 @@ const FEATURES: Record<AgentNodeType, FeatureFlags> = {
   human:   { agentType: false, model: false, prompt: false, permissions: false, command: false, description: true  },
 };
 
-export default function ConfigPanel() {
+export default function ConfigPanel({ workflowId }: { workflowId?: string }) {
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
   const removeNode = useWorkflowStore((s) => s.removeNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
+  const runStatus = useRunStore((s) => s.status);
   const t = useLocaleStore((s) => s.t);
+
+  const isRunActive = runStatus === "running" || runStatus === "paused";
+
+  // Tab state: auto-switch to Tasks when run starts, Config when node selected
+  const [activeTab, setActiveTab] = useState<"config" | "tasks">(
+    isRunActive && !selectedNodeId ? "tasks" : "config"
+  );
+
+  // Auto-switch to tasks tab when run starts and no node selected
+  // Auto-switch to config tab when a node is selected
+  const prevSelectedRef = useRef<string | null>(null);
+  if (selectedNodeId && selectedNodeId !== prevSelectedRef.current && activeTab === "tasks") {
+    setActiveTab("config");
+  }
+  prevSelectedRef.current = selectedNodeId;
 
   const node = nodes.find((n) => n.id === selectedNodeId);
 
@@ -69,131 +89,182 @@ export default function ConfigPanel() {
     }
   }, [selectedNodeId, removeNode]);
 
-  if (!selectedNodeId || !node) return null;
-
-  const { data } = node;
-  const nodeType = node.type as AgentNodeType;
+  // Derived node data for Config tab
+  const data = node?.data;
+  const nodeType = (node?.type ?? "coder") as AgentNodeType;
   const meta = NODE_META[nodeType];
   const features = FEATURES[nodeType];
   const IconComponent = ICON_MAP[meta.icon];
   const colors = COLOR_MAP[meta.color] ?? COLOR_MAP.gray;
 
+  // Config tab needs a selected node with data
+  const showConfig = activeTab === "config" && selectedNodeId && node && data;
+
   return (
     <div className="w-80 bg-white border-l border-gray-200 flex flex-col h-full overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100">
-        <div className={`w-8 h-8 rounded-lg ${colors.bg} flex items-center justify-center`}>
-          {IconComponent && <IconComponent size={16} className={colors.text} />}
-        </div>
-        <div className="flex-1 min-w-0">
-          <span className="text-sm font-semibold text-gray-800 block truncate">
-            {t(`node.${nodeType}.label`)}
-          </span>
-          <span className="text-xs text-gray-400 block truncate">
-            {t(`node.${nodeType}.description`)}
-          </span>
-        </div>
+      {/* Tab bar */}
+      <div className="flex items-center border-b border-gray-100 shrink-0">
         <button
-          onClick={handleDelete}
-          className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors"
-          aria-label={t("config.deleteNode")}
+          onClick={() => setActiveTab("config")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-medium transition-colors border-b-2 ${
+            activeTab === "config"
+              ? "border-gray-900 text-gray-900"
+              : "border-transparent text-gray-400 hover:text-gray-600"
+          }`}
         >
-          <Trash2 size={16} />
+          <Settings size={13} />
+          {t("config.title") || "Config"}
         </button>
         <button
+          onClick={() => setActiveTab("tasks")}
+          className={`flex items-center gap-1.5 px-4 py-2 text-xs font-medium transition-colors border-b-2 ${
+            activeTab === "tasks"
+              ? "border-gray-900 text-gray-900"
+              : "border-transparent text-gray-400 hover:text-gray-600"
+          }`}
+        >
+          <ListTodo size={13} />
+          Tasks
+        </button>
+
+        {/* Close button */}
+        <div className="flex-1" />
+        <button
           onClick={handleClose}
-          className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
+          className="p-1.5 mr-2 rounded-lg hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
           aria-label={t("config.closePanel")}
         >
           <X size={16} />
         </button>
       </div>
 
-      {/* Body */}
-      <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5">
-        {/* Label */}
-        <div className="space-y-1.5">
-          <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
-            {t("config.label")}
-          </label>
-          <input
-            type="text"
-            value={data.label}
-            onChange={(e) => updateNodeData(node.id, { label: e.target.value })}
-            className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
-          />
-        </div>
+      {/* Config tab content */}
+      {activeTab === "config" && (
+        <>
+          {showConfig ? (
+            <>
+              {/* Node header */}
+              <div className="flex items-center gap-3 px-4 py-3 border-b border-gray-100">
+                <div className={`w-8 h-8 rounded-lg ${colors.bg} flex items-center justify-center`}>
+                  {IconComponent && <IconComponent size={16} className={colors.text} />}
+                </div>
+                <div className="flex-1 min-w-0">
+                  <span className="text-sm font-semibold text-gray-800 block truncate">
+                    {t(`node.${nodeType}.label`)}
+                  </span>
+                  <span className="text-xs text-gray-400 block truncate">
+                    {t(`node.${nodeType}.description`)}
+                  </span>
+                </div>
+                <button
+                  onClick={handleDelete}
+                  className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors"
+                  aria-label={t("config.deleteNode")}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
 
-        {/* Agent Type */}
-        {features.agentType && (
-          <div className="space-y-1.5">
-            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
-              {t("config.agentType")}
-            </label>
-            <div className={`w-full rounded-lg border border-gray-200 ${colors.bg} px-3 py-2 text-sm text-gray-600 flex items-center gap-2`}>
-              {IconComponent && <IconComponent size={14} className={colors.text} />}
-              {t(`node.${nodeType}.label`)}
+              {/* Body */}
+              <div className="flex-1 overflow-y-auto px-4 py-4 space-y-5">
+                {/* Label */}
+                <div className="space-y-1.5">
+                  <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                    {t("config.label")}
+                  </label>
+                  <input
+                    type="text"
+                    value={data.label}
+                    onChange={(e) => updateNodeData(node.id, { label: e.target.value })}
+                    className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+                  />
+                </div>
+
+                {/* Agent Type */}
+                {features.agentType && (
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                      {t("config.agentType")}
+                    </label>
+                    <div className={`w-full rounded-lg border border-gray-200 ${colors.bg} px-3 py-2 text-sm text-gray-600 flex items-center gap-2`}>
+                      {IconComponent && <IconComponent size={14} className={colors.text} />}
+                      {t(`node.${nodeType}.label`)}
+                    </div>
+                  </div>
+                )}
+
+                {/* Model */}
+                {features.model && (
+                  <ModelSelector
+                    value={data.modelProvider && data.modelId ? `${data.modelProvider}/${data.modelId}` : ""}
+                    onChange={(fullId) => {
+                      const slash = fullId.indexOf("/");
+                      if (slash >= 0) {
+                        updateNodeData(node.id, {
+                          modelProvider: fullId.slice(0, slash),
+                          modelId: fullId.slice(slash + 1),
+                        });
+                      } else {
+                        updateNodeData(node.id, { modelProvider: "", modelId: fullId });
+                      }
+                    }}
+                  />
+                )}
+
+                {/* Prompt */}
+                {features.prompt && (
+                  <PromptEditor
+                    value={data.prompt}
+                    onChange={(prompt) => updateNodeData(node.id, { prompt })}
+                  />
+                )}
+
+                {/* Permissions */}
+                {features.permissions && (
+                  <PermissionsEditor
+                    value={data.permissions}
+                    onChange={(permissions) => updateNodeData(node.id, { permissions })}
+                  />
+                )}
+
+                {/* Command */}
+                {features.command && (
+                  <CommandEditor
+                    value={data.command}
+                    onChange={(command) => updateNodeData(node.id, { command })}
+                  />
+                )}
+
+                {/* Description (human node) */}
+                {features.description && (
+                  <div className="space-y-1.5">
+                    <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                      {t("config.description")}
+                    </label>
+                    <textarea
+                      value={data.description}
+                      onChange={(e) => updateNodeData(node.id, { description: e.target.value })}
+                      placeholder={t("config.descriptionPlaceholder")}
+                      rows={4}
+                      className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+                    />
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <div className="flex-1 flex items-center justify-center p-6">
+              <p className="text-xs text-gray-400 text-center">
+                Select a node on the canvas to edit its configuration
+              </p>
             </div>
-          </div>
-        )}
+          )}
+        </>
+      )}
 
-        {/* Model */}
-        {features.model && (
-          <ModelSelector
-            value={data.modelProvider && data.modelId ? `${data.modelProvider}/${data.modelId}` : ""}
-            onChange={(fullId) => {
-              const slash = fullId.indexOf("/");
-              if (slash >= 0) {
-                updateNodeData(node.id, {
-                  modelProvider: fullId.slice(0, slash),
-                  modelId: fullId.slice(slash + 1),
-                });
-              } else {
-                updateNodeData(node.id, { modelProvider: "", modelId: fullId });
-              }
-            }}
-          />
-        )}
-
-        {/* Prompt */}
-        {features.prompt && (
-          <PromptEditor
-            value={data.prompt}
-            onChange={(prompt) => updateNodeData(node.id, { prompt })}
-          />
-        )}
-
-        {/* Permissions */}
-        {features.permissions && (
-          <PermissionsEditor
-            value={data.permissions}
-            onChange={(permissions) => updateNodeData(node.id, { permissions })}
-          />
-        )}
-
-        {/* Command */}
-        {features.command && (
-          <CommandEditor
-            value={data.command}
-            onChange={(command) => updateNodeData(node.id, { command })}
-          />
-        )}
-
-        {/* Description (human node) */}
-        {features.description && (
-          <div className="space-y-1.5">
-            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
-              {t("config.description")}
-            </label>
-            <textarea
-              value={data.description}
-              onChange={(e) => updateNodeData(node.id, { description: e.target.value })}
-              placeholder={t("config.descriptionPlaceholder")}
-              rows={4}
-              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
-            />
-          </div>
-        )}
+      {/* Tasks tab content — always mount so useEffect fetches tasks on page load */}
+      <div className={activeTab === "tasks" ? "flex-1 flex flex-col overflow-hidden" : "hidden"}>
+        <TaskBoard workflowId={workflowId} />
       </div>
     </div>
   );

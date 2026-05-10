@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { api } from "@/lib/api";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
+import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import type { WorkflowDetail } from "@/types/api";
@@ -52,6 +53,7 @@ export default function WorkflowEditor() {
   const runId = useRunStore((s) => s.runId);
   const runStatus = useRunStore((s) => s.status);
   const setRunId = useRunStore((s) => s.setRunId);
+  const taskCount = useTaskStore((s) => s.tasks.length);
   const setStatus = useRunStore((s) => s.setStatus);
   const clearEvents = useRunStore((s) => s.clearEvents);
   const events = useRunStore((s) => s.events);
@@ -167,6 +169,7 @@ export default function WorkflowEditor() {
       setRunId(null);
       setStatus("idle");
       clearEvents();
+      useTaskStore.getState().clearTasks();
       processedChildEventsRef.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -229,8 +232,8 @@ export default function WorkflowEditor() {
           <OutputPanel />
         </div>
 
-        {/* Right: ConfigPanel (w-320px, only when a node is selected) */}
-        {selectedNodeId && <ConfigPanel />}
+        {/* Right: ConfigPanel (w-320px, shows Config or Tasks tab) */}
+        <ConfigPanel workflowId={workflowId} />
       </div>
 
       {/* Human-in-the-Loop Approval Modal */}

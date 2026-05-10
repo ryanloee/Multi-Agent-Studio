@@ -249,6 +249,58 @@ export const api = {
   getRunDiff: (id: string): Promise<string> =>
     request<string>(`/runs/${id}/diff`),
 
+  // ---- Tasks ----
+
+  /** List all tasks for a run */
+  listTasks: (runId: string): Promise<import("@/types/task").Task[]> =>
+    request<import("@/types/task").Task[]>(`/runs/${runId}/tasks`),
+
+  /** Get a single task */
+  getTask: (runId: string, taskId: string): Promise<import("@/types/task").Task> =>
+    request<import("@/types/task").Task>(`/runs/${runId}/tasks/${taskId}`),
+
+  /** Update a task (user edits) */
+  updateTask: (
+    runId: string,
+    taskId: string,
+    patch: Partial<import("@/types/task").Task>,
+  ): Promise<import("@/types/task").Task> =>
+    request<import("@/types/task").Task>(`/runs/${runId}/tasks/${taskId}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
+  /** Restart a failed/completed task */
+  restartTask: (runId: string, taskId: string): Promise<import("@/types/task").Task> =>
+    request<import("@/types/task").Task>(`/runs/${runId}/tasks/${taskId}/restart`, {
+      method: "POST",
+    }),
+
+  /** Send a message to a task */
+  sendTaskMessage: (
+    runId: string,
+    taskId: string,
+    body: {
+      sender_type: "planner" | "worker" | "user";
+      sender_id: string;
+      message_type: string;
+      content: string;
+    },
+  ): Promise<import("@/types/task").TaskMessage> =>
+    request<import("@/types/task").TaskMessage>(
+      `/runs/${runId}/tasks/${taskId}/messages`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  /** List messages for a task */
+  listTaskMessages: (
+    runId: string,
+    taskId: string,
+  ): Promise<import("@/types/task").TaskMessage[]> =>
+    request<import("@/types/task").TaskMessage[]>(
+      `/runs/${runId}/tasks/${taskId}/messages`,
+    ),
+
   // ---- Models ----
 
   /** List available LLM models */

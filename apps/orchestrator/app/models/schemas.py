@@ -114,3 +114,76 @@ class NodeExecutionResponse(BaseModel):
         return _ensure_utc(v) if v is not None else None
 
     model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Task schemas
+# ---------------------------------------------------------------------------
+
+class TaskCreate(BaseModel):
+    run_id: UUID
+    parent_task_id: Optional[UUID] = None
+    title: str = Field(..., min_length=1, max_length=512)
+    description: str = ""
+    assigned_node_id: Optional[str] = None
+    assigned_worker_label: Optional[str] = None
+
+
+class TaskUpdate(BaseModel):
+    title: Optional[str] = Field(None, min_length=1, max_length=512)
+    description: Optional[str] = None
+    status: Optional[str] = None
+    assigned_node_id: Optional[str] = None
+    assigned_worker_label: Optional[str] = None
+    progress: Optional[int] = Field(None, ge=0, le=100)
+    result_summary: Optional[str] = None
+
+
+class TaskResponse(BaseModel):
+    id: UUID
+    run_id: UUID
+    parent_task_id: Optional[UUID] = None
+    title: str
+    description: str
+    status: str
+    assigned_node_id: Optional[str] = None
+    assigned_worker_label: Optional[str] = None
+    progress: int
+    result_summary: str
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _utc_aware(cls, v: datetime) -> datetime:
+        return _ensure_utc(v)
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# TaskMessage schemas
+# ---------------------------------------------------------------------------
+
+class TaskMessageCreate(BaseModel):
+    sender_type: str = Field(..., pattern="^(planner|worker|user)$")
+    sender_id: str
+    message_type: str = Field(..., pattern="^(assignment|question|answer|escalation|update|user_edit)$")
+    content: str
+
+
+class TaskMessageResponse(BaseModel):
+    id: UUID
+    task_id: UUID
+    sender_type: str
+    sender_id: str
+    message_type: str
+    content: str
+    created_at: datetime
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _utc_aware(cls, v: datetime) -> datetime:
+        return _ensure_utc(v)
+
+    model_config = {"from_attributes": True}
