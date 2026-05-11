@@ -19,6 +19,8 @@ const COLOR_MAP: Record<string, string> = {
   orange: "#f97316",
 };
 
+const EMPTY_TASK_MESSAGES: import("@/types/task").TaskMessage[] = [];
+
 // ---------------------------------------------------------------------------
 // Icon mapping — maps icon name strings to simple SVG glyphs
 // ---------------------------------------------------------------------------
@@ -68,6 +70,17 @@ const ICON_MAP: Record<string, JSX.Element> = {
 // ---------------------------------------------------------------------------
 // Derive current action label from the most recent event for a node
 // ---------------------------------------------------------------------------
+function eventContent(event: StreamEvent): string {
+  const raw = (event as unknown as Record<string, unknown>).content;
+  return typeof raw === "string" ? raw.trim() : "";
+}
+
+function truncate(text: string, max = 120): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, max - 1)}...`;
+}
+
 function getCurrentAction(events: StreamEvent[]): string {
   if (events.length === 0) return "运行中...";
   const last = events[events.length - 1];
@@ -85,6 +98,29 @@ function getCurrentAction(events: StreamEvent[]): string {
     return "步骤完成";
   }
   return "运行中...";
+}
+
+function getActivitySummary(events: StreamEvent[]): string {
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const event = events[i];
+    const type = event.type as string;
+    const content = eventContent(event);
+    if (!content) continue;
+    if (type === "tool_call") {
+      const toolName = (event as unknown as Record<string, unknown>).tool_name;
+      return `工具: ${typeof toolName === "string" && toolName ? toolName : content}`;
+    }
+    if (type === "shell_stdout" || type === "shell_stderr") {
+      return truncate(content.startsWith("$") ? content : `命令输出: ${content}`);
+    }
+    if (type === "llm_token" || type === "llm_chunk") {
+      return truncate(content);
+    }
+    if (type === "node_failed" || type === "error") {
+      return truncate(content);
+    }
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -118,11 +154,21 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
     [allEvents, id]
   );
   const currentAction = nodeStatus === "running" ? getCurrentAction(nodeEvents) : "";
+  const activitySummary = getActivitySummary(nodeEvents);
 
   // Task status from taskStore (for dynamic worker nodes)
   const taskForNode = useTaskStore((s) =>
     s.tasks.find((t) => t.assigned_node_id === id)
   );
+  const taskMessages = useTaskStore((s) =>
+    taskForNode ? (s.taskMessages[taskForNode.id] ?? EMPTY_TASK_MESSAGES) : EMPTY_TASK_MESSAGES
+  );
+  const lastTaskMessage = taskMessages[taskMessages.length - 1];
+  const detailText =
+    (lastTaskMessage?.content && truncate(lastTaskMessage.content)) ||
+    activitySummary ||
+    (taskForNode?.result_summary && truncate(taskForNode.result_summary)) ||
+    (taskForNode?.description && nodeStatus !== "completed" ? truncate(taskForNode.description) : "");
 
   return (
     <div
@@ -130,7 +176,7 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
         "relative rounded-md border bg-white shadow-sm transition-shadow overflow-hidden",
         selected ? "ring-2 ring-blue-500" : "",
       ].join(" ")}
-      style={{ width: 200 }}
+      style={{ width: 260 }}
     >
       {/* Handles */}
       <Handle
@@ -143,11 +189,16 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
       <div className="h-1.5" style={{ backgroundColor: colorHex }} />
 
       {/* Header: icon + label */}
-      <div className="flex items-center gap-2 px-3 py-2">
+      <div className="flex items-start gap-2 px-3 py-2">
         <span style={{ color: colorHex }}>{icon}</span>
-        <span className="text-sm font-medium text-gray-800 truncate">
-          {nodeData.label || t(`node.${nodeData.agentType}.label`)}
-        </span>
+        <div className="min-w-0 flex-1">
+          <span className="block text-sm font-medium text-gray-800 truncate">
+            {nodeData.label || t(`node.${nodeData.agentType}.label`)}
+          </span>
+          <span className="block text-[10px] uppercase tracking-wide text-gray-400">
+            {nodeData.agentType}
+          </span>
+        </div>
       </div>
 
       {/* Status indicator bar */}
@@ -172,7 +223,7 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
               <svg className="w-3.5 h-3.5 text-green-500 shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3}>
                 <polyline points="20 6 9 17 4 12" />
               </svg>
-              <span className="text-xs text-green-600 font-medium">completed</span>
+              <span className="text-xs text-green-600 font-medium">完成</span>
             </>
           )}
           {nodeStatus === "failed" && (
@@ -182,7 +233,7 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
                 <line x1="18" y1="6" x2="6" y2="18" />
                 <line x1="6" y1="6" x2="18" y2="18" />
               </svg>
-              <span className="text-xs text-red-600 font-medium">failed</span>
+              <span className="text-xs text-red-600 font-medium">失败</span>
             </>
           )}
           {nodeStatus === "paused" && (
@@ -202,13 +253,41 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
                 <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
               </span>
-              <span className="text-xs text-amber-600 font-medium">escalating...</span>
+              <span className="text-xs text-amber-600 font-medium">等待协助...</span>
             </>
           )}
           {taskForNode && taskForNode.status === "running" && taskForNode.progress > 0 && (
             <span className="text-[10px] font-mono text-blue-500 ml-auto">
               {taskForNode.progress}%
             </span>
+          )}
+        </div>
+      )}
+
+      {(taskForNode || detailText) && (
+        <div className="mx-3 mb-2 rounded bg-gray-50 border border-gray-100 px-2 py-1.5">
+          {taskForNode && (
+            <div className="mb-1 flex items-center justify-between gap-2 text-[10px]">
+              <span className="font-medium text-gray-500 truncate">
+                {taskForNode.title}
+              </span>
+              <span className="shrink-0 font-mono text-gray-400">
+                {taskForNode.progress ?? 0}%
+              </span>
+            </div>
+          )}
+          {detailText && (
+            <div className="text-[11px] leading-snug text-gray-600 line-clamp-3">
+              {detailText}
+            </div>
+          )}
+          {taskForNode && taskForNode.status === "running" && (
+            <div className="mt-1 h-1 overflow-hidden rounded-full bg-gray-200">
+              <div
+                className="h-full rounded-full bg-blue-500 transition-all"
+                style={{ width: `${Math.max(5, Math.min(taskForNode.progress || 5, 100))}%` }}
+              />
+            </div>
           )}
         </div>
       )}

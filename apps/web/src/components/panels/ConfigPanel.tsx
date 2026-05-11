@@ -288,7 +288,6 @@ export default function ConfigPanel() {
             value={localDir}
             onChange={handleDirChange}
             placeholder={t("config.workspaceDirectoryPlaceholder")}
-            disabled={mode === "auto"}
             label={t("config.workspaceDirectory")}
           />
 

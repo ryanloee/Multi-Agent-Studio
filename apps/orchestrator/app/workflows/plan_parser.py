@@ -208,10 +208,14 @@ def _infer_task_type(content: str) -> str:
 def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
     """Parse structured JSON plan output into (nodes, edges) for the DAG executor.
 
+    Supports two formats:
+    1. Planner chat format: {"nodes": [...], "edges": [...]}
+    2. Tasks format: {"tasks": [{"id": ..., "type": ..., "prompt": ..., "depends_on": [...]}, ...]}
+
     Returns None if the output doesn't contain valid structured JSON.
     """
-    # Step 1: Try to find a JSON code block (```json ... ```)
-    json_block_pattern = r"```json\s*(\{[\s\S]*?\})\s*```"
+    # Step 1: Try to find a JSON code block (```json ... ``` or ```plan ... ```)
+    json_block_pattern = r"```(?:json|plan)\s*(\{[\s\S]*?\})\s*```"
     match = re.search(json_block_pattern, plan_output)
     raw_json = None
 
@@ -228,46 +232,98 @@ def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
     if raw_json is None:
         return None
 
-    # Step 3: Parse JSON and validate "tasks" array
+    # Step 3: Parse JSON
     try:
         data = json.loads(raw_json)
     except json.JSONDecodeError:
         return None
 
-    if not isinstance(data, dict) or "tasks" not in data:
-        return None
-    tasks = data["tasks"]
-    if not isinstance(tasks, list):
+    if not isinstance(data, dict):
         return None
 
-    # Step 4-7: Build nodes and edges
     nodes: list[dict] = []
     edges: list[dict] = []
 
-    for task in tasks:
-        if not isinstance(task, dict):
-            return None
-        if "id" not in task or "type" not in task or "prompt" not in task or "depends_on" not in task:
-            return None
-
-        nodes.append({
-            "id": task["id"],
-            "type": task["type"],
-            "data": {
-                "label": task["id"],
-                "agent_type": task["type"],
-                "prompt": task["prompt"],
-            },
-        })
-
-        for dep in task["depends_on"]:
-            edges.append({
-                "id": f"e_{dep}_{task['id']}",
-                "source": dep,
-                "target": task["id"],
+    # Format 1: Direct nodes/edges (from planner chat)
+    if "nodes" in data and isinstance(data["nodes"], list):
+        edge_keys: set[tuple[str, str]] = set()
+        for node in data["nodes"]:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("id")
+            if not node_id:
+                continue
+            # Convert to standard format
+            nodes.append({
+                "id": node_id,
+                "type": node.get("type", "coder"),
+                "data": {
+                    "label": node.get("label", node_id),
+                    "agent_type": node.get("type", "coder"),
+                    "prompt": node.get("prompt", ""),
+                },
             })
 
-    return (nodes, edges)
+            depends_on = node.get("depends_on", [])
+            if isinstance(depends_on, list):
+                for dep in depends_on:
+                    if not dep:
+                        continue
+                    edge_keys.add((str(dep), str(node_id)))
+
+        # Parse edges
+        if "edges" in data and isinstance(data["edges"], list):
+            for edge in data["edges"]:
+                if not isinstance(edge, dict):
+                    continue
+                source = edge.get("source")
+                target = edge.get("target")
+                if source and target:
+                    edge_keys.add((str(source), str(target)))
+
+        for source, target in edge_keys:
+            edges.append({
+                "id": f"e_{source}_{target}",
+                "source": source,
+                "target": target,
+            })
+
+        if nodes:
+            return (nodes, edges)
+
+    # Format 2: Tasks with dependencies (legacy format)
+    if "tasks" in data and isinstance(data["tasks"], list):
+        tasks = data["tasks"]
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if "id" not in task or "type" not in task or "prompt" not in task or "depends_on" not in task:
+                return None
+
+            nodes.append({
+                "id": task["id"],
+                "type": task["type"],
+                "data": {
+                    "label": task["id"],
+                    "agent_type": task["type"],
+                    "prompt": task["prompt"],
+                },
+            })
+
+            # Parse depends_on as edges
+            depends_on = task.get("depends_on", [])
+            if isinstance(depends_on, list):
+                for dep in depends_on:
+                    edges.append({
+                        "id": f"e_{dep}_{task['id']}",
+                        "source": dep,
+                        "target": task["id"],
+                    })
+
+        if nodes:
+            return (nodes, edges)
+
+    return None
 
 
 def _validate_tasks(tasks: list) -> list[dict]:

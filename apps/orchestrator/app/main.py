@@ -9,6 +9,7 @@
 import asyncio
 import logging
 import os
+import secrets
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -24,8 +25,9 @@ from dotenv import load_dotenv
 # Load .env into os.environ so non-MAS_ vars (like MIMO_API_KEY) are available
 load_dotenv(Path(__file__).parent.parent / ".env", override=False)
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.models import router as models_router
 from app.api.runs import router as runs_router, init_engine as init_runs_engine
@@ -46,6 +48,32 @@ from app.sandbox.provision import SandboxProvisioner
 from app.ws.hub import WebSocketHub
 
 logger = logging.getLogger(__name__)
+
+
+AUTH_HEADER = "x-mas-access-token"
+AUTH_EXEMPT_PATHS = {"/health", "/api/auth/status", "/api/auth/verify"}
+
+
+def _access_password_enabled() -> bool:
+    return bool(settings.access_password)
+
+
+def _token_matches(token: str | None) -> bool:
+    if not _access_password_enabled():
+        return True
+    if not token:
+        return False
+    return secrets.compare_digest(token, settings.access_password)
+
+
+def _request_token(request: Request) -> str | None:
+    token = request.headers.get(AUTH_HEADER)
+    if token:
+        return token
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return None
 
 
 @asynccontextmanager
@@ -127,11 +155,63 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def access_password_middleware(request: Request, call_next):
+    if (
+        not _access_password_enabled()
+        or request.method == "OPTIONS"
+        or request.url.path in AUTH_EXEMPT_PATHS
+    ):
+        return await call_next(request)
+
+    if not _token_matches(_request_token(request)):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "status": 401,
+                "code": "UNAUTHORIZED",
+                "message": "Access password required",
+            },
+        )
+
+    return await call_next(request)
+
+
+@app.get("/api/auth/status")
+async def auth_status():
+    return {"enabled": _access_password_enabled()}
+
+
+@app.post("/api/auth/verify")
+async def auth_verify(request: Request):
+    if not _access_password_enabled():
+        return {"ok": True}
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    token = request.headers.get(AUTH_HEADER) or body.get("password")
+    if not _token_matches(token):
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={
+                "status": 401,
+                "code": "UNAUTHORIZED",
+                "message": "Invalid access password",
+            },
+        )
+    return {"ok": True}
 
 app.include_router(workflows_router, prefix="/api/workflows", tags=["workflows"])
 app.include_router(runs_router, prefix="/api/runs", tags=["runs"])
@@ -143,6 +223,11 @@ app.include_router(models_router, prefix="/api/models", tags=["models"])
 
 @app.websocket("/ws/runs/{run_id}/stream")
 async def ws_run_stream(websocket: WebSocket, run_id: str):
+    token = websocket.query_params.get("access_token")
+    if not _token_matches(token):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
     hub: WebSocketHub = app.state.ws_hub
     await hub.connect(websocket, run_id)
     try:

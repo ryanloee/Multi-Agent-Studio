@@ -94,6 +94,135 @@ function nextNodeId(): string {
   return `node_${Date.now()}_${idCounter}`;
 }
 
+function isAgentNodeType(value: unknown): value is AgentNodeType {
+  return typeof value === "string" && value in NODE_META;
+}
+
+function normalizeWorkflowNode(node: unknown, index: number): WorkflowNode {
+  const raw = (node ?? {}) as Record<string, unknown>;
+  const data = (typeof raw.data === "object" && raw.data !== null ? raw.data : {}) as Partial<NodeData>;
+  const nodeType = isAgentNodeType(raw.type)
+    ? raw.type
+    : isAgentNodeType(data.agentType)
+      ? data.agentType
+      : "coder";
+  const meta = NODE_META[nodeType];
+  const rawPosition = (typeof raw.position === "object" && raw.position !== null ? raw.position : {}) as {
+    x?: unknown;
+    y?: unknown;
+  };
+  const position = {
+    x: typeof rawPosition.x === "number" ? rawPosition.x : 100 + (index % 3) * 280,
+    y: typeof rawPosition.y === "number" ? rawPosition.y : 100 + Math.floor(index / 3) * 140,
+  };
+
+  return {
+    id: String(raw.id || nextNodeId()),
+    type: nodeType,
+    position,
+    data: {
+      label: String(data.label || raw.label || meta.label),
+      agentType: nodeType,
+      modelProvider: String(data.modelProvider || raw.model_provider || ""),
+      modelId: String(data.modelId || raw.model_id || ""),
+      prompt: String(data.prompt || raw.prompt || ""),
+      permissions: data.permissions ?? meta.defaultData.permissions ?? {},
+      command: String(data.command || raw.command || ""),
+      description: String(data.description || raw.description || ""),
+      childNodeIds: data.childNodeIds,
+      parentNodeId: data.parentNodeId,
+      isDynamic: data.isDynamic,
+    },
+  };
+}
+
+function normalizeWorkflowEdge(edge: unknown): WorkflowEdge | null {
+  const raw = (edge ?? {}) as Record<string, unknown>;
+  const source = typeof raw.source === "string" ? raw.source : "";
+  const target = typeof raw.target === "string" ? raw.target : "";
+  if (!source || !target) return null;
+  return {
+    ...(raw as Partial<WorkflowEdge>),
+    id: String(raw.id || `e_${source}-${target}`),
+    source,
+    target,
+    data: {
+      transfer_files: true,
+      transfer_summary: true,
+      transfer_format: "summary",
+      ...((typeof raw.data === "object" && raw.data !== null) ? raw.data : {}),
+    },
+  } as WorkflowEdge;
+}
+
+function layoutDagNodes(nodes: WorkflowNode[], edges: WorkflowEdge[]): WorkflowNode[] {
+  if (nodes.length === 0) return nodes;
+
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const incoming = new Map<string, string[]>();
+  const outgoing = new Map<string, string[]>();
+  for (const node of nodes) {
+    incoming.set(node.id, []);
+    outgoing.set(node.id, []);
+  }
+
+  for (const edge of edges) {
+    if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
+    incoming.get(edge.target)?.push(edge.source);
+    outgoing.get(edge.source)?.push(edge.target);
+  }
+
+  const roots = nodes
+    .filter((node) => (incoming.get(node.id) ?? []).length === 0)
+    .map((node) => node.id);
+  const queue = roots.length > 0 ? [...roots] : [nodes[0].id];
+  const layerById = new Map<string, number>();
+  for (const root of queue) layerById.set(root, 0);
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    const currentLayer = layerById.get(current) ?? 0;
+    for (const child of outgoing.get(current) ?? []) {
+      const nextLayer = Math.max(layerById.get(child) ?? 0, currentLayer + 1);
+      if ((layerById.get(child) ?? -1) < nextLayer) {
+        layerById.set(child, nextLayer);
+        queue.push(child);
+      }
+    }
+  }
+
+  for (const node of nodes) {
+    if (!layerById.has(node.id)) {
+      layerById.set(node.id, Math.max(0, layerById.size));
+    }
+  }
+
+  const layers = new Map<number, WorkflowNode[]>();
+  for (const node of nodes) {
+    const layer = layerById.get(node.id) ?? 0;
+    layers.set(layer, [...(layers.get(layer) ?? []), node]);
+  }
+
+  const xCenter = 520;
+  const xGap = 300;
+  const yGap = 170;
+  const yStart = 80;
+
+  return nodes.map((node) => {
+    const layer = layerById.get(node.id) ?? 0;
+    const layerNodes = layers.get(layer) ?? [];
+    const index = layerNodes.findIndex((item) => item.id === node.id);
+    const count = Math.max(layerNodes.length, 1);
+    return {
+      ...node,
+      position: {
+        x: xCenter + (index - (count - 1) / 2) * xGap,
+        y: yStart + layer * yGap,
+      },
+    };
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -236,12 +365,33 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       return node;
     });
 
-    // Skip if node or edge already exists (prevents duplicates on re-render)
+    // Skip duplicate node creation, but still refresh runtime metadata and add
+    // a missing edge. Events can arrive as task_created first, then
+    // child_created with the real agent type/model.
     const nodeExists = nodes.some((n) => n.id === childDef.id);
     const edgeExists = get().edges.some((e) => e.id === newEdge.id);
+    const nodesWithUpdatedChild = nodeExists
+      ? updatedNodes.map((node) =>
+          node.id === childDef.id
+            ? {
+                ...node,
+                type: childDef.type,
+                data: {
+                  ...node.data,
+                  agentType: childDef.type,
+                  modelProvider,
+                  modelId,
+                  prompt: childDef.prompt || node.data.prompt,
+                  parentNodeId: (node.data as NodeData).parentNodeId ?? parentId,
+                  isDynamic: true,
+                },
+              }
+            : node
+        )
+      : updatedNodes;
 
     set({
-      nodes: nodeExists ? updatedNodes : [...updatedNodes, newNode],
+      nodes: nodeExists ? nodesWithUpdatedChild : [...updatedNodes, newNode],
       edges: edgeExists ? get().edges : [...get().edges, newEdge],
     });
   },
@@ -302,9 +452,18 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
   // ---- Bulk operations ----
   loadWorkflow: (workflow: WorkflowDetail) => {
+    const normalizedNodes = (workflow.nodes ?? []).map(normalizeWorkflowNode);
+    const normalizedEdges = (workflow.edges ?? [])
+      .map(normalizeWorkflowEdge)
+      .filter((edge): edge is WorkflowEdge => edge !== null);
+    const shouldAutoLayout = workflow.mode === "auto" || normalizedNodes.some((node) => {
+      const raw = (workflow.nodes ?? []).find((item) => (item as WorkflowNode).id === node.id) as Partial<WorkflowNode> | undefined;
+      return !raw?.position || typeof raw.position.x !== "number" || typeof raw.position.y !== "number";
+    });
+
     set({
-      nodes: workflow.nodes as WorkflowNode[],
-      edges: workflow.edges as WorkflowEdge[],
+      nodes: shouldAutoLayout ? layoutDagNodes(normalizedNodes, normalizedEdges) : normalizedNodes,
+      edges: normalizedEdges,
       selectedNodeId: null,
       selectedEdgeId: null,
       currentWorkflowId: workflow.id,

@@ -350,6 +350,22 @@ class BrowseDirResponse(BaseModel):
     path: str = Field(default="")
 
 
+class ListDirRequest(BaseModel):
+    path: str = Field(default="", description="要浏览的目录")
+
+
+class DirEntry(BaseModel):
+    name: str
+    path: str
+
+
+class ListDirResponse(BaseModel):
+    path: str
+    parent: str
+    entries: list[DirEntry] = Field(default_factory=list)
+    error: str = ""
+
+
 @router.post("/browse-dir", response_model=BrowseDirResponse)
 async def browse_directory(body: BrowseDirRequest) -> BrowseDirResponse:
     import sys
@@ -361,23 +377,68 @@ async def browse_directory(body: BrowseDirRequest) -> BrowseDirResponse:
         except ImportError:
             return ""
 
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
+        root = None
 
         try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
             init_dir = initial_dir if initial_dir and Path(initial_dir).is_dir() else ""
             selected = filedialog.askdirectory(
                 title="选择工作目录" if sys.platform == "win32" else "Select Directory",
                 initialdir=init_dir or None,
             )
-            return selected
+            return selected if isinstance(selected, str) else ""
+        except Exception:
+            return ""
         finally:
-            root.destroy()
+            if root is not None:
+                root.destroy()
 
     loop = asyncio.get_event_loop()
     selected_path = await loop.run_in_executor(None, _pick_folder, body.current_path)
-    return BrowseDirResponse(path=selected_path)
+    return BrowseDirResponse(path=selected_path if isinstance(selected_path, str) else "")
+
+
+@router.post("/list-dir", response_model=ListDirResponse)
+async def list_directory(body: ListDirRequest) -> ListDirResponse:
+    raw_path = body.path.strip() or str(Path.home())
+    try:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        else:
+            path = path.resolve()
+    except OSError as exc:
+        return ListDirResponse(
+            path=str(Path.home()),
+            parent=str(Path.home().parent),
+            entries=[],
+            error=f"路径无效: {exc}",
+        )
+
+    if not path.exists() or not path.is_dir():
+        path = Path.home()
+
+    entries: list[DirEntry] = []
+    error = ""
+    try:
+        for child in path.iterdir():
+            try:
+                if child.is_dir():
+                    entries.append(DirEntry(name=child.name, path=str(child)))
+            except OSError:
+                continue
+    except OSError as exc:
+        error = f"无法读取目录: {exc}"
+
+    entries.sort(key=lambda item: (item.name.startswith("."), item.name.lower()))
+    return ListDirResponse(
+        path=str(path),
+        parent=str(path.parent),
+        entries=entries,
+        error=error,
+    )
 
 
 # ---------------------------------------------------------------------------

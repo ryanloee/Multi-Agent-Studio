@@ -60,6 +60,30 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
+def _load_default_model_config() -> dict[str, str]:
+    """Load the first configured UI model for agent execution fallback."""
+    settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
+    try:
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+    models = data.get("models", [])
+    if not isinstance(models, list) or not models:
+        return {}
+
+    first = models[0]
+    if not isinstance(first, dict):
+        return {}
+
+    return {
+        "provider": str(first.get("format") or ""),
+        "model": str(first.get("default_model") or first.get("name") or ""),
+        "url": str(first.get("base_url") or "").rstrip("/"),
+        "key": str(first.get("api_key") or ""),
+    }
+
+
 class LocalDAGExecutor:
     """Local asyncio-based DAG executor.  Replaces Temporal."""
 
@@ -124,6 +148,44 @@ class LocalDAGExecutor:
             "global_config": global_config or {},
         }
         logger.info("DAG task created for run %s with %d layers", run_id, len(layers))
+        return run_id
+
+    async def start_task_dag(
+        self,
+        run_id: str,
+        dag_json: dict,
+        global_config: dict | None = None,
+        workspace_directory: str | None = None,
+    ) -> str:
+        """Start an already-planned DAG and mirror each node to the task board."""
+        cancel_event = asyncio.Event()
+        task = asyncio.create_task(
+            self._execute_task_dag(
+                run_id, dag_json, global_config or {}, cancel_event,
+                workspace_directory=workspace_directory,
+            ),
+            name=f"task-dag-{run_id}",
+        )
+
+        def _log_task_exception(t: asyncio.Task) -> None:
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc:
+                logger.exception("Task DAG failed for run %s", run_id)
+
+        task.add_done_callback(_log_task_exception)
+
+        self._runs[run_id] = {
+            "status": "running",
+            "task": task,
+            "cancel_event": cancel_event,
+            "global_config": global_config or {},
+        }
+        logger.info(
+            "Task DAG created for run %s with %d nodes",
+            run_id, len(dag_json.get("nodes", [])),
+        )
         return run_id
 
     async def get_status(self, run_id: str) -> dict:
@@ -296,6 +358,7 @@ class LocalDAGExecutor:
         layer_results: dict[str, Any] = {}
         sandbox_map: dict[str, str] = {}  # node_id -> sandbox_id
         commit_map: dict[str, str] = {}    # node_id -> last commit hash
+        retained_sandboxes: set[str] = set()
 
         for layer_idx, layer in enumerate(layers):
             if cancel_event.is_set():
@@ -367,6 +430,18 @@ class LocalDAGExecutor:
             for node in nodes:
                 n_id = node.get("id", node.get("node_id", ""))
                 assigned_sid = layer_sandbox_assignments.get(n_id)
+                task_id = (global_config.get("_task_db_map") or {}).get(n_id)
+                if task_id:
+                    await self._update_task_status_db(
+                        task_id, "running", progress=5,
+                    )
+                    await self._emit(
+                        "task_updated", run_id, "",
+                        task_id=task_id,
+                        status="running",
+                        progress=5,
+                        assigned_node_id=n_id,
+                    )
 
                 # If this node needs a clone, do it now (before launching)
                 if assigned_sid is None and n_id in layer_clone_requests:
@@ -396,6 +471,7 @@ class LocalDAGExecutor:
                         upstream_context=self._build_upstream_context(
                             n_id, edges, layer_results,
                         ),
+                        destroy_owned_sandbox=False,
                     )
                 )
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -419,6 +495,7 @@ class LocalDAGExecutor:
                     _sid = result.get("sandbox_id")
                     if _sid:
                         sandbox_map[node_id] = _sid
+                        retained_sandboxes.add(_sid)
 
                         # Persist to run state for API access
                         run_state = self._runs.get(run_id, {})
@@ -457,12 +534,19 @@ class LocalDAGExecutor:
                     if (
                         _atype == "plan"
                         and result.get("state") == "completed"
+                        and not global_config.get("_disable_dynamic_plan")
                     ):
                         plan_results = await self._execute_dynamic_plan(
                             run_id, node_id, result, global_config, cancel_event,
                             planner_node=node,
                         )
                         layer_results.update(plan_results)
+
+        for sandbox_id in retained_sandboxes:
+            try:
+                await self._sandbox.destroy(sandbox_id)
+            except Exception:
+                logger.debug("Failed to destroy retained sandbox %s", sandbox_id, exc_info=True)
 
         return layer_results
 
@@ -487,6 +571,195 @@ class LocalDAGExecutor:
                     await session.commit()
         except Exception:
             logger.warning("Failed to update run status in DB for %s", run_id, exc_info=True)
+
+    async def _update_task_status_db(
+        self,
+        task_id: str,
+        status: str,
+        progress: int = 0,
+        result_summary: str = "",
+    ) -> None:
+        """Update task-board row status for a running DAG node."""
+        try:
+            from app.core.database import async_session_factory
+            from app.models.task import Task as TaskModel
+            from sqlalchemy import select
+            from uuid import UUID as _UUID
+
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(TaskModel).where(TaskModel.id == _UUID(task_id))
+                )
+                task_row = result.scalar_one_or_none()
+                if task_row is not None:
+                    task_row.status = status
+                    task_row.progress = progress
+                    if result_summary:
+                        task_row.result_summary = result_summary
+                    await session.commit()
+        except Exception:
+            logger.warning("Failed to update task status for %s", task_id, exc_info=True)
+
+    async def _execute_task_dag(
+        self,
+        run_id: str,
+        dag_json: dict,
+        global_config: dict,
+        cancel_event: asyncio.Event,
+        workspace_directory: str | None = None,
+    ) -> None:
+        """Execute a saved DAG while creating task-board rows for every node."""
+        logger.info(
+            "Task DAG execution STARTED for run %s, %d nodes",
+            run_id, len(dag_json.get("nodes", [])),
+        )
+
+        try:
+            await self._emit("run_started", run_id, "")
+
+            from app.core.database import async_session_factory
+            from app.models.task import Task as TaskModel
+            from uuid import uuid4
+
+            task_db_map: dict[str, str] = {}
+            normalized_nodes: list[dict] = []
+
+            async with async_session_factory() as session:
+                for node in dag_json.get("nodes", []):
+                    if not isinstance(node, dict):
+                        continue
+
+                    node_id = node.get("id", "")
+                    if not node_id:
+                        continue
+
+                    data = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
+                    agent_type = (
+                        node.get("agent_type")
+                        or data.get("agent_type")
+                        or data.get("agentType")
+                        or node.get("type")
+                        or "coder"
+                    )
+                    label = data.get("label") or node.get("label") or node_id
+                    prompt = node.get("prompt") or data.get("prompt") or ""
+                    model_provider = (
+                        node.get("model_provider")
+                        or data.get("model_provider")
+                        or data.get("modelProvider")
+                        or ""
+                    )
+                    model_id = (
+                        node.get("model_id")
+                        or data.get("model_id")
+                        or data.get("modelId")
+                        or ""
+                    )
+
+                    task_id = uuid4()
+                    db_task = TaskModel(
+                        id=task_id,
+                        run_id=uuid.UUID(run_id),
+                        title=str(label)[:200],
+                        description=prompt,
+                        status="pending",
+                        assigned_node_id=node_id,
+                        assigned_worker_label=str(label),
+                    )
+                    session.add(db_task)
+                    task_db_map[node_id] = str(task_id)
+
+                    normalized_nodes.append({
+                        "id": node_id,
+                        "agent_type": agent_type,
+                        "model_provider": model_provider,
+                        "model_id": model_id,
+                        "prompt": (
+                            prompt
+                            + f"\n\n---\nTask ID: {node_id}\n"
+                            + f"When you need help or are stuck, output a line:\n"
+                            + f"{ESCALATION_MARKER} <your question>\n"
+                            + f"To report progress, output a line:\n"
+                            + f"{PROGRESS_MARKER} <0-100>\n"
+                        ),
+                    })
+
+                    await self._emit(
+                        "task_created", run_id, "planner",
+                        task_id=str(task_id),
+                        task_title=db_task.title,
+                        task_description=db_task.description,
+                        status="pending",
+                        child_node_id=node_id,
+                    )
+                    await self._emit(
+                        "child_created", run_id, "planner",
+                        child_node_id=node_id,
+                        child_type=agent_type,
+                        child_prompt=prompt,
+                        child_model=(
+                            f"{model_provider}/{model_id}"
+                            if model_provider and model_id else model_id
+                        ),
+                    )
+
+                await session.commit()
+
+            sub_dag = {
+                "nodes": normalized_nodes,
+                "edges": dag_json.get("edges", []),
+            }
+            layers = compile_dag(sub_dag)
+            global_config["_edges"] = sub_dag["edges"]
+            global_config["_task_db_map"] = task_db_map
+            global_config["_disable_dynamic_plan"] = True
+
+            child_results = await self._execute_layers(
+                run_id, layers, sub_dag["edges"], global_config, cancel_event,
+                workspace_directory=workspace_directory,
+            )
+
+            for node_id, result in child_results.items():
+                task_id = task_db_map.get(node_id)
+                if not task_id:
+                    continue
+                state = result.get("state", "failed") if isinstance(result, dict) else "failed"
+                summary = ""
+                if isinstance(result, dict):
+                    summary = result.get("error", "")
+                    if state == "completed":
+                        raw = result.get("raw_output", "")
+                        summary = self._task_scheduler._summarize(raw) if raw else "completed"
+
+                await self._update_task_status_db(
+                    task_id,
+                    state,
+                    progress=100 if state == "completed" else 0,
+                    result_summary=summary,
+                )
+                await self._emit(
+                    "task_updated", run_id, "",
+                    task_id=task_id,
+                    status=state,
+                    progress=100 if state == "completed" else 0,
+                    result_summary=summary,
+                )
+
+            has_failed = any(
+                isinstance(result, dict) and result.get("state") == "failed"
+                for result in layer_results.values()
+            )
+            status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
+            self._runs[run_id]["status"] = status
+            event_type = "run_completed" if status == "completed" else "run_failed"
+            await self._emit(event_type, run_id, "", content=f"status={status}")
+            await self._update_run_status_db(run_id, status)
+
+        except Exception as exc:
+            logger.exception("Task DAG execution failed for run %s", run_id)
+            self._runs[run_id]["status"] = "failed"
+            await self._emit("run_failed", run_id, "", content=str(exc))
+            await self._update_run_status_db(run_id, "failed")
 
     async def _execute_dag(
         self,
@@ -520,7 +793,11 @@ class LocalDAGExecutor:
                     first_key = next(iter(commit_map))
                     run_state["_commit_map"]["_initial"] = commit_map[first_key]
 
-            status = "cancelled" if cancel_event.is_set() else "completed"
+            has_failed = any(
+                isinstance(result, dict) and result.get("state") == "failed"
+                for result in child_results.values()
+            )
+            status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
             self._runs[run_id]["status"] = status
             event_type = "run_completed" if status == "completed" else "run_failed"
             await self._emit(event_type, run_id, "", content=f"status={status}")
@@ -542,6 +819,7 @@ class LocalDAGExecutor:
         workspace_directory: str | None = None,
         sandbox_id: str | None = None,
         upstream_context: str = "",
+        destroy_owned_sandbox: bool = True,
     ) -> dict:
         """Execute a single DAG node: create sandbox, run agent, stream events.
 
@@ -606,6 +884,11 @@ class LocalDAGExecutor:
                 or (data.get("modelId") if isinstance(data, dict) else "")
                 or ""
             )
+            default_model_cfg = _load_default_model_config()
+            if not model_provider:
+                model_provider = default_model_cfg.get("provider", "")
+            if not model_id:
+                model_id = default_model_cfg.get("model", "")
             prompt: str = (
                 node.get("prompt")
                 or (data.get("prompt") if isinstance(data, dict) else "")
@@ -694,8 +977,10 @@ class LocalDAGExecutor:
             # Resolve provider URL + API key from models.json
             from app.api.models import load_provider_config
             provider_cfg = load_provider_config().get(model_provider, {})
-            provider_url = provider_cfg.get("url", "")
-            provider_key = provider_cfg.get("key", "")
+            provider_url = default_model_cfg.get("url", "") if default_model_cfg.get("provider") == model_provider else ""
+            provider_key = default_model_cfg.get("key", "") if default_model_cfg.get("provider") == model_provider else ""
+            provider_url = provider_url or provider_cfg.get("url", "")
+            provider_key = provider_key or provider_cfg.get("key", "")
 
             # Write prompt to file to avoid shell argument length limits
             prompt_file = "/workspace/.agent/prompt.txt"
@@ -810,8 +1095,9 @@ class LocalDAGExecutor:
                         sandbox_id[:12], workspace_directory, exc_info=True,
                     )
 
-            # Only destroy the sandbox if we created it
-            if _owns_sandbox:
+            # Only destroy the sandbox if we created it and the DAG layer
+            # executor does not need to reuse it for downstream nodes.
+            if _owns_sandbox and destroy_owned_sandbox:
                 try:
                     await self._sandbox.destroy(sandbox_id)
                 except Exception:
@@ -935,6 +1221,8 @@ class LocalDAGExecutor:
                 for dag_node in child_nodes:
                     nd = dag_node.get("data", {})
                     task_entry: dict = {
+                        "node_id": dag_node.get("id", ""),
+                        "title": nd.get("label") or dag_node.get("id", ""),
                         "type": nd.get("agent_type") or dag_node.get("type", "coder"),
                         "prompt": nd.get("prompt", ""),
                     }
@@ -972,16 +1260,16 @@ class LocalDAGExecutor:
 
         async with async_session_factory() as session:
             for idx, parsed in enumerate(parsed_tasks):
-                child_node_id = f"{parent_node_id}_child_{idx}"
+                child_node_id = parsed.get("node_id") or f"{parent_node_id}_child_{idx}"
 
                 # Create DB task
                 task_id = uuid4()
                 task_type = parsed.get("type", "coder")
-                worker_label = f"{task_type} #{idx + 1}"
+                worker_label = parsed.get("title") or f"{task_type} #{idx + 1}"
                 db_task = TaskModel(
                     id=task_id,
                     run_id=uuid.UUID(run_id),
-                    title=parsed.get("prompt", "")[:200],
+                    title=(parsed.get("title") or parsed.get("prompt", ""))[:200],
                     description=parsed.get("prompt", ""),
                     status="pending",
                     assigned_node_id=child_node_id,

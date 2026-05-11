@@ -3,8 +3,12 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { Send, Loader2, MessageCircle } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
+import { useRunStore } from "@/stores/runStore";
+import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { api } from "@/lib/api";
+import { authHeaders } from "@/lib/auth";
+import MarkdownMessage from "@/components/common/MarkdownMessage";
 import type { ChatHistoryItem } from "@/types/settings";
 
 // ---------------------------------------------------------------------------
@@ -14,6 +18,10 @@ import type { ChatHistoryItem } from "@/types/settings";
 interface ChatMsg {
   role: "user" | "assistant";
   content: string;
+}
+
+function isExecutionRequest(text: string): boolean {
+  return /(^|\s|，|。|,)(开始执行|开始工作|开始做|执行工作流|开始|执行|运行|开跑|run|start)(\s|，|。|,|$)/i.test(text);
 }
 
 // ---------------------------------------------------------------------------
@@ -38,6 +46,28 @@ export default function PlannerChatTab() {
   const [streaming, setStreaming] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const triggerRun = useCallback(async () => {
+    if (!currentWorkflowId) return;
+
+    const runStore = useRunStore.getState();
+    const taskStore = useTaskStore.getState();
+
+    runStore.clearEvents();
+    taskStore.clearTasks();
+
+    const store = useWorkflowStore.getState();
+    const result = await api.triggerRun(currentWorkflowId, {
+      nodes: store.nodes,
+      edges: store.edges,
+    });
+    runStore.setRunId(result.id);
+    runStore.setStatus("running");
+    taskStore.setCurrentRunId(result.id);
+
+    const updated = await api.getWorkflow(currentWorkflowId);
+    useWorkflowStore.getState().loadWorkflow(updated);
+  }, [currentWorkflowId]);
 
   // Build node options for the selector
   const nodeOptions = (() => {
@@ -106,7 +136,7 @@ export default function PlannerChatTab() {
         `${process.env.NEXT_PUBLIC_API_URL || "/api"}/planner/chat`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({
             workflow_id: currentWorkflowId,
             message: text,
@@ -154,9 +184,26 @@ export default function PlannerChatTab() {
                 }
                 return updated;
               });
+            } else if (event.type === "dag_update") {
+              const updated = await api.getWorkflow(currentWorkflowId);
+              useWorkflowStore.getState().loadWorkflow(updated);
             }
-            // DAG updates are auto-saved by the backend
           } catch { /* skip */ }
+        }
+      }
+
+      if (isExecutionRequest(text)) {
+        try {
+          await triggerRun();
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "已开始执行工作流，任务面板会显示各节点任务。" },
+          ]);
+        } catch (err) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `启动工作流失败: ${err}` },
+          ]);
         }
       }
     } catch (err) {
@@ -164,7 +211,7 @@ export default function PlannerChatTab() {
     } finally {
       setStreaming(false);
     }
-  }, [input, currentWorkflowId, streaming, selectedNodeId]);
+  }, [input, currentWorkflowId, streaming, selectedNodeId, triggerRun]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -211,14 +258,20 @@ export default function PlannerChatTab() {
         {messages.map((msg, idx) => (
           <div
             key={idx}
-            className={`text-xs leading-relaxed whitespace-pre-wrap ${
+            className={`text-xs leading-relaxed ${
               msg.role === "user" ? "text-blue-700" : "text-gray-700"
             }`}
           >
             <span className={`font-semibold ${msg.role === "user" ? "text-blue-500" : "text-gray-500"}`}>
               {msg.role === "user" ? "You: " : `${selectedLabel}: `}
             </span>
-            {msg.content}
+            <div className="mt-1">
+              <MarkdownMessage
+                content={msg.content}
+                compact
+                inverted={false}
+              />
+            </div>
           </div>
         ))}
         {streaming && messages[messages.length - 1]?.content === "" && (

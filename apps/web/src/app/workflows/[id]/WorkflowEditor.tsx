@@ -9,8 +9,6 @@ import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import type { WorkflowDetail } from "@/types/api";
-import type { AgentNodeType } from "@/types/workflow";
-import type { ChildCreatedEvent } from "@/types/events";
 
 import Toolbar from "@/components/toolbar/Toolbar";
 import LeftPanel from "@/components/sidebar/LeftPanel";
@@ -48,7 +46,6 @@ export default function WorkflowEditor() {
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
-  const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
 
   const runId = useRunStore((s) => s.runId);
   const runStatus = useRunStore((s) => s.status);
@@ -56,30 +53,9 @@ export default function WorkflowEditor() {
   const taskCount = useTaskStore((s) => s.tasks.length);
   const setStatus = useRunStore((s) => s.setStatus);
   const clearEvents = useRunStore((s) => s.clearEvents);
-  const events = useRunStore((s) => s.events);
 
   // ---- WebSocket connection ----
   useWebSocket(runId);
-
-  // ---- Handle child_created events — create dynamic nodes on canvas ----
-  const processedChildEventsRef = useRef<Set<string>>(new Set());
-
-  useEffect(() => {
-    for (const event of events) {
-      if (event.type !== "child_created") continue;
-      const childEvent = event as ChildCreatedEvent;
-      // Skip if already processed (prevents duplicate node creation on re-render)
-      if (processedChildEventsRef.current.has(childEvent.child_node_id)) continue;
-      processedChildEventsRef.current.add(childEvent.child_node_id);
-
-      addDynamicNode(event.node_id, {
-        id: childEvent.child_node_id,
-        type: (childEvent.child_type || "coder") as AgentNodeType,
-        prompt: childEvent.child_prompt || "",
-        model: childEvent.child_model || "",
-      });
-    }
-  }, [events, addDynamicNode]);
 
   // ---- Load workflow data on mount ----
   useEffect(() => {
@@ -170,7 +146,6 @@ export default function WorkflowEditor() {
       setStatus("idle");
       clearEvents();
       useTaskStore.getState().clearTasks();
-      processedChildEventsRef.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

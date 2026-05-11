@@ -55,3 +55,7 @@ htmlcov/
 
 # Dev temp
 .dev-bat/
+
+# Runtime data with secrets
+apps/data/
+.pid/

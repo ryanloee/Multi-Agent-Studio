@@ -356,7 +356,7 @@ def _extract_dag_from_text(text: str) -> dict | None:
             try:
                 parsed = json.loads(m)
                 if "nodes" in parsed:
-                    return parsed
+                    return _normalize_dag(parsed)
             except json.JSONDecodeError:
                 continue
         return None
@@ -366,10 +366,44 @@ def _extract_dag_from_text(text: str) -> dict | None:
         try:
             parsed = json.loads(raw)
             if "nodes" in parsed:
-                return parsed
+                return _normalize_dag(parsed)
         except json.JSONDecodeError:
             continue
     return None
+
+
+def _normalize_dag(dag: dict) -> dict:
+    """Ensure planner DAGs always include edge records for node dependencies."""
+    nodes = dag.get("nodes", [])
+    raw_edges = dag.get("edges", [])
+    edge_keys: set[tuple[str, str]] = set()
+
+    if isinstance(raw_edges, list):
+        for edge in raw_edges:
+            if not isinstance(edge, dict):
+                continue
+            source = edge.get("source")
+            target = edge.get("target")
+            if source and target:
+                edge_keys.add((str(source), str(target)))
+
+    if isinstance(nodes, list):
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            node_id = node.get("id")
+            depends_on = node.get("depends_on", [])
+            if not node_id or not isinstance(depends_on, list):
+                continue
+            for dep in depends_on:
+                if dep:
+                    edge_keys.add((str(dep), str(node_id)))
+
+    dag["edges"] = [
+        {"source": source, "target": target}
+        for source, target in sorted(edge_keys)
+    ]
+    return dag
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +457,12 @@ async def planner_chat(
     )
     db.add(user_msg)
 
-    # 3. If the workflow already has a DAG, include it in context
+    # 3.5. For auto-mode workflows, save the first user message as the goal
+    if workflow.mode == "auto" and not workflow.goal:
+        workflow.goal = body.message
+        await db.flush()
+
+    # 4. If the workflow already has a DAG, include it in context
     existing_dag = workflow.dag_json or {}
     if existing_dag and existing_dag.get("nodes"):
         dag_context = f"\n\n## 当前工作流状态\n已有 {len(existing_dag.get('nodes', []))} 个节点和 {len(existing_dag.get('edges', []))} 条连线。"
@@ -461,19 +500,20 @@ async def planner_chat(
         # After the full response, check if it contains a DAG
         dag = _extract_dag_from_text(full_response)
         if dag:
+            # Auto-save the DAG before notifying the frontend so a subsequent
+            # run request cannot race against this commit.
+            try:
+                workflow.dag_json = dag
+                await db.commit()
+            except Exception as exc:
+                logger.warning("Failed to auto-save DAG: %s", exc)
+
             # Emit the DAG update event
             data = json.dumps({
                 "type": "dag_update",
                 "dag": dag,
             }, ensure_ascii=False)
             yield f"data: {data}\n\n"
-
-            # Auto-save the DAG to the workflow
-            try:
-                workflow.dag_json = dag
-                await db.commit()
-            except Exception as exc:
-                logger.warning("Failed to auto-save DAG: %s", exc)
 
         # Done
         yield "data: [DONE]\n\n"

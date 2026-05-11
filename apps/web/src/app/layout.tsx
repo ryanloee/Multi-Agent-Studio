@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import AuthGate from "@/components/auth/AuthGate";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -14,7 +15,7 @@ export default function RootLayout({
   return (
     <html lang="zh" className="h-full">
       <body className="h-full antialiased text-gray-900 bg-gray-50">
-        {children}
+        <AuthGate>{children}</AuthGate>
       </body>
     </html>
   );

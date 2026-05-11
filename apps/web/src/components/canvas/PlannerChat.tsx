@@ -4,8 +4,11 @@ import { useState, useCallback, useRef, useEffect } from "react";
 import { Send, Bot, User, Play, Loader2, Target } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
+import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { api } from "@/lib/api";
+import { authHeaders } from "@/lib/auth";
+import MarkdownMessage from "@/components/common/MarkdownMessage";
 import type { EdgeData } from "@/types/workflow";
 
 // ---------------------------------------------------------------------------
@@ -49,6 +52,45 @@ const NODE_STYLES: Record<string, { bg: string; border: string; text: string; la
   human:   { bg: "bg-rose-50",    border: "border-rose-300",  text: "text-rose-700",   label: "人工" },
 };
 
+function isExecutionRequest(text: string): boolean {
+  return /(^|\s|，|。|,)(开始执行|开始工作|开始做|执行工作流|开始|执行|运行|开跑|run|start)(\s|，|。|,|$)/i.test(text);
+}
+
+function dagPosition(nodeId: string, dag: DagData, fallbackIndex: number): { x: number; y: number } {
+  const incoming = new Map<string, string[]>();
+  const outgoing = new Map<string, string[]>();
+  for (const node of dag.nodes) {
+    incoming.set(node.id, []);
+    outgoing.set(node.id, []);
+  }
+  for (const edge of dag.edges) {
+    incoming.get(edge.target)?.push(edge.source);
+    outgoing.get(edge.source)?.push(edge.target);
+  }
+  const roots = dag.nodes.filter((node) => (incoming.get(node.id) ?? []).length === 0).map((node) => node.id);
+  const queue = roots.length ? [...roots] : dag.nodes[0] ? [dag.nodes[0].id] : [];
+  const layerById = new Map<string, number>();
+  for (const root of queue) layerById.set(root, 0);
+  while (queue.length) {
+    const current = queue.shift()!;
+    const layer = layerById.get(current) ?? 0;
+    for (const child of outgoing.get(current) ?? []) {
+      const next = Math.max(layerById.get(child) ?? 0, layer + 1);
+      if ((layerById.get(child) ?? -1) < next) {
+        layerById.set(child, next);
+        queue.push(child);
+      }
+    }
+  }
+  const layer = layerById.get(nodeId) ?? fallbackIndex;
+  const layerNodes = dag.nodes.filter((node, idx) => (layerById.get(node.id) ?? idx) === layer);
+  const index = Math.max(0, layerNodes.findIndex((node) => node.id === nodeId));
+  return {
+    x: 520 + (index - (layerNodes.length - 1) / 2) * 300,
+    y: 80 + layer * 170,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // PlannerChat component
 // ---------------------------------------------------------------------------
@@ -69,6 +111,28 @@ export default function PlannerChat() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+
+  const triggerRun = useCallback(async () => {
+    if (!currentWorkflowId) return;
+
+    const runStore = useRunStore.getState();
+    const taskStore = useTaskStore.getState();
+
+    runStore.clearEvents();
+    taskStore.clearTasks();
+
+    const store = useWorkflowStore.getState();
+    const result = await api.triggerRun(currentWorkflowId, {
+      nodes: store.nodes,
+      edges: store.edges,
+    });
+    runStore.setRunId(result.id);
+    runStore.setStatus("running");
+    taskStore.setCurrentRunId(result.id);
+
+    const updated = await api.getWorkflow(currentWorkflowId);
+    useWorkflowStore.getState().loadWorkflow(updated);
+  }, [currentWorkflowId]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -105,7 +169,7 @@ export default function PlannerChat() {
         `${process.env.NEXT_PUBLIC_API_URL || "/api"}/planner/chat`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...authHeaders() },
           body: JSON.stringify({
             workflow_id: currentWorkflowId,
             message: text,
@@ -168,10 +232,11 @@ export default function PlannerChat() {
                 return updated;
               });
             } else if (event.type === "dag_update") {
-              latestDag = event.dag;
-              setCurrentDag(latestDag);
+              const dag = event.dag as DagData;
+              latestDag = dag;
+              setCurrentDag(dag);
               // Also sync to workflow store
-              syncDagToStore(latestDag);
+              syncDagToStore(dag);
             }
           } catch {
             // Skip non-JSON lines
@@ -192,6 +257,21 @@ export default function PlannerChat() {
           return updated;
         });
       }
+
+      if (isExecutionRequest(text)) {
+        try {
+          await triggerRun();
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "已开始执行工作流，任务面板会显示各节点任务。" },
+          ]);
+        } catch (err) {
+          setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: `启动工作流失败: ${err}` },
+          ]);
+        }
+      }
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
       setMessages((prev) => [
@@ -201,7 +281,7 @@ export default function PlannerChat() {
     } finally {
       setStreaming(false);
     }
-  }, [input, currentWorkflowId, streaming, messages]);
+  }, [input, currentWorkflowId, streaming, messages, triggerRun]);
 
   // Sync the DAG from Planner to the workflow store so it can be executed
   const syncDagToStore = useCallback((dag: DagData) => {
@@ -213,7 +293,7 @@ export default function PlannerChat() {
       return {
         id: n.id,
         type: n.type,
-        position: { x: 100 + (idx % 3) * 280, y: 100 + Math.floor(idx / 3) * 140 },
+        position: dagPosition(n.id, dag, idx),
         data: {
           label: n.label || style.label,
           agentType: n.type,
@@ -250,18 +330,12 @@ export default function PlannerChat() {
 
   // Handle "Run" button
   const handleRun = useCallback(async () => {
-    if (!currentWorkflowId) return;
     try {
-      const result = await api.triggerRun(currentWorkflowId);
-      useRunStore.getState().setRunId(result.id);
-      useRunStore.getState().setStatus("running");
-      // Reload workflow so auto-mode planner node (saved to dag_json by backend) appears on canvas
-      const updated = await api.getWorkflow(currentWorkflowId);
-      useWorkflowStore.getState().loadWorkflow(updated);
+      await triggerRun();
     } catch (err) {
       console.error("Failed to trigger run:", err);
     }
-  }, [currentWorkflowId]);
+  }, [triggerRun]);
 
   // Handle Enter key
   const handleKeyDown = useCallback(
@@ -333,7 +407,7 @@ export default function PlannerChat() {
               }`}
             >
               {/* Render text content */}
-              <div className="whitespace-pre-wrap">{msg.content}</div>
+              <MarkdownMessage content={msg.content} inverted={msg.role === "user"} />
 
               {/* Render DAG preview */}
               {msg.dag && (

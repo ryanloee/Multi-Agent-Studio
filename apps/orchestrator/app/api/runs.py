@@ -110,52 +110,98 @@ async def trigger_run(
     global_config = payload.config or {}
     workflow_mode = getattr(workflow, "mode", "manual") or "manual"
     dag_json: dict | None = None
+    run_id = uuid4()
+    start_as_task_dag = False
 
     # 2. Route based on mode
     if workflow_mode == "auto":
-        # Auto mode: goal is required; build a synthetic planner node
         goal = getattr(workflow, "goal", "") or ""
-        if not goal:
+        saved_dag = payload.dag if payload.dag else (workflow.dag_json or {})
+        saved_nodes = [
+            node for node in saved_dag.get("nodes", [])
+            if isinstance(node, dict) and node.get("id") != "planner"
+        ]
+        if not saved_nodes:
+            from app.api.planner_chat import _extract_dag_from_text
+            from app.models.db import ChatMessage as ChatMessageORM
+
+            chat_result = await db.execute(
+                select(ChatMessageORM)
+                .where(
+                    ChatMessageORM.workflow_id == workflow_id,
+                    ChatMessageORM.node_id == "planner",
+                    ChatMessageORM.role == "assistant",
+                )
+                .order_by(ChatMessageORM.created_at.desc())
+            )
+            for msg in chat_result.scalars().all():
+                recovered_dag = _extract_dag_from_text(msg.content or "")
+                recovered_nodes = [
+                    node for node in (recovered_dag or {}).get("nodes", [])
+                    if isinstance(node, dict) and node.get("id") != "planner"
+                ]
+                if recovered_nodes:
+                    saved_dag = recovered_dag or {}
+                    saved_nodes = recovered_nodes
+                    workflow.dag_json = saved_dag
+                    db.add(workflow)
+                    await db.flush()
+                    logger.info(
+                        "Recovered auto DAG for workflow %s from planner chat history (%d nodes)",
+                        workflow_id, len(saved_nodes),
+                    )
+                    break
+
+        if saved_nodes:
+            # Planner chat already produced a concrete DAG. Execute that
+            # saved team directly and mirror every node to the task board.
+            dag_json = saved_dag
+            start_as_task_dag = True
+            global_config["_mode"] = "auto"
+            global_config["_goal"] = goal
+        elif not goal:
             raise HTTPException(
                 status_code=400,
                 detail="Auto mode requires a non-empty goal on the workflow",
             )
-
-        planner_node = {
-            "id": "planner",
-            "type": "plan",
-            "agent_type": "plan",
-            "data": {
-                "label": "Planner",
-                "agentType": "plan",
+        else:
+            # Backward-compatible path: no saved DAG yet, so run a synthetic
+            # planner node and let its output create dynamic child tasks.
+            planner_node = {
+                "id": "planner",
+                "type": "plan",
+                "agent_type": "plan",
+                "data": {
+                    "label": "Planner",
+                    "agentType": "plan",
+                    "prompt": goal,
+                },
+                "model_provider": "",
+                "model_id": "",
                 "prompt": goal,
-            },
-            "model_provider": "",
-            "model_id": "",
-            "prompt": goal,
-        }
-        layers_data = [[planner_node]]
-        global_config["_mode"] = "auto"
-        global_config["_goal"] = goal
+            }
+            layers_data = [[planner_node]]
+            global_config["_mode"] = "auto"
+            global_config["_goal"] = goal
 
-        # Save planner node to dag_json so frontend can render it on canvas
-        workflow.dag_json = {
-            "nodes": [
-                {
-                    "id": "planner",
-                    "type": "plan",
-                    "position": {"x": 400, "y": 200},
-                    "data": {
-                        "label": "Planner",
-                        "agentType": "plan",
-                        "prompt": goal,
-                    },
-                }
-            ],
-            "edges": [],
-        }
-        db.add(workflow)
-        await db.flush()
+            # Save planner node to dag_json so frontend can render it on canvas
+            workflow.dag_json = {
+                "nodes": [
+                    {
+                        "id": "planner",
+                        "type": "plan",
+                        "position": {"x": 400, "y": 200},
+                        "data": {
+                            "label": "Planner",
+                            "agentType": "plan",
+                            "prompt": goal,
+                        },
+                    }
+                ],
+                "edges": [],
+            }
+            db.add(workflow)
+            await db.flush()
     else:
         # Manual mode (default): compile the user-drawn DAG
         dag_json = payload.dag if payload.dag else (workflow.dag_json or {})
@@ -204,16 +250,8 @@ async def trigger_run(
 
     global_config["_edges"] = (dag_json or workflow.dag_json or {}).get("edges", [])
 
-    # 5. Start DAG execution via LocalDAGExecutor
-    run_id = uuid4()
-    await engine.start_workflow(
-        run_id=str(run_id),
-        layers=layers_data,
-        global_config=global_config,
-        workspace_directory=workflow.workspace_directory,
-    )
-
-    # 6. Persist run record
+    # 5. Persist run record before starting background execution. Dynamic
+    # tasks are inserted from a separate DB session and need this FK visible.
     run = Run(
         id=run_id,
         workflow_id=workflow_id,
@@ -221,8 +259,24 @@ async def trigger_run(
         engine_workflow_id=str(run_id),
     )
     db.add(run)
-    await db.flush()
+    await db.commit()
     await db.refresh(run)
+
+    # 6. Start execution via LocalDAGExecutor
+    if start_as_task_dag:
+        await engine.start_task_dag(
+            run_id=str(run_id),
+            dag_json=dag_json or {},
+            global_config=global_config,
+            workspace_directory=workflow.workspace_directory,
+        )
+    else:
+        await engine.start_workflow(
+            run_id=str(run_id),
+            layers=layers_data,
+            global_config=global_config,
+            workspace_directory=workflow.workspace_directory,
+        )
 
     return run
 

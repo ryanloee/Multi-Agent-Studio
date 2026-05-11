@@ -1,8 +1,9 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { FolderSearch, CheckCircle2, AlertTriangle, Loader2 } from "lucide-react";
+import { FolderSearch, CheckCircle2, AlertTriangle, Loader2, Folder, X } from "lucide-react";
 import { api } from "@/lib/api";
+import { authHeaders } from "@/lib/auth";
 import { useLocaleStore } from "@/stores/localeStore";
 import type { PathValidateResult } from "@/types/settings";
 
@@ -46,6 +47,11 @@ export default function DirectoryPicker({
   const [validation, setValidation] = useState<PathValidateResult | null>(null);
   const [validating, setValidating] = useState(false);
   const [browsing, setBrowsing] = useState(false);
+  const [browserOpen, setBrowserOpen] = useState(false);
+  const [browserPath, setBrowserPath] = useState("");
+  const [browserParent, setBrowserParent] = useState("");
+  const [browserEntries, setBrowserEntries] = useState<Array<{ name: string; path: string }>>([]);
+  const [browserError, setBrowserError] = useState("");
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Cleanup on unmount
@@ -90,18 +96,41 @@ export default function DirectoryPicker({
     [onChange, validatePath]
   );
 
-  // Handle browse button click
-  // Strategy: try backend native dialog first (works on Windows with tkinter),
-  // fall back to HTML <input webkitdirectory> if backend is unavailable.
+  const apiBase = process.env.NEXT_PUBLIC_API_URL || "/api";
+
+  const loadServerDirectory = useCallback(async (path: string) => {
+    setBrowsing(true);
+    setBrowserError("");
+    try {
+      const resp = await fetch(`${apiBase}/settings/list-dir`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ path }),
+      });
+      if (!resp.ok) throw new Error(await resp.text());
+      const data = await resp.json();
+      setBrowserPath(data.path || "");
+      setBrowserParent(data.parent || "");
+      setBrowserEntries(Array.isArray(data.entries) ? data.entries : []);
+      setBrowserError(data.error || "");
+      setBrowserOpen(true);
+    } catch (err) {
+      setBrowserError(err instanceof Error ? err.message : "Unable to list directory");
+      setBrowserOpen(true);
+    } finally {
+      setBrowsing(false);
+    }
+  }, [apiBase]);
+
+  // Handle browse button click.
+  // Native dialogs may work on desktop Linux with DISPLAY. If they do not,
+  // fall back to a server-side directory browser that returns absolute paths.
   const handleBrowse = useCallback(async () => {
     setBrowsing(true);
-
-    // ---- Attempt 1: Backend native dialog (gives full path) ----
     try {
-      const apiBase = process.env.NEXT_PUBLIC_API_URL || "/api";
       const resp = await fetch(`${apiBase}/settings/browse-dir`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ current_path: value || "" }),
       });
       if (resp.ok) {
@@ -114,68 +143,19 @@ export default function DirectoryPicker({
         }
       }
     } catch {
-      // Backend browse not available — fall through
+      // Fall through to the server-side browser.
     }
 
-    // ---- Attempt 2: File System Access API (Chrome/Edge only, name only) ----
-    if ("showDirectoryPicker" in window) {
-      try {
-        const dirHandle = await (window as any).showDirectoryPicker({ mode: "read" });
-        if (dirHandle?.name) {
-          // On the web we can only get the folder name, not the full path.
-          // We set it and let the user adjust the prefix if needed.
-          onChange(dirHandle.name);
-          validatePath(dirHandle.name);
-          setBrowsing(false);
-          return;
-        }
-      } catch (err) {
-        if ((err as DOMException)?.name === "AbortError") {
-          setBrowsing(false);
-          return;
-        }
-      }
-    }
+    setBrowsing(false);
+    await loadServerDirectory(value || "~");
+  }, [apiBase, value, onChange, validatePath, loadServerDirectory]);
 
-    // ---- Attempt 3: <input webkitdirectory> fallback ----
-    const input = document.createElement("input");
-    input.type = "file";
-    // @ts-expect-error — webkitdirectory is non-standard but widely supported
-    input.webkitdirectory = true;
-    // @ts-expect-error — directory is the standard equivalent
-    input.directory = true;
-    input.style.display = "none";
-
-    input.onchange = () => {
-      const files = input.files;
-      if (files && files.length > 0) {
-        // In Electron, File.path gives the absolute path
-        const filePath = (files[0] as any).path;
-        if (filePath) {
-          // Electron: derive directory from file path
-          const dirPath = filePath.substring(0, filePath.length - files[0].name.length - 1);
-          onChange(dirPath);
-          validatePath(dirPath);
-        } else {
-          // Web browser: only relative path available
-          const relativePath = files[0].webkitRelativePath;
-          const rootFolder = relativePath.split("/")[0];
-          onChange(rootFolder);
-          validatePath(rootFolder);
-        }
-      }
-      document.body.removeChild(input);
-      setBrowsing(false);
-    };
-
-    input.oncancel = () => {
-      document.body.removeChild(input);
-      setBrowsing(false);
-    };
-
-    document.body.appendChild(input);
-    input.click();
-  }, [value, onChange, validatePath]);
+  const selectBrowserPath = useCallback(() => {
+    if (!browserPath) return;
+    onChange(browserPath);
+    validatePath(browserPath);
+    setBrowserOpen(false);
+  }, [browserPath, onChange, validatePath]);
 
   // Validation status icon
   const renderValidationIcon = () => {
@@ -263,6 +243,89 @@ export default function DirectoryPicker({
         <p className="text-xs leading-relaxed">
           {renderValidationMessage()}
         </p>
+      )}
+
+      {browserOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+          <div className="w-full max-w-lg rounded-lg bg-white shadow-xl border border-gray-200 overflow-hidden">
+            <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
+              <FolderSearch size={16} className="text-blue-500" />
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold text-gray-800">选择工作目录</div>
+                <div className="text-xs text-gray-500 truncate font-mono">{browserPath || "~"}</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setBrowserOpen(false)}
+                className="p-1 rounded hover:bg-gray-100 text-gray-500"
+                aria-label="关闭"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="max-h-80 overflow-y-auto p-2">
+              {browserError && (
+                <div className="mb-2 rounded border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                  {browserError}
+                </div>
+              )}
+              {browserParent && browserParent !== browserPath && (
+                <button
+                  type="button"
+                  onClick={() => loadServerDirectory(browserParent)}
+                  className="w-full flex items-center gap-2 rounded px-3 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+                >
+                  <Folder size={14} className="text-gray-400" />
+                  ..
+                </button>
+              )}
+              {browserEntries.map((entry) => (
+                <button
+                  key={entry.path}
+                  type="button"
+                  onClick={() => loadServerDirectory(entry.path)}
+                  className="w-full flex items-center gap-2 rounded px-3 py-2 text-left text-sm text-gray-700 hover:bg-blue-50 hover:text-blue-700"
+                >
+                  <Folder size={14} className="text-blue-400" />
+                  <span className="truncate">{entry.name}</span>
+                </button>
+              ))}
+              {browserEntries.length === 0 && !browsing && (
+                <div className="px-3 py-6 text-center text-xs text-gray-400">
+                  没有可进入的子目录
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center gap-2 px-4 py-3 border-t border-gray-100 bg-gray-50">
+              <button
+                type="button"
+                onClick={() => loadServerDirectory(browserPath)}
+                disabled={browsing || !browserPath}
+                className="px-3 py-1.5 rounded border border-gray-200 bg-white text-xs text-gray-600 hover:bg-gray-100 disabled:opacity-50"
+              >
+                {browsing ? "读取中..." : "刷新"}
+              </button>
+              <div className="flex-1" />
+              <button
+                type="button"
+                onClick={() => setBrowserOpen(false)}
+                className="px-3 py-1.5 rounded border border-gray-200 bg-white text-xs text-gray-600 hover:bg-gray-100"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={selectBrowserPath}
+                disabled={!browserPath}
+                className="px-3 py-1.5 rounded bg-blue-600 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+              >
+                选择此目录
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

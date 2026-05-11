@@ -3,6 +3,9 @@
 import { useEffect, useRef, useCallback, useState } from "react";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
+import { useWorkflowStore } from "@/stores/workflowStore";
+import { withAccessToken } from "@/lib/auth";
+import type { AgentNodeType, RunStatus } from "@/types/workflow";
 
 // ---------------------------------------------------------------------------
 // useWebSocket — connects to a run event stream via WebSocket
@@ -28,11 +31,18 @@ interface UseWebSocketReturn {
   isConnected: boolean;
 }
 
+function defaultWsBaseUrl(): string {
+  if (process.env.NEXT_PUBLIC_WS_URL) return process.env.NEXT_PUBLIC_WS_URL;
+  if (typeof window === "undefined") return "ws://localhost:8000";
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.hostname}:8000`;
+}
+
 export function useWebSocket(
   runId: string | null,
   options: UseWebSocketOptions = {},
 ): UseWebSocketReturn {
-  const { baseUrl = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:8000", autoReconnect = true } = options;
+  const { baseUrl = defaultWsBaseUrl(), autoReconnect = true } = options;
 
   const wsRef = useRef<WebSocket | null>(null);
   const addEvent = useRunStore((s) => s.addEvent);
@@ -80,7 +90,7 @@ export function useWebSocket(
     function connect() {
       if (cancelled || manualCloseRef.current) return;
 
-      const url = `${baseUrl}/ws/runs/${runId}/stream`;
+      const url = withAccessToken(`${baseUrl}/ws/runs/${runId}/stream`);
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
@@ -97,6 +107,8 @@ export function useWebSocket(
 
           // Handle task-related events
           const taskStore = useTaskStore.getState();
+          const workflowStore = useWorkflowStore.getState();
+          const runStore = useRunStore.getState();
           if (data.type === "task_created") {
             taskStore.upsertTask({
               id: data.task_id,
@@ -112,6 +124,18 @@ export function useWebSocket(
               created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             });
+            if (data.child_node_id) {
+              runStore.setNodeStatus(data.child_node_id, (data.status || "pending") as RunStatus);
+              const nodeExists = workflowStore.nodes.some((node) => node.id === data.child_node_id);
+              if (!nodeExists) {
+                workflowStore.addDynamicNode(data.node_id || "planner", {
+                  id: data.child_node_id,
+                  type: "coder",
+                  prompt: data.task_description || "",
+                  model: "",
+                });
+              }
+            }
           } else if (data.type === "task_updated") {
             const existing = taskStore.tasks.find((t) => t.id === data.task_id);
             if (existing) {
@@ -124,6 +148,10 @@ export function useWebSocket(
                 result_summary: data.result_summary || existing.result_summary,
                 updated_at: new Date().toISOString(),
               });
+              const nodeId = data.assigned_node_id || existing.assigned_node_id;
+              if (nodeId && data.status) {
+                runStore.setNodeStatus(nodeId, data.status as RunStatus);
+              }
             }
           } else if (data.type === "task_message") {
             taskStore.appendMessage(data.task_id, {
@@ -135,6 +163,20 @@ export function useWebSocket(
               content: data.content,
               created_at: new Date().toISOString(),
             });
+          } else if (data.type === "child_created") {
+            const parentId = data.node_id || "planner";
+            const nodeExists = workflowStore.nodes.some((node) => node.id === data.child_node_id);
+            const edgeExists = workflowStore.edges.some((edge) =>
+              edge.source === parentId && edge.target === data.child_node_id
+            );
+            if (!nodeExists || (!edgeExists && parentId !== "planner")) {
+              workflowStore.addDynamicNode(parentId, {
+                id: data.child_node_id,
+                type: (data.child_type || "coder") as AgentNodeType,
+                prompt: data.child_prompt || "",
+                model: data.child_model || "",
+              });
+            }
           }
         } catch {
           // skip non-JSON messages

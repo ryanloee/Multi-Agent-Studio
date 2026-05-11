@@ -10,6 +10,7 @@ import type {
 } from "@/types/api";
 import type { AppSettings } from "@/types/settings";
 import type { PathValidateResult, ModelTestResult } from "@/types/settings";
+import { authHeaders } from "@/lib/auth";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -58,8 +59,12 @@ async function request<T>(
 
   try {
     response = await fetch(`${API_BASE}${path}`, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeaders(),
+        ...(options?.headers || {}),
+      },
     });
   } catch (err) {
     // Network-level error (no response at all)
@@ -222,9 +227,10 @@ export const api = {
   // ---- Runs ----
 
   /** Trigger a new run for a workflow */
-  triggerRun: (workflowId: string): Promise<TriggerRunResponse> =>
+  triggerRun: (workflowId: string, dag?: { nodes: unknown[]; edges: unknown[] }): Promise<TriggerRunResponse> =>
     request<TriggerRunResponse>(`/runs/${workflowId}/run`, {
       method: "POST",
+      body: dag ? JSON.stringify({ dag }) : undefined,
     }),
 
   /** Get run details by ID */

@@ -18,7 +18,7 @@ const TOOLS = [
 type PermissionValue = "allow" | "deny" | "ask";
 
 interface PermissionsEditorProps {
-  value: Record<string, PermissionValue>;
+  value?: Record<string, PermissionValue>;
   onChange: (v: Record<string, PermissionValue>) => void;
   disabled?: boolean;
 }
@@ -29,12 +29,13 @@ export default function PermissionsEditor({
   disabled,
 }: PermissionsEditorProps) {
   const t = useLocaleStore((s) => s.t);
+  const safeValue = value ?? {};
 
   const handleChange = useCallback(
     (tool: string, perm: PermissionValue) => {
-      onChange({ ...value, [tool]: perm });
+      onChange({ ...safeValue, [tool]: perm });
     },
-    [value, onChange],
+    [safeValue, onChange],
   );
 
   return (
@@ -53,7 +54,7 @@ export default function PermissionsEditor({
         </thead>
         <tbody>
           {TOOLS.map((tool) => {
-            const current: PermissionValue = value[tool] ?? "ask";
+            const current: PermissionValue = safeValue[tool] ?? "ask";
             return (
               <tr key={tool} className="border-t border-gray-100">
                 <td className="py-1.5 text-gray-700 font-mono text-xs">

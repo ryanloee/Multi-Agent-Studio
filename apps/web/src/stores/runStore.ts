@@ -108,7 +108,8 @@ export const useRunStore = create<RunState>((set, get) => ({
       return;
     }
 
-    // Handle child_created — register parent-child relationship, set child status to running
+    // Handle child_created — register parent-child relationship. The child is
+    // known to exist, but it should only become running after node/task events.
     if (event.type === "child_created") {
       const childEvent = event as ChildCreatedEvent;
       const parentId = event.node_id;
@@ -123,7 +124,7 @@ export const useRunStore = create<RunState>((set, get) => ({
           },
           nodeStatuses: {
             ...state.nodeStatuses,
-            [childId]: "running",
+            [childId]: state.nodeStatuses[childId] ?? "pending",
           },
         });
         return;
