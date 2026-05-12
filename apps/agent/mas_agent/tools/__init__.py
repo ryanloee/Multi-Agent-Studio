@@ -152,24 +152,24 @@ ToolRegistry.register(GlobTool())
 ToolRegistry.register(GrepTool())
 ToolRegistry.register(ReadTool())
 
-# write — plan, coder, shell only
+# write — plan, coder, merge, shell only
 _write = WriteTool()
-_write.allowed_agent_types = ["plan", "coder", "shell"]
+_write.allowed_agent_types = ["plan", "coder", "merge", "shell"]
 ToolRegistry.register(_write)
 
-# shell — plan, coder, shell only
+# shell — plan, coder, merge, shell only
 _shell = ShellTool()
-_shell.allowed_agent_types = ["plan", "coder", "shell"]
+_shell.allowed_agent_types = ["plan", "coder", "merge", "shell"]
 ToolRegistry.register(_shell)
 
 # edit — available to all agent types that write
 _edit = EditTool()
-_edit.allowed_agent_types = ["plan", "coder", "review", "shell"]
+_edit.allowed_agent_types = ["plan", "coder", "merge", "review", "shell"]
 ToolRegistry.register(_edit)
 
 from mas_agent.tools.apply_patch_tool import ApplyPatchTool  # noqa: E402
 
-# apply_patch — plan, coder only (diff-based editing for GPT models)
+# apply_patch — plan, coder, merge only (diff-based editing for GPT models)
 _apply_patch = ApplyPatchTool()
-_apply_patch.allowed_agent_types = ["plan", "coder"]
+_apply_patch.allowed_agent_types = ["plan", "coder", "merge"]
 ToolRegistry.register(_apply_patch)

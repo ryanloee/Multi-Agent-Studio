@@ -50,9 +50,9 @@ def _register_stubs():
     ToolRegistry.register(_StubTool("grep"))
 
     # Restricted tools
-    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["plan", "coder", "review"]))
-    ToolRegistry.register(_StubTool("write", allowed_agent_types=["plan", "coder", "shell"]))
-    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["plan", "coder", "shell"]))
+    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["plan", "coder", "merge", "review"]))
+    ToolRegistry.register(_StubTool("write", allowed_agent_types=["plan", "coder", "merge", "shell"]))
+    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["plan", "coder", "merge", "shell"]))
 
 
 def _tool_names(schemas: list[dict[str, Any]]) -> set[str]:
@@ -88,10 +88,16 @@ class TestForAgentType:
         tools = _tool_names(ToolRegistry.for_agent_type("coder"))
         assert tools == {"glob", "read", "grep", "edit", "write", "shell"}
 
+    def test_merge_gets_integration_tools(self) -> None:
+        """merge agents should see the same integration tools as coder/shell."""
+        _register_stubs()
+        tools = _tool_names(ToolRegistry.for_agent_type("merge"))
+        assert tools == {"glob", "read", "grep", "edit", "write", "shell"}
+
     def test_none_means_available_to_all(self) -> None:
         """A tool with allowed_agent_types=None is returned for every type."""
         ToolRegistry.register(_StubTool("universal", allowed_agent_types=None))
-        for agent_type in ("plan", "coder", "explore", "review", "shell"):
+        for agent_type in ("plan", "coder", "explore", "merge", "review", "shell"):
             tools = _tool_names(ToolRegistry.for_agent_type(agent_type))
             assert "universal" in tools, f"universal missing for {agent_type}"
 
@@ -101,7 +107,7 @@ class TestForAgentType:
         # coder sees it
         assert "secret" in _tool_names(ToolRegistry.for_agent_type("coder"))
         # other types do not
-        for agent_type in ("plan", "explore", "review", "shell", "human"):
+        for agent_type in ("plan", "explore", "merge", "review", "shell", "human"):
             assert "secret" not in _tool_names(ToolRegistry.for_agent_type(agent_type)), (
                 f"secret should not be visible to {agent_type}"
             )

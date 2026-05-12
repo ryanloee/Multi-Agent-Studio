@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import String, Text, ForeignKey, Integer, Uuid, DateTime, func
+from sqlalchemy import JSON, String, Text, ForeignKey, Integer, Uuid, DateTime, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.db import Base
@@ -38,6 +38,7 @@ class Task(Base):
     assigned_worker_label: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     result_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    dependencies: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
     )
@@ -50,6 +51,9 @@ class Task(Base):
     run: Mapped["Run"] = relationship("Run", back_populates="tasks")
     messages: Mapped[list["TaskMessage"]] = relationship(
         "TaskMessage", back_populates="task", cascade="all, delete-orphan",
+    )
+    artifacts: Mapped[list["Artifact"]] = relationship(
+        "Artifact", back_populates="task", cascade="all, delete-orphan",
     )
     sub_tasks: Mapped[list["Task"]] = relationship(
         "Task", back_populates="parent_task",
@@ -80,11 +84,46 @@ class TaskMessage(Base):
     )  # node_id or "planner"
     message_type: Mapped[str] = mapped_column(
         String(50), nullable=False,
-    )  # "assignment" | "question" | "answer" | "escalation" | "update" | "user_edit"
+    )  # assignment | worker_question | worker_answer | planner_question | planner_answer | artifact_created | update | user_edit
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    target_node_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    artifact_id: Mapped[Optional[uuid.UUID]] = mapped_column(Uuid, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
     )
 
     # Relationships
     task: Mapped["Task"] = relationship("Task", back_populates="messages")
+
+
+class Artifact(Base):
+    """Structured artifact produced by a planner or worker task."""
+
+    __tablename__ = "artifacts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    task_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        Uuid, ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    node_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    type: Mapped[str] = mapped_column(String(50), nullable=False)
+    title: Mapped[str] = mapped_column(String(512), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False, default="system")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    task: Mapped[Optional["Task"]] = relationship("Task", back_populates="artifacts")

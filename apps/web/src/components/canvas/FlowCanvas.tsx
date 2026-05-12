@@ -143,8 +143,8 @@ export default function FlowCanvas() {
         nodes={staticNodes}
         edges={edges}
         onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
+        onEdgesChange={mode === "auto" ? undefined : onEdgesChange}
+        onConnect={mode === "auto" ? undefined : onConnect}
         onInit={setRfInstance}
         onDragOver={mode === "auto" ? undefined : onDragOver}
         onDrop={mode === "auto" ? undefined : onDrop}
@@ -157,7 +157,7 @@ export default function FlowCanvas() {
         fitView
         minZoom={0.2}
         maxZoom={2}
-        nodesDraggable={mode !== "auto"}
+        nodesDraggable
         nodesConnectable={mode !== "auto"}
         deleteKeyCode={mode === "auto" ? null : undefined}
       >

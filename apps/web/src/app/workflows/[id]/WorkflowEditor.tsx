@@ -6,6 +6,7 @@ import { api } from "@/lib/api";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import type { WorkflowDetail } from "@/types/api";
@@ -45,6 +46,7 @@ export default function WorkflowEditor() {
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
+  const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
 
   const runId = useRunStore((s) => s.runId);
@@ -53,6 +55,7 @@ export default function WorkflowEditor() {
   const taskCount = useTaskStore((s) => s.tasks.length);
   const setStatus = useRunStore((s) => s.setStatus);
   const clearEvents = useRunStore((s) => s.clearEvents);
+  const loadSettings = useSettingsStore((s) => s.loadFromServer);
 
   // ---- WebSocket connection ----
   useWebSocket(runId);
@@ -69,6 +72,25 @@ export default function WorkflowEditor() {
         if (cancelled) return;
         setWorkflowName(data.name);
         loadWorkflow(data);
+
+        const runs = await api.listRuns(workflowId);
+        if (cancelled) return;
+        const latestRun = runs[0];
+        if (latestRun) {
+          useTaskStore.getState().setCurrentRunId(latestRun.id);
+
+          const events = await api.listRunEvents(latestRun.id);
+          if (cancelled) return;
+          useRunStore.getState().hydrateEvents(events);
+          useRunStore.getState().setStatus(latestRun.status);
+          setRunId(latestRun.id);
+        } else {
+          setRunId(null);
+          setStatus("idle");
+          clearEvents();
+          useTaskStore.getState().setCurrentRunId(null);
+          useTaskStore.getState().clearTasks();
+        }
       } catch (err) {
         if (cancelled) return;
         setError(err instanceof Error ? err.message : "Failed to load workflow");
@@ -81,7 +103,11 @@ export default function WorkflowEditor() {
     return () => {
       cancelled = true;
     };
-  }, [workflowId, loadWorkflow]);
+  }, [workflowId, loadWorkflow, setRunId, setStatus, clearEvents]);
+
+  useEffect(() => {
+    void loadSettings();
+  }, [loadSettings]);
 
   // ---- Debounced auto-save (2 seconds) ----
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -98,12 +124,13 @@ export default function WorkflowEditor() {
           name: latestNameRef.current,
           nodes,
           edges,
+          metadata: { auto_child_model_map: autoChildModelMap },
         });
       } catch (err) {
         console.error("Auto-save failed:", err);
       }
     }, 2000);
-  }, [workflowId, nodes, edges]);
+  }, [workflowId, nodes, edges, autoChildModelMap]);
 
   // Auto-save when nodes or edges change (debounced 2s)
   useEffect(() => {
@@ -132,11 +159,12 @@ export default function WorkflowEditor() {
         name: workflowName,
         nodes,
         edges,
+        metadata: { auto_child_model_map: autoChildModelMap },
       });
     } catch (err) {
       console.error("Save failed:", err);
     }
-  }, [workflowId, workflowName, nodes, edges]);
+  }, [workflowId, workflowName, nodes, edges, autoChildModelMap]);
 
   // ---- Cleanup on unmount ----
   useEffect(() => {
@@ -146,6 +174,7 @@ export default function WorkflowEditor() {
       setStatus("idle");
       clearEvents();
       useTaskStore.getState().clearTasks();
+      useTaskStore.getState().setCurrentRunId(null);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

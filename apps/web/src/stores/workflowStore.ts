@@ -14,7 +14,9 @@ import type {
   WorkflowNode,
   WorkflowEdge,
   AgentNodeType,
+  WorkerAgentType,
   NodeData,
+  AutoChildModelMap,
 } from "@/types/workflow";
 import type { WorkflowDetail } from "@/types/api";
 import { NODE_META, VALID_CONNECTIONS } from "@/lib/constants";
@@ -38,6 +40,7 @@ interface WorkflowState {
   // Workflow dual mode (auto vs manual)
   mode: "auto" | "manual";
   goal: string;
+  autoChildModelMap: AutoChildModelMap;
 
   // React Flow change handlers
   onNodesChange: OnNodesChange<WorkflowNode>;
@@ -83,6 +86,7 @@ interface WorkflowState {
   // Mode & goal
   updateMode: (mode: "auto" | "manual") => Promise<void>;
   updateGoal: (goal: string) => Promise<void>;
+  updateAutoChildModelMap: (agentType: WorkerAgentType, model: string) => Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,8 +238,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   focusNodeId: null,
   currentWorkflowId: null,
   workspaceDirectory: "",
-  mode: "manual" as const,
+  mode: "auto" as const,
   goal: "",
+  autoChildModelMap: {},
 
   // ---- React Flow change handlers ----
   onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
@@ -468,8 +473,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       selectedEdgeId: null,
       currentWorkflowId: workflow.id,
       workspaceDirectory: workflow.workspace_directory ?? "",
-      mode: (workflow.mode as "auto" | "manual") ?? "manual",
+      mode: "auto",
       goal: workflow.goal ?? "",
+      autoChildModelMap: workflow.metadata?.auto_child_model_map ?? {},
     });
   },
 
@@ -479,8 +485,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       edges: [],
       selectedNodeId: null,
       selectedEdgeId: null,
-      mode: "manual",
+      mode: "auto",
       goal: "",
+      autoChildModelMap: {},
     });
   },
 
@@ -511,13 +518,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   // ---- Mode & goal ----
-  updateMode: async (mode: "auto" | "manual") => {
+  updateMode: async (_mode: "auto" | "manual") => {
     const { currentWorkflowId } = get();
     // Always update local state immediately (optimistic)
-    set({ mode });
+    set({ mode: "auto" });
     if (!currentWorkflowId) return;
     try {
-      await api.updateWorkflow(currentWorkflowId, { mode });
+      await api.updateWorkflow(currentWorkflowId, { mode: "auto" });
     } catch (err) {
       console.error("Failed to update workflow mode:", err);
     }
@@ -532,6 +539,25 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       await api.updateWorkflow(currentWorkflowId, { goal });
     } catch (err) {
       console.error("Failed to update workflow goal:", err);
+    }
+  },
+
+  updateAutoChildModelMap: async (agentType, model) => {
+    const { currentWorkflowId, autoChildModelMap } = get();
+    const nextMap = {
+      ...autoChildModelMap,
+      [agentType]: model,
+    };
+    set({ autoChildModelMap: nextMap });
+    if (!currentWorkflowId) return;
+    try {
+      await api.updateWorkflow(currentWorkflowId, {
+        metadata: {
+          auto_child_model_map: nextMap,
+        },
+      });
+    } catch (err) {
+      console.error("Failed to update auto child model map:", err);
     }
   },
 }));

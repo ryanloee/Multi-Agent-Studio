@@ -121,6 +121,7 @@ export function useWebSocket(
               assigned_worker_label: null,
               progress: 0,
               result_summary: "",
+              dependencies: data.dependencies || undefined,
               created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             });
@@ -161,6 +162,22 @@ export function useWebSocket(
               sender_id: data.sender_id,
               message_type: data.message_type,
               content: data.content,
+              target_node_id: data.target_node_id || null,
+              artifact_id: data.artifact_id || null,
+              created_at: new Date().toISOString(),
+            });
+          } else if (data.type === "artifact_created") {
+            taskStore.upsertArtifact({
+              id: data.artifact_id,
+              run_id: runId!,
+              workflow_id: "",
+              task_id: data.task_id || null,
+              node_id: data.node_id || null,
+              type: data.artifact_type || "file_change",
+              title: data.title || "Artifact",
+              content: "",
+              metadata: {},
+              created_by: data.node_id || "system",
               created_at: new Date().toISOString(),
             });
           } else if (data.type === "child_created") {

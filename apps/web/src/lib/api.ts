@@ -10,6 +10,7 @@ import type {
 } from "@/types/api";
 import type { AppSettings } from "@/types/settings";
 import type { PathValidateResult, ModelTestResult } from "@/types/settings";
+import type { StreamEvent } from "@/types/events";
 import { authHeaders } from "@/lib/auth";
 
 // ---------------------------------------------------------------------------
@@ -111,7 +112,9 @@ async function handleHttpError(response: Response): Promise<never> {
     // Body is not JSON — ignore
   }
 
-  const serverMessage = body?.message;
+  const serverMessage = body?.message ?? (typeof (body as { detail?: unknown } | null)?.detail === "string"
+    ? (body as { detail?: string }).detail
+    : undefined);
   const serverCode = body?.code;
   const serverDetails = body?.details;
 
@@ -237,9 +240,17 @@ export const api = {
   getRun: (id: string): Promise<RunInfo> =>
     request<RunInfo>(`/runs/${id}`),
 
-  /** List all runs */
-  listRuns: (): Promise<RunInfo[]> =>
-    request<RunInfo[]>("/runs"),
+  /** List runs, optionally filtered by workflow */
+  listRuns: (workflowId?: string): Promise<RunInfo[]> => {
+    const query = workflowId ? `?workflow_id=${encodeURIComponent(workflowId)}` : "";
+    return request<RunInfo[]>(`/runs${query}`);
+  },
+
+  /** Load persisted stream event history for a run */
+  listRunEvents: async (runId: string): Promise<StreamEvent[]> => {
+    const rows = await request<Array<{ payload: StreamEvent }>>(`/runs/${runId}/events`);
+    return rows.map((row) => row.payload).filter(Boolean);
+  },
 
   /** Cancel a running workflow */
   cancelRun: (id: string): Promise<void> =>
@@ -344,6 +355,33 @@ export const api = {
       `/runs/${runId}/tasks/${taskId}/messages`,
     ),
 
+  /** List artifacts for a run */
+  listArtifacts: (runId: string): Promise<import("@/types/task").Artifact[]> =>
+    request<import("@/types/task").Artifact[]>(`/runs/${runId}/artifacts`),
+
+  /** Get a single artifact */
+  getArtifact: (runId: string, artifactId: string): Promise<import("@/types/task").Artifact> =>
+    request<import("@/types/task").Artifact>(`/runs/${runId}/artifacts/${artifactId}`),
+
+  /** Create an artifact */
+  createArtifact: (
+    runId: string,
+    body: {
+      workflow_id: string;
+      task_id?: string | null;
+      node_id?: string | null;
+      type: import("@/types/task").ArtifactType;
+      title: string;
+      content?: string;
+      metadata?: Record<string, unknown>;
+      created_by?: string;
+    },
+  ): Promise<import("@/types/task").Artifact> =>
+    request<import("@/types/task").Artifact>(`/runs/${runId}/artifacts`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
   // ---- Models ----
 
   /** List available LLM models */
@@ -384,4 +422,17 @@ export const api = {
   /** Load persisted chat history for a workflow + node */
   getChatHistory: (workflowId: string, nodeId: string = "planner"): Promise<import("@/types/settings").ChatHistoryItem[]> =>
     request<import("@/types/settings").ChatHistoryItem[]>(`/planner/history/${workflowId}?node_id=${nodeId}`),
+
+  // ---- Shared Document ----
+
+  /** Get or create the shared document for a workflow */
+  getSharedDoc: (workflowId: string): Promise<{ id: string; workflow_id: string; content: string; updated_by: string; created_at: string; updated_at: string }> =>
+    request(`/workflows/${workflowId}/shared-doc`),
+
+  /** Update the shared document */
+  updateSharedDoc: (workflowId: string, content: string, updatedBy: string = "user"): Promise<{ id: string; workflow_id: string; content: string; updated_by: string; created_at: string; updated_at: string }> =>
+    request(`/workflows/${workflowId}/shared-doc`, {
+      method: "PUT",
+      body: JSON.stringify({ content, updated_by: updatedBy }),
+    }),
 };

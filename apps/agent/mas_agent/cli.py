@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Fields where argparse defaults overlap with config-file defaults.
 # We track these so we know which CLI values were explicitly provided vs.
 # just the argparse default.
-_CONFIG_OVERRIDABLE = {"max_turns", "max_tokens"}
+_CONFIG_OVERRIDABLE = {"max_turns", "max_tokens", "context_window"}
 
 
 def parse_args() -> tuple[argparse.Namespace, set[str]]:
@@ -30,7 +30,7 @@ def parse_args() -> tuple[argparse.Namespace, set[str]]:
     )
     parser.add_argument("--provider", required=True, help="Provider ID (e.g. mimo, glm)")
     parser.add_argument("--model", required=True, help="Model ID (e.g. mimo-v2.5)")
-    parser.add_argument("--agent-type", default="coder", help="Agent type (coder/plan/explore/review/shell)")
+    parser.add_argument("--agent-type", default="coder", help="Agent type (coder/plan/explore/merge/review/shell)")
     parser.add_argument("--run-id", required=True, help="Run ID")
     parser.add_argument("--node-id", required=True, help="Node ID")
     parser.add_argument("--prompt-file", required=True, help="Path to prompt file")
@@ -39,7 +39,8 @@ def parse_args() -> tuple[argparse.Namespace, set[str]]:
     parser.add_argument("--workspace", default="/workspace", help="Workspace directory")
     parser.add_argument("--stream-dir", default="/workspace/.agent", help="Stream output directory")
     parser.add_argument("--max-turns", type=int, default=50, help="Max LLM turns")
-    parser.add_argument("--max-tokens", type=int, default=4096, help="Max tokens per LLM call")
+    parser.add_argument("--max-tokens", type=int, default=4096, help="Max output tokens per LLM call")
+    parser.add_argument("--context-window", type=int, default=128000, help="Model context window in tokens")
 
     args = parser.parse_args()
 
@@ -85,6 +86,8 @@ async def main() -> int:
         cli_overrides["max_turns"] = args.max_turns
     if "max_tokens" in explicitly_set:
         cli_overrides["max_tokens"] = args.max_tokens
+    if "context_window" in explicitly_set:
+        cli_overrides["context_window"] = args.context_window
 
     # Load merged configuration (defaults → user config → project config → env → CLI)
     merged = load_config(cli_overrides=cli_overrides or None)
@@ -102,11 +105,15 @@ async def main() -> int:
         prompt=prompt,
         max_turns=merged.get("max_turns", args.max_turns),
         max_tokens=merged.get("max_tokens", args.max_tokens),
+        context_window=merged.get("context_window", args.context_window),
         workspace=args.workspace,
         stream_dir=args.stream_dir,
     )
 
-    logger.debug("LoopConfig max_turns=%s max_tokens=%s (from merged config)", config.max_turns, config.max_tokens)
+    logger.debug(
+        "LoopConfig max_turns=%s max_tokens=%s context_window=%s (from merged config)",
+        config.max_turns, config.max_tokens, config.context_window,
+    )
 
     loop = AgentLoop(config)
     return await loop.run()

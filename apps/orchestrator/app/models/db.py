@@ -45,6 +45,9 @@ class Workflow(Base):
     chat_messages: Mapped[list["ChatMessage"]] = relationship(
         "ChatMessage", back_populates="workflow", cascade="all, delete-orphan",
     )
+    shared_document: Mapped[Optional["SharedDocument"]] = relationship(
+        "SharedDocument", back_populates="workflow", uselist=False, cascade="all, delete-orphan",
+    )
 
 
 class Run(Base):
@@ -80,6 +83,37 @@ class Run(Base):
     tasks: Mapped[list["Task"]] = relationship(
         "Task", back_populates="run", cascade="all, delete-orphan",
     )
+    events: Mapped[list["RunEvent"]] = relationship(
+        "RunEvent", back_populates="run", cascade="all, delete-orphan",
+    )
+
+
+class RunEvent(Base):
+    """Persisted white-box stream event for a workflow run.
+
+    WebSocket delivery is best-effort and page-local. This table is the durable
+    history used to restore LLM, shell, tool, communication, and timeline panels
+    after refresh or after the user closes the browser.
+    """
+
+    __tablename__ = "run_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    node_id: Mapped[str] = mapped_column(String(255), nullable=False, server_default="")
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(),
+    )
+
+    run: Mapped["Run"] = relationship("Run", back_populates="events")
 
 
 class NodeExecution(Base):
@@ -141,3 +175,33 @@ class ChatMessage(Base):
 
     # Relationships
     workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="chat_messages")
+
+
+class SharedDocument(Base):
+    """Project-level shared document accessible to planner, workers, and user."""
+
+    __tablename__ = "shared_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4,
+    )
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    updated_by: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="user",
+        server_default="user",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        server_default=func.now(), onupdate=datetime.utcnow,
+    )
+
+    # Relationships
+    workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="shared_document")

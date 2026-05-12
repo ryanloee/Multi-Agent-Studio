@@ -247,6 +247,10 @@ class LocalSandbox:
         )
         return sandbox_id
 
+    def get_workspace_path(self, sandbox_id: str) -> Path:
+        """Return the real host workspace path for a sandbox."""
+        return self._state(sandbox_id).workspace_dir
+
     async def _git_init_with_commit(self, workspace_path: Path) -> None:
         """Initialise a git repo in *workspace_path* and commit all contents."""
         shell = self._shell_prefix()
@@ -315,7 +319,9 @@ class LocalSandbox:
                 return True
             else:
                 logger.warning("sync_back: git apply failed (rc=%d) for %s", rc, target_dir)
-                return False
+                await asyncio.to_thread(_copy_workspace_fallback, workspace, Path(target_dir))
+                logger.info("sync_back: copied workspace files to %s via fallback", target_dir)
+                return True
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
@@ -537,3 +543,22 @@ def _make_tar_gz(source_dir: str, output_path: str) -> None:
     with tarfile.open(output_path, "w:gz") as tar:
         for file in sorted(source.rglob("*")):
             tar.add(str(file), arcname=file.relative_to(source.parent))
+
+
+def _copy_workspace_fallback(source: Path, target: Path) -> None:
+    """Fallback sync for non-git target directories.
+
+    Copies user-visible workspace files while leaving MAS runtime metadata and
+    agent scratch directories alone.
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    skip_dirs = {".git", ".agent", ".workflow", ".mas", "sandbox-meta"}
+    for item in source.iterdir():
+        if item.name in skip_dirs:
+            continue
+        dest = target / item.name
+        if item.is_dir():
+            shutil.copytree(item, dest, dirs_exist_ok=True)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(item, dest)

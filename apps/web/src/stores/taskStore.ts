@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import type { Task, TaskMessage } from "@/types/task";
+import type { Artifact, Task, TaskMessage } from "@/types/task";
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -13,6 +13,8 @@ interface TaskState {
   taskMessages: Record<string, TaskMessage[]>;
   /** Current run ID — used to scope task operations */
   currentRunId: string | null;
+  /** Artifacts for the current run */
+  artifacts: Artifact[];
 
   // ---- Actions ----
   setCurrentRunId: (runId: string | null) => void;
@@ -21,6 +23,8 @@ interface TaskState {
   selectTask: (id: string | null) => void;
   setTaskMessages: (taskId: string, messages: TaskMessage[]) => void;
   appendMessage: (taskId: string, msg: TaskMessage) => void;
+  setArtifacts: (artifacts: Artifact[]) => void;
+  upsertArtifact: (artifact: Artifact) => void;
   optimisticUpdateTask: (id: string, patch: Partial<Task>) => void;
   clearTasks: () => void;
 }
@@ -33,6 +37,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
   selectedTaskId: null,
   taskMessages: {},
   currentRunId: null,
+  artifacts: [],
 
   setCurrentRunId: (runId) => set({ currentRunId: runId }),
 
@@ -64,10 +69,23 @@ export const useTaskStore = create<TaskState>((set, get) => ({
       };
     }),
 
+  setArtifacts: (artifacts) => set({ artifacts }),
+
+  upsertArtifact: (artifact) =>
+    set((state) => {
+      const idx = state.artifacts.findIndex((a) => a.id === artifact.id);
+      if (idx >= 0) {
+        const next = [...state.artifacts];
+        next[idx] = artifact;
+        return { artifacts: next };
+      }
+      return { artifacts: [...state.artifacts, artifact] };
+    }),
+
   optimisticUpdateTask: (id, patch) =>
     set((state) => ({
       tasks: state.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)),
     })),
 
-  clearTasks: () => set({ tasks: [], selectedTaskId: null, taskMessages: {} }),
+  clearTasks: () => set({ tasks: [], selectedTaskId: null, taskMessages: {}, artifacts: [] }),
 }));

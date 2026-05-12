@@ -62,6 +62,8 @@ class ModelEntry(BaseModel):
     base_url: str = Field(default="", description="API Base URL")
     api_key: str = Field(default="", description="API Key")
     default_model: str = Field(default="", description="默认模型 ID")
+    context_window: int = Field(default=128000, ge=1024, description="模型上下文窗口 token 数")
+    max_output_tokens: int = Field(default=4096, ge=256, description="单次输出 token 上限")
 
 
 class GeneralSettings(BaseModel):

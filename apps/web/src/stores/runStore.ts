@@ -16,11 +16,14 @@ interface RunState {
   selectedRunNodeId: string | null;
   /** Parent-to-children mapping: parentId → childNodeIds */
   parentChildMap: Record<string, string[]>;
+  /** Progress summary from DAG execution */
+  progressSummary: { total: number; completed: number; failed: number } | null;
 
   // Actions
   setRunId: (id: string | null) => void;
   setStatus: (status: RunStatus) => void;
   addEvent: (event: StreamEvent) => void;
+  hydrateEvents: (events: StreamEvent[]) => void;
   clearEvents: () => void;
   setNodeStatus: (nodeId: string, status: RunStatus) => void;
   setSelectedRunNode: (id: string | null) => void;
@@ -32,7 +35,7 @@ interface RunState {
 // Helper: derive RunStatus from event content string
 // ---------------------------------------------------------------------------
 function parseRunStatus(raw: string): RunStatus | null {
-  const valid: RunStatus[] = ["idle", "pending", "running", "paused", "cancelling", "completed", "failed"];
+  const valid: RunStatus[] = ["idle", "pending", "running", "paused", "cancelling", "cancelled", "completed", "failed"];
   if (valid.includes(raw as RunStatus)) return raw as RunStatus;
   return null;
 }
@@ -47,6 +50,7 @@ export const useRunStore = create<RunState>((set, get) => ({
   nodeStatuses: {},
   selectedRunNodeId: null,
   parentChildMap: {},
+  progressSummary: null,
 
   setRunId: (id) => set({ runId: id }),
 
@@ -54,6 +58,9 @@ export const useRunStore = create<RunState>((set, get) => ({
 
   addEvent: (event: StreamEvent) => {
     const state = get();
+    if (event.event_id && state.events.some((existing) => existing.event_id === event.event_id)) {
+      return;
+    }
 
     // Sync status events to nodeStatuses / global status
     if (event.type === "status") {
@@ -76,13 +83,17 @@ export const useRunStore = create<RunState>((set, get) => ({
     if (
       (event.type === "node_started" ||
         event.type === "node_completed" ||
-        event.type === "node_failed") &&
+        event.type === "node_failed" ||
+        event.type === "task_blocked" ||
+        event.type === "task_unblocked") &&
       event.node_id
     ) {
       const statusMap: Record<string, RunStatus> = {
         node_started: "running",
         node_completed: "completed",
         node_failed: "failed",
+        task_blocked: "paused",
+        task_unblocked: "running",
       };
       set({
         events: [...state.events, event],
@@ -147,6 +158,16 @@ export const useRunStore = create<RunState>((set, get) => ({
       }
     }
 
+    // Handle progress_summary
+    if (event.type === "progress_summary") {
+      const ps = event as import("@/types/events").ProgressSummaryEvent;
+      set({
+        events: [...state.events, event],
+        progressSummary: { total: ps.total, completed: ps.completed, failed: ps.failed },
+      });
+      return;
+    }
+
     // Infer node running status from activity events
     // (node_started may be missed if WS connected after it was published)
     if (event.node_id) {
@@ -167,7 +188,14 @@ export const useRunStore = create<RunState>((set, get) => ({
     set({ events: [...state.events, event] });
   },
 
-  clearEvents: () => set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {} }),
+  hydrateEvents: (events: StreamEvent[]) => {
+    set({ events: [], nodeStatuses: {}, parentChildMap: {}, progressSummary: null });
+    for (const event of events) {
+      get().addEvent(event);
+    }
+  },
+
+  clearEvents: () => set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {}, progressSummary: null }),
 
   setNodeStatus: (nodeId: string, status: RunStatus) => {
     set({ nodeStatuses: { ...get().nodeStatuses, [nodeId]: status } });

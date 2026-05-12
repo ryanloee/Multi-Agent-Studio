@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect } from "react";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import type { ModelEntry } from "@/types/settings";
@@ -13,7 +14,15 @@ interface ModelSelectorProps {
 export default function ModelSelector({ value, onChange, disabled }: ModelSelectorProps) {
   const t = useLocaleStore((s) => s.t);
   const rawModels = useSettingsStore((s) => s.settings.models);
+  const loading = useSettingsStore((s) => s.loading);
+  const loadFromServer = useSettingsStore((s) => s.loadFromServer);
   const models: ModelEntry[] = Array.isArray(rawModels) ? rawModels : [];
+
+  useEffect(() => {
+    if (!loading && models.length === 0) {
+      void loadFromServer();
+    }
+  }, [loadFromServer, loading, models.length]);
 
   // Group models by (format + base_url) as provider key
   const grouped: Record<string, { label: string; models: ModelEntry[] }> = {};
@@ -32,8 +41,9 @@ export default function ModelSelector({ value, onChange, disabled }: ModelSelect
     grouped[providerKey].models.push(model);
   }
 
-  // Build the full_id format: format/base_url/model_name
-  const getOptionValue = (m: ModelEntry) => `${m.format}/${m.base_url}/${m.default_model}`;
+  // Store only what executor needs: provider format + model id. The base URL
+  // and API key are resolved from settings at runtime.
+  const getOptionValue = (m: ModelEntry) => `${m.format}/${m.default_model || m.name}`;
 
   return (
     <div className="space-y-1">
@@ -63,7 +73,7 @@ export default function ModelSelector({ value, onChange, disabled }: ModelSelect
       </select>
       {models.length === 0 && (
         <p className="text-[10px] text-amber-500 mt-0.5">
-          {t("model.noModelsHint") || "请先在设置中添加模型"}
+          {loading ? "正在加载模型配置..." : (t("model.noModelsHint") || "请先在设置中添加模型")}
         </p>
       )}
     </div>

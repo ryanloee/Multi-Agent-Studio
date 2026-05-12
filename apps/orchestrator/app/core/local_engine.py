@@ -18,7 +18,10 @@ import json
 import logging
 import os
 import shlex
+import time
+import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -39,6 +42,8 @@ _KNOWN_EVENT_TYPES = frozenset({
     "shell_stderr", "status", "error", "node_started", "node_completed",
     "node_failed", "child_created", "child_completed",
     "task_created", "task_updated", "task_message", "worker_escalation",
+    "artifact_created", "worker_message", "planner_guidance",
+    "task_blocked", "task_unblocked",
 })
 
 # Resolve the mas_agent package directory: apps/agent/ relative to project root
@@ -60,28 +65,79 @@ def _build_subprocess_env() -> dict[str, str]:
     return env
 
 
-def _load_default_model_config() -> dict[str, str]:
-    """Load the first configured UI model for agent execution fallback."""
+def _load_settings_models() -> list[dict[str, Any]]:
+    """Load UI model entries from settings.json."""
     settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
     try:
         data = json.loads(settings_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
+        return []
 
     models = data.get("models", [])
     if not isinstance(models, list) or not models:
+        return []
+    return [m for m in models if isinstance(m, dict)]
+
+
+def _normalize_model_config(entry: dict[str, Any]) -> dict[str, str | int]:
+    return {
+        "provider": str(entry.get("format") or ""),
+        "model": str(entry.get("default_model") or entry.get("name") or ""),
+        "url": str(entry.get("base_url") or "").rstrip("/"),
+        "key": str(entry.get("api_key") or ""),
+        "context_window": int(entry.get("context_window") or 128000),
+        "max_output_tokens": int(entry.get("max_output_tokens") or 4096),
+    }
+
+
+def _load_default_model_config() -> dict[str, str | int]:
+    """Load the first configured UI model for agent execution fallback."""
+    models = _load_settings_models()
+    if not models:
         return {}
 
     first = models[0]
-    if not isinstance(first, dict):
+    return _normalize_model_config(first)
+
+
+def _load_model_config(model_provider: str, model_id: str) -> dict[str, str | int]:
+    """Load the configured model matching provider/model, with first model fallback."""
+    models = _load_settings_models()
+    if not models:
         return {}
 
-    return {
-        "provider": str(first.get("format") or ""),
-        "model": str(first.get("default_model") or first.get("name") or ""),
-        "url": str(first.get("base_url") or "").rstrip("/"),
-        "key": str(first.get("api_key") or ""),
-    }
+    for entry in models:
+        provider = str(entry.get("format") or "")
+        configured_model = str(entry.get("default_model") or entry.get("name") or "")
+        if provider == model_provider and configured_model == model_id:
+            return _normalize_model_config(entry)
+
+    for entry in models:
+        if str(entry.get("format") or "") == model_provider:
+            return _normalize_model_config(entry)
+
+    if not model_provider and not model_id:
+        return _normalize_model_config(models[0])
+    return {}
+
+
+def _parse_full_model_id(full_id: str) -> tuple[str, str]:
+    if not full_id:
+        return "", ""
+    parts = full_id.split("/", 1)
+    if len(parts) == 2:
+        return parts[0], parts[1]
+    return "", full_id
+
+
+def _resolve_auto_child_model(
+    auto_child_model_map: dict[str, Any] | None,
+    agent_type: str,
+) -> tuple[str, str]:
+    if not isinstance(auto_child_model_map, dict):
+        return "", ""
+    raw = str(auto_child_model_map.get(agent_type) or "")
+    return _parse_full_model_id(raw)
 
 
 class LocalDAGExecutor:
@@ -124,6 +180,25 @@ class LocalDAGExecutor:
     ) -> str:
         """Start DAG execution as a background asyncio task."""
         cancel_event = asyncio.Event()
+        self._runs[run_id] = {
+            "status": "running",
+            "task": None,
+            "cancel_event": cancel_event,
+            "global_config": global_config or {},
+            "workspace_directory": workspace_directory,
+            "kind": "workflow",
+            "layers": layers,
+        }
+        await self._write_mas_run_manifest(
+            run_id=run_id,
+            workspace_directory=workspace_directory,
+            kind="workflow",
+            status="running",
+            payload={
+                "layers": layers,
+                "global_config": global_config or {},
+            },
+        )
         task = asyncio.create_task(
             self._execute_dag(
                 run_id, layers, global_config or {}, cancel_event,
@@ -141,12 +216,7 @@ class LocalDAGExecutor:
 
         task.add_done_callback(_log_task_exception)
 
-        self._runs[run_id] = {
-            "status": "running",
-            "task": task,
-            "cancel_event": cancel_event,
-            "global_config": global_config or {},
-        }
+        self._runs[run_id]["task"] = task
         logger.info("DAG task created for run %s with %d layers", run_id, len(layers))
         return run_id
 
@@ -159,6 +229,25 @@ class LocalDAGExecutor:
     ) -> str:
         """Start an already-planned DAG and mirror each node to the task board."""
         cancel_event = asyncio.Event()
+        self._runs[run_id] = {
+            "status": "running",
+            "task": None,
+            "cancel_event": cancel_event,
+            "global_config": global_config or {},
+            "workspace_directory": workspace_directory,
+            "kind": "task_dag",
+            "dag_json": dag_json,
+        }
+        await self._write_mas_run_manifest(
+            run_id=run_id,
+            workspace_directory=workspace_directory,
+            kind="task_dag",
+            status="running",
+            payload={
+                "dag_json": dag_json,
+                "global_config": global_config or {},
+            },
+        )
         task = asyncio.create_task(
             self._execute_task_dag(
                 run_id, dag_json, global_config or {}, cancel_event,
@@ -176,16 +265,107 @@ class LocalDAGExecutor:
 
         task.add_done_callback(_log_task_exception)
 
-        self._runs[run_id] = {
-            "status": "running",
-            "task": task,
-            "cancel_event": cancel_event,
-            "global_config": global_config or {},
-        }
+        self._runs[run_id]["task"] = task
         logger.info(
             "Task DAG created for run %s with %d nodes",
             run_id, len(dag_json.get("nodes", [])),
         )
+        return run_id
+
+    async def recover_interrupted_runs(self) -> None:
+        """Resume DB runs that were left running when the backend stopped.
+
+        We cannot resume a killed Python coroutine or an in-flight LLM request.
+        Instead, we restore the run DAG from the workflow/.mas manifest, keep
+        completed tasks as completed, reset stale running tasks to pending, and
+        re-execute only unfinished nodes.
+        """
+        try:
+            from app.core.database import async_session_factory
+            from app.models.db import Run as RunModel, Workflow
+            from app.models.task import Task as TaskModel
+            from sqlalchemy import select
+
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(RunModel, Workflow)
+                    .join(Workflow, RunModel.workflow_id == Workflow.id)
+                    .where(RunModel.status.in_(("running", "pending", "cancelling")))
+                )
+                rows = result.all()
+                for run, workflow in rows:
+                    task_result = await session.execute(
+                        select(TaskModel).where(TaskModel.run_id == run.id)
+                    )
+                    for task in task_result.scalars().all():
+                        if task.status in ("running", "blocked"):
+                            task.status = "pending"
+                    run.status = "running"
+                await session.commit()
+
+            for run, workflow in rows:
+                dag_json = await self._load_mas_dag_json(str(run.id), workflow.workspace_directory)
+                if not dag_json:
+                    dag_json = workflow.dag_json or {}
+                if not dag_json.get("nodes"):
+                    logger.warning("Cannot recover run %s: no DAG JSON", run.id)
+                    await self._update_run_status_db(str(run.id), "failed")
+                    continue
+                await self.resume_task_dag(
+                    run_id=str(run.id),
+                    dag_json=dag_json,
+                    global_config={
+                        "_mode": "auto",
+                        "_goal": workflow.goal or "",
+                        "_workflow_id": str(workflow.id),
+                        "_edges": dag_json.get("edges", []),
+                        "_recovered": True,
+                    },
+                    workspace_directory=workflow.workspace_directory,
+                )
+        except Exception:
+            logger.warning("Failed to recover interrupted runs", exc_info=True)
+
+    async def resume_task_dag(
+        self,
+        run_id: str,
+        dag_json: dict,
+        global_config: dict | None = None,
+        workspace_directory: str | None = None,
+    ) -> str:
+        """Resume an existing task DAG without recreating completed tasks."""
+        cancel_event = asyncio.Event()
+        self._runs[run_id] = {
+            "status": "running",
+            "task": None,
+            "cancel_event": cancel_event,
+            "global_config": global_config or {},
+            "workspace_directory": workspace_directory,
+            "kind": "task_dag",
+            "dag_json": dag_json,
+            "recovered": True,
+        }
+        await self._write_mas_run_manifest(
+            run_id=run_id,
+            workspace_directory=workspace_directory,
+            kind="task_dag",
+            status="running",
+            payload={
+                "dag_json": dag_json,
+                "global_config": global_config or {},
+                "recovered": True,
+            },
+        )
+        task = asyncio.create_task(
+            self._resume_task_dag(
+                run_id, dag_json, global_config or {}, cancel_event,
+                workspace_directory=workspace_directory,
+            ),
+            name=f"resume-task-dag-{run_id}",
+        )
+        task.add_done_callback(lambda t: logger.exception("Recovered run failed for %s", run_id) if (not t.cancelled() and t.exception()) else None)
+        self._runs[run_id]["task"] = task
+        logger.info("Recovered task DAG created for run %s", run_id)
         return run_id
 
     async def get_status(self, run_id: str) -> dict:
@@ -209,18 +389,565 @@ class LocalDAGExecutor:
     async def _emit(
         self, event_type: str, run_id: str, node_id: str, **extra: Any
     ) -> None:
-        """Publish an event to the in-process event bus."""
+        """Persist and publish an event to the in-process event bus."""
         event = {
+            "event_id": str(uuid.uuid4()),
             "type": event_type,
             "run_id": run_id,
             "node_id": node_id,
+            "timestamp": time.time(),
             **extra,
         }
+        await self._persist_run_event(event)
+        await self._append_mas_event(run_id, event)
         channel = f"run:{run_id}:stream"
         try:
             await self._event_bus.publish(channel, event)
         except Exception:
             logger.warning("Failed to publish event %s", event_type, exc_info=True)
+
+    async def _persist_run_event(self, event: dict[str, Any]) -> None:
+        """Store a stream event so UI panels can be restored after reconnect."""
+        try:
+            from app.core.database import async_session_factory
+            from app.models.db import RunEvent
+
+            run_id = uuid.UUID(str(event.get("run_id", "")))
+            node_id = str(event.get("node_id") or "")
+            async with async_session_factory() as session:
+                session.add(RunEvent(
+                    run_id=run_id,
+                    event_type=str(event.get("type") or ""),
+                    node_id=node_id,
+                    payload=event,
+                ))
+                await session.commit()
+        except Exception:
+            logger.warning("Failed to persist run event %s", event.get("type"), exc_info=True)
+
+    def _mas_run_dir(self, workspace_directory: str | None, run_id: str) -> Path | None:
+        if not workspace_directory:
+            return None
+        try:
+            workspace = Path(workspace_directory).expanduser().resolve()
+            return workspace / ".mas" / "runs" / run_id
+        except Exception:
+            return None
+
+    def _mas_node_output_dir(
+        self,
+        workspace_directory: str | None,
+        run_id: str,
+        node_id: str,
+    ) -> Path | None:
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return None
+        return run_dir / "node-output" / node_id
+
+    def _mas_integration_dir(
+        self,
+        workspace_directory: str | None,
+        run_id: str,
+    ) -> Path | None:
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return None
+        return run_dir / "integration"
+
+    async def _write_mas_json(self, workspace_directory: str | None, run_id: str, relative: str, data: dict) -> None:
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return
+
+        def _write() -> None:
+            path = run_dir / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception:
+            logger.warning("Failed to write .mas state %s for run %s", relative, run_id, exc_info=True)
+
+    async def _write_mas_text(
+        self,
+        workspace_directory: str | None,
+        run_id: str,
+        relative: str,
+        content: str,
+    ) -> None:
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return
+
+        def _write() -> None:
+            path = run_dir / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+        try:
+            await asyncio.to_thread(_write)
+        except Exception:
+            logger.warning("Failed to write .mas text %s for run %s", relative, run_id, exc_info=True)
+
+    @staticmethod
+    def _node_agent_type(node: dict[str, Any]) -> str:
+        data = node.get("data", {})
+        return (
+            node.get("agent_type")
+            or node.get("type")
+            or (data.get("agentType") if isinstance(data, dict) else None)
+            or "coder"
+        )
+
+    @staticmethod
+    def _upstream_ids_for_node(node_id: str, edges: list[dict[str, Any]]) -> list[str]:
+        return [
+            str(edge.get("source"))
+            for edge in edges
+            if edge.get("target") == node_id and edge.get("source")
+        ]
+
+    async def _write_mas_run_manifest(
+        self,
+        run_id: str,
+        workspace_directory: str | None,
+        kind: str,
+        status: str,
+        payload: dict,
+    ) -> None:
+        await self._write_mas_json(
+            workspace_directory,
+            run_id,
+            "run.json",
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "kind": kind,
+                "status": status,
+                "workspace_directory": workspace_directory or "",
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                **payload,
+            },
+        )
+
+    async def _load_mas_dag_json(self, run_id: str, workspace_directory: str | None) -> dict | None:
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return None
+
+        def _read() -> dict | None:
+            path = run_dir / "run.json"
+            if not path.exists():
+                return None
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return None
+            dag = data.get("dag_json")
+            return dag if isinstance(dag, dict) else None
+
+        return await asyncio.to_thread(_read)
+
+    async def _append_mas_event(self, run_id: str, event: dict[str, Any]) -> None:
+        run_state = self._runs.get(run_id, {})
+        workspace_directory = run_state.get("workspace_directory")
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return
+
+        def _append() -> None:
+            path = run_dir / "events.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+        try:
+            await asyncio.to_thread(_append)
+        except Exception:
+            logger.warning("Failed to append .mas event for run %s", run_id, exc_info=True)
+
+    async def _write_mas_node_state(
+        self,
+        run_id: str,
+        node_id: str,
+        status: str,
+        node: dict | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        run_state = self._runs.get(run_id, {})
+        workspace_directory = run_state.get("workspace_directory")
+        data = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "node_id": node_id,
+            "status": status,
+            "node": node or {},
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if extra:
+            data.update(extra)
+        await self._write_mas_json(workspace_directory, run_id, f"nodes/{node_id}.json", data)
+        await self._write_mas_json(workspace_directory, run_id, f"node-output/{node_id}/state.json", data)
+
+    async def _prepare_node_output_workspace(
+        self,
+        run_id: str,
+        node_id: str,
+        workspace_directory: str | None,
+        sandbox_id: str,
+    ) -> None:
+        node_dir = self._mas_node_output_dir(workspace_directory, run_id, node_id)
+        if node_dir is None:
+            return
+
+        sandbox_workspace = self._sandbox.get_workspace_path(sandbox_id)
+
+        def _prepare() -> None:
+            node_dir.mkdir(parents=True, exist_ok=True)
+            workspace_link = node_dir / "workspace"
+            if workspace_link.is_symlink() or workspace_link.exists():
+                if workspace_link.is_symlink() or workspace_link.is_file():
+                    workspace_link.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(workspace_link, ignore_errors=True)
+            try:
+                workspace_link.symlink_to(sandbox_workspace, target_is_directory=True)
+                (node_dir / "workspace.live").write_text(
+                    f"{sandbox_workspace}\n",
+                    encoding="utf-8",
+                )
+            except OSError:
+                (node_dir / "workspace.live").write_text(
+                    f"{sandbox_workspace}\n",
+                    encoding="utf-8",
+                )
+
+        try:
+            await asyncio.to_thread(_prepare)
+        except Exception:
+            logger.warning("Failed to prepare node output workspace for %s", node_id, exc_info=True)
+
+    async def _snapshot_workspace_to_dir(self, sandbox_id: str, target_dir: Path) -> None:
+        sandbox_workspace = self._sandbox.get_workspace_path(sandbox_id)
+
+        def _copy() -> None:
+            skip_dirs = {".git", ".agent", ".workflow", ".mas", "sandbox-meta"}
+            if target_dir.exists():
+                shutil.rmtree(target_dir, ignore_errors=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for item in sandbox_workspace.iterdir():
+                if item.name in skip_dirs:
+                    continue
+                dest = target_dir / item.name
+                if item.is_dir():
+                    shutil.copytree(item, dest, dirs_exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(item, dest)
+
+        await asyncio.to_thread(_copy)
+
+    async def _finalize_node_output_workspace(
+        self,
+        run_id: str,
+        node_id: str,
+        workspace_directory: str | None,
+        sandbox_id: str,
+    ) -> None:
+        node_dir = self._mas_node_output_dir(workspace_directory, run_id, node_id)
+        if node_dir is None:
+            return
+        try:
+            await self._snapshot_workspace_to_dir(sandbox_id, node_dir / "workspace")
+        except Exception:
+            logger.warning("Failed to finalize node workspace snapshot for %s", node_id, exc_info=True)
+
+    async def _write_integration_workspace_snapshot(
+        self,
+        run_id: str,
+        workspace_directory: str | None,
+        sandbox_id: str,
+    ) -> None:
+        integration_dir = self._mas_integration_dir(workspace_directory, run_id)
+        if integration_dir is None:
+            return
+        try:
+            await self._snapshot_workspace_to_dir(sandbox_id, integration_dir / "workspace")
+        except Exception:
+            logger.warning("Failed to write integration workspace snapshot for run %s", run_id, exc_info=True)
+
+    def _result_summary_text(self, result: dict[str, Any]) -> str:
+        raw = result.get("raw_output", "") if isinstance(result, dict) else ""
+        summary = self._task_scheduler._summarize(raw, max_len=2400) if raw else ""
+        if raw and not summary:
+            summary = raw.strip()[:2400]
+        if not summary:
+            summary = str(result.get("error", "")).strip()
+        if not summary:
+            summary = f"Task finished with state={result.get('state', 'unknown')}"
+        return summary.strip()
+
+    def _node_report_title(self, agent_type: str) -> str:
+        if agent_type == "explore":
+            return "调查报告"
+        if agent_type == "review":
+            return "审查报告"
+        if agent_type == "merge":
+            return "合并报告"
+        if agent_type == "shell":
+            return "执行报告"
+        if agent_type == "plan":
+            return "规划结果"
+        return "变更摘要"
+
+    async def _build_commit_patch(
+        self,
+        sandbox_id: str,
+        commit_hash: str,
+    ) -> str:
+        parent_hash = await self._parent_commit_hash(sandbox_id, commit_hash)
+        if not parent_hash:
+            return ""
+        patch_stdout, _ = await self._sandbox.exec(
+            sandbox_id,
+            (
+                'git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" '
+                f"diff {shlex.quote(parent_hash)} {shlex.quote(commit_hash)}"
+            ),
+        )
+        return patch_stdout
+
+    async def _parent_commit_hash(
+        self,
+        sandbox_id: str,
+        commit_hash: str,
+    ) -> str:
+        parent_stdout, _ = await self._sandbox.exec(
+            sandbox_id,
+            f'git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" rev-parse {shlex.quote(commit_hash)}^',
+        )
+        return parent_stdout.strip()
+
+    async def _write_node_git_artifacts(
+        self,
+        run_id: str,
+        node_id: str,
+        workspace_directory: str | None,
+        sandbox_id: str,
+        commit_hash: str,
+    ) -> None:
+        parent_hash = await self._parent_commit_hash(sandbox_id, commit_hash)
+        patch_text = await self._build_commit_patch(sandbox_id, commit_hash)
+        commit_payload = {
+            "node_id": node_id,
+            "commit": commit_hash,
+            "parent_commit": parent_hash,
+        }
+        await self._write_mas_json(
+            workspace_directory,
+            run_id,
+            f"node-output/{node_id}/commit.json",
+            commit_payload,
+        )
+        if patch_text.strip():
+            await self._write_mas_text(
+                workspace_directory,
+                run_id,
+                f"node-output/{node_id}/patch.diff",
+                patch_text,
+            )
+
+    async def _prepare_merge_sandbox(
+        self,
+        run_id: str,
+        node_id: str,
+        workspace_directory: str | None,
+        upstream_ids: list[str],
+        sandbox_map: dict[str, str],
+        commit_map: dict[str, str],
+        layer_results: dict[str, Any],
+    ) -> tuple[str | None, str]:
+        notes: list[str] = []
+        manifest: dict[str, Any] = {
+            "node_id": node_id,
+            "run_id": run_id,
+            "primary_upstream": "",
+            "askable_nodes": list(upstream_ids),
+            "entries": [],
+        }
+        available_upstreams = [uid for uid in upstream_ids if sandbox_map.get(uid)]
+        if not available_upstreams:
+            return None, ""
+
+        primary_upstream = available_upstreams[-1]
+        primary_sandbox = sandbox_map.get(primary_upstream)
+        if not primary_sandbox:
+            return None, ""
+
+        merge_sandbox_id: str | None = None
+        try:
+            merge_sandbox_id = await self._sandbox.clone(
+                primary_sandbox,
+                f"ws-{node_id}-{uuid4().hex[:8]}",
+            )
+            notes.append(f"- 已使用 `{primary_upstream}` 作为集成基线工作区。")
+            manifest["primary_upstream"] = primary_upstream
+        except Exception:
+            logger.warning("Failed to clone primary upstream sandbox for merge node %s", node_id, exc_info=True)
+            return None, ""
+
+        patch_dir = f"/workspace/.agent/merge-patches/{node_id}"
+        await self._sandbox.exec(merge_sandbox_id, f"mkdir -p {patch_dir}")
+        upstream_summary = layer_results.get(primary_upstream, {}) if isinstance(layer_results.get(primary_upstream), dict) else {}
+        manifest["entries"].append({
+            "node_id": primary_upstream,
+            "status": "base",
+            "commit": commit_map.get(primary_upstream, ""),
+            "patch_path": "",
+            "error_path": "",
+            "summary": upstream_summary.get("result_summary", "") or "",
+        })
+
+        for upstream_id in available_upstreams[:-1]:
+            upstream_sandbox = sandbox_map.get(upstream_id)
+            commit_hash = commit_map.get(upstream_id, "")
+            upstream_result = layer_results.get(upstream_id, {}) if isinstance(layer_results.get(upstream_id), dict) else {}
+            entry = {
+                "node_id": upstream_id,
+                "status": "skipped",
+                "commit": commit_hash,
+                "patch_path": "",
+                "error_path": "",
+                "summary": upstream_result.get("result_summary", "") or "",
+            }
+            if not upstream_sandbox or not commit_hash:
+                notes.append(f"- `{upstream_id}` 缺少可用提交信息，未自动并入。")
+                entry["status"] = "missing_commit"
+                manifest["entries"].append(entry)
+                continue
+
+            patch_text = await self._build_commit_patch(upstream_sandbox, commit_hash)
+            if not patch_text.strip():
+                notes.append(f"- `{upstream_id}` 没有可应用的增量 patch。")
+                entry["status"] = "no_patch"
+                manifest["entries"].append(entry)
+                continue
+
+            patch_path = f"{patch_dir}/{upstream_id}.patch"
+            await self._sandbox.write_file(merge_sandbox_id, patch_path, patch_text)
+            entry["patch_path"] = patch_path
+            apply_stdout, apply_err = await self._sandbox.exec(
+                merge_sandbox_id,
+                (
+                    'git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" '
+                    f"apply --3way {shlex.quote(patch_path)}; "
+                    'printf "\\n__MAS_RC:%s" "$?"'
+                ),
+            )
+            rc = 1
+            rc_marker = "__MAS_RC:"
+            if rc_marker in apply_stdout:
+                _, _, rc_text = apply_stdout.rpartition(rc_marker)
+                try:
+                    rc = int(rc_text.strip() or "1")
+                except ValueError:
+                    rc = 1
+            clean_stdout = apply_stdout.split(rc_marker, 1)[0].strip() if rc_marker in apply_stdout else apply_stdout.strip()
+            conflict_path = f"{patch_dir}/{upstream_id}.error.txt"
+            error_text = "\n".join(part for part in (clean_stdout, apply_err.strip()) if part).strip()
+            if error_text:
+                await self._sandbox.write_file(merge_sandbox_id, conflict_path, error_text + "\n")
+                entry["error_path"] = conflict_path
+            if rc != 0:
+                notes.append(
+                    f"- `{upstream_id}` 自动应用失败，patch 保存在 `{patch_path}`，错误记录在 `{conflict_path}`。"
+                )
+                entry["status"] = "conflict"
+            else:
+                notes.append(f"- `{upstream_id}` 的 patch 已自动并入集成工作区。")
+                entry["status"] = "applied"
+            manifest["entries"].append(entry)
+
+        merge_context = ""
+        if notes:
+            merge_context = "\n\n## Merge 集成准备\n" + "\n".join(notes) + "\n"
+            await self._write_mas_text(
+                workspace_directory,
+                run_id,
+                f"integration/{node_id}.prep.md",
+                merge_context.lstrip(),
+            )
+        manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        await self._sandbox.write_file(
+            merge_sandbox_id,
+            f"/workspace/.agent/merge-manifest-{node_id}.json",
+            manifest_json,
+        )
+        await self._write_mas_text(
+            workspace_directory,
+            run_id,
+            f"integration/{node_id}.manifest.json",
+            manifest_json,
+        )
+        conflicting_nodes = [
+            str(entry.get("node_id"))
+            for entry in manifest.get("entries", [])
+            if isinstance(entry, dict) and entry.get("status") == "conflict"
+        ]
+        if conflicting_nodes:
+            merge_context += (
+                "\n## 冲突处理建议\n"
+                f"- 当前需要重点核对的上游节点: {', '.join(conflicting_nodes)}\n"
+                "- 可以用 `ASK_WORKER: <node_id>: <question>` 询问具体冲突来源。\n"
+                "- 如果涉及架构或范围取舍，用 `ESCALATE_TO_PLANNER: <question>` 请求 Planner 决策。\n"
+                f"- 结构化清单见 `/workspace/.agent/merge-manifest-{node_id}.json`。\n"
+            )
+        elif merge_sandbox_id:
+            merge_context += f"\n- 结构化清单见 `/workspace/.agent/merge-manifest-{node_id}.json`。\n"
+        return merge_sandbox_id, merge_context
+
+    async def _write_node_report_files(
+        self,
+        run_id: str,
+        node_id: str,
+        agent_type: str,
+        workspace_directory: str | None,
+        result: dict[str, Any],
+    ) -> None:
+        node_dir = self._mas_node_output_dir(workspace_directory, run_id, node_id)
+        if node_dir is None:
+            return
+
+        summary = self._result_summary_text(result)
+        raw_output = str(result.get("raw_output", "") or "")
+        title = self._node_report_title(agent_type)
+        report_md = (
+            f"# {title}\n\n"
+            f"- Node ID: `{node_id}`\n"
+            f"- Agent Type: `{agent_type}`\n"
+            f"- State: `{result.get('state', 'unknown')}`\n"
+            f"- Exit Code: `{result.get('exit_code', '')}`\n\n"
+            f"## 摘要\n\n{summary}\n"
+        )
+
+        await self._write_mas_text(
+            workspace_directory,
+            run_id,
+            f"node-output/{node_id}/report.md",
+            report_md,
+        )
+        if raw_output:
+            await self._write_mas_text(
+                workspace_directory,
+                run_id,
+                f"node-output/{node_id}/stream.jsonl",
+                raw_output,
+            )
 
     @staticmethod
     def _extract_llm_text(jsonl_content: str) -> str:
@@ -430,6 +1157,8 @@ class LocalDAGExecutor:
             for node in nodes:
                 n_id = node.get("id", node.get("node_id", ""))
                 assigned_sid = layer_sandbox_assignments.get(n_id)
+                agent_type = self._node_agent_type(node)
+                upstream_ids = self._upstream_ids_for_node(n_id, edges)
                 task_id = (global_config.get("_task_db_map") or {}).get(n_id)
                 if task_id:
                     await self._update_task_status_db(
@@ -463,6 +1192,21 @@ class LocalDAGExecutor:
                         )
                         assigned_sid = None
 
+                merge_context = ""
+                if agent_type == "merge":
+                    prepared_sid, prepared_context = await self._prepare_merge_sandbox(
+                        run_id=run_id,
+                        node_id=n_id,
+                        workspace_directory=workspace_directory,
+                        upstream_ids=upstream_ids,
+                        sandbox_map=sandbox_map,
+                        commit_map=commit_map,
+                        layer_results=layer_results,
+                    )
+                    if prepared_sid:
+                        assigned_sid = prepared_sid
+                    merge_context = prepared_context
+
                 tasks.append(
                     self._execute_node(
                         run_id, node, layer_results, global_config, cancel_event,
@@ -470,7 +1214,7 @@ class LocalDAGExecutor:
                         sandbox_id=assigned_sid,
                         upstream_context=self._build_upstream_context(
                             n_id, edges, layer_results,
-                        ),
+                        ) + merge_context,
                         destroy_owned_sandbox=False,
                     )
                 )
@@ -516,6 +1260,13 @@ class LocalDAGExecutor:
                                 if not run_state.get("_commit_map"):
                                     run_state["_commit_map"] = {}
                                 run_state["_commit_map"][node_id] = commit_hash
+                                await self._write_node_git_artifacts(
+                                    run_id=run_id,
+                                    node_id=node_id,
+                                    workspace_directory=workspace_directory,
+                                    sandbox_id=_sid,
+                                    commit_hash=commit_hash,
+                                )
                         except Exception:
                             pass
 
@@ -539,6 +1290,7 @@ class LocalDAGExecutor:
                         plan_results = await self._execute_dynamic_plan(
                             run_id, node_id, result, global_config, cancel_event,
                             planner_node=node,
+                            workspace_directory=workspace_directory,
                         )
                         layer_results.update(plan_results)
 
@@ -547,6 +1299,240 @@ class LocalDAGExecutor:
                 await self._sandbox.destroy(sandbox_id)
             except Exception:
                 logger.debug("Failed to destroy retained sandbox %s", sandbox_id, exc_info=True)
+
+        return layer_results
+
+    async def _execute_task_layers(
+        self,
+        run_id: str,
+        layers: list,
+        edges: list[dict],
+        global_config: dict,
+        cancel_event: asyncio.Event,
+        task_db_map: dict[str, str],
+        task_type_map: dict[str, str],
+        task_label_map: dict[str, str],
+        workspace_directory: str | None = None,
+        planner_node: dict | None = None,
+        parent_node_id: str = "planner",
+        completed_results: dict[str, dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Execute DAG layers through the task-aware runner.
+
+        This path preserves DAG parallelism while routing every worker through
+        TaskScheduler so progress markers, planner escalation, worker
+        collaboration, task DB updates, and artifacts behave consistently.
+        """
+        layer_results: dict[str, Any] = dict(completed_results or {})
+        dag_layers: list[list[str]] = []
+        for layer in layers:
+            if isinstance(layer, dict):
+                nodes = layer.get("nodes", []) or [layer]
+            else:
+                nodes = layer
+            dag_layers.append([str(node.get("id", node.get("node_id", ""))) for node in nodes])
+
+        global_config["_edges"] = edges
+        global_config["_task_db_map"] = task_db_map
+        global_config["_dag_layers"] = dag_layers
+
+        fallback_planner = planner_node or {
+            "id": "planner",
+            "agent_type": "plan",
+            "model_provider": "",
+            "model_id": "",
+            "prompt": "Answer worker escalation questions concisely using the run context.",
+        }
+        workflow_id = await self._get_run_workflow_id(run_id)
+        sandbox_map: dict[str, str] = {}
+        commit_map: dict[str, str] = {}
+        retained_sandboxes: set[str] = set()
+
+        for layer_idx, layer in enumerate(layers):
+            if cancel_event.is_set():
+                break
+            nodes = layer.get("nodes", []) if isinstance(layer, dict) else layer
+            if isinstance(layer, dict) and not nodes:
+                nodes = [layer]
+            runnable_nodes = [
+                node for node in nodes
+                if str(node.get("id", node.get("node_id", ""))) not in layer_results
+            ]
+
+            logger.info(
+                "Task-aware layers run=%s layer %d: executing %d nodes (%d already completed)",
+                run_id, layer_idx, len(runnable_nodes), len(nodes) - len(runnable_nodes),
+            )
+            if not runnable_nodes:
+                continue
+
+            layer_sandbox_assignments: dict[str, str | None] = {}
+            layer_clone_requests: dict[str, str] = {}
+            reused_upstream_ids: set[str] = set()
+
+            for node in runnable_nodes:
+                node_id = str(node.get("id", node.get("node_id", "")))
+                upstream_ids = self._upstream_ids_for_node(node_id, edges)
+                resolved_sid: str | None = None
+                if upstream_ids:
+                    primary_upstream = upstream_ids[-1]
+                    candidate = sandbox_map.get(primary_upstream)
+                    transfer_edge = next(
+                        (
+                            e for e in edges
+                            if e.get("target") == node_id and e.get("source") == primary_upstream
+                        ),
+                        {},
+                    )
+                    transfer_files = transfer_edge.get("data", {}).get("transfer_files", True)
+                    if candidate and transfer_files is not False:
+                        if primary_upstream not in reused_upstream_ids:
+                            resolved_sid = candidate
+                            reused_upstream_ids.add(primary_upstream)
+                        else:
+                            layer_clone_requests[node_id] = candidate
+                layer_sandbox_assignments[node_id] = resolved_sid
+
+            async def _run_one(node: dict) -> tuple[str, dict]:
+                node_id = str(node.get("id", node.get("node_id", "")))
+                agent_type = self._node_agent_type(node)
+                assigned_sid = layer_sandbox_assignments.get(node_id)
+                if assigned_sid is None and node_id in layer_clone_requests:
+                    source_sid = layer_clone_requests[node_id]
+                    try:
+                        assigned_sid = await self._sandbox.clone(
+                            source_sid,
+                            f"ws-{node_id}-{uuid4().hex[:8]}",
+                        )
+                    except Exception:
+                        logger.warning("Failed to clone sandbox %s for task-layer node %s", source_sid[:12], node_id, exc_info=True)
+                        assigned_sid = None
+
+                merge_context = ""
+                if agent_type == "merge":
+                    prepared_sid, prepared_context = await self._prepare_merge_sandbox(
+                        run_id=run_id,
+                        node_id=node_id,
+                        workspace_directory=workspace_directory,
+                        upstream_ids=self._upstream_ids_for_node(node_id, edges),
+                        sandbox_map=sandbox_map,
+                        commit_map=commit_map,
+                        layer_results=layer_results,
+                    )
+                    if prepared_sid:
+                        assigned_sid = prepared_sid
+                    merge_context = prepared_context
+
+                task_id = task_db_map.get(node_id)
+                if not task_id:
+                    result = await self._execute_node(
+                        run_id, node, layer_results, global_config, cancel_event,
+                        workspace_directory=workspace_directory,
+                        sandbox_id=assigned_sid,
+                        upstream_context=self._build_upstream_context(
+                            node_id, edges, layer_results,
+                        ) + merge_context,
+                    )
+                    return node_id, result
+
+                from app.core.task_scheduler import ManagedTask
+                managed = ManagedTask(
+                    db_id=task_id,
+                    run_id=run_id,
+                    title=task_label_map.get(node_id, node_id),
+                    description=node.get("prompt", ""),
+                    status="pending",
+                    assigned_node_id=node_id,
+                    assigned_worker_label=task_label_map.get(node_id, node_id),
+                )
+                result = await self._task_scheduler.run_worker_task(
+                    worker_node=node,
+                    task=managed,
+                    global_config=global_config,
+                    cancel_event=cancel_event,
+                    db_session=True,
+                    planner_node=fallback_planner,
+                    layer_results=layer_results,
+                    workspace_directory=workspace_directory,
+                    upstream_context=self._build_upstream_context(
+                        node_id, edges, layer_results,
+                    ) + merge_context,
+                    sandbox_id=assigned_sid,
+                )
+                if result.get("state") == "completed":
+                    await self._create_artifact_for_task(
+                        run_id=run_id,
+                        workflow_id=workflow_id,
+                        task_id=task_id,
+                        node_id=node_id,
+                        agent_type=task_type_map.get(node_id, "coder"),
+                        title=task_label_map.get(node_id, node_id),
+                        result=result,
+                    )
+                await self._emit(
+                    "child_completed", run_id, parent_node_id,
+                    child_node_id=node_id,
+                    content=f"state={result.get('state', 'unknown')}",
+                )
+                return node_id, result
+
+            results = await asyncio.gather(
+                *[_run_one(node) for node in runnable_nodes],
+                return_exceptions=True,
+            )
+            for item in results:
+                if isinstance(item, Exception):
+                    logger.warning("Task-aware layer execution failed: %s", item)
+                    continue
+                node_id, result = item
+                layer_results[node_id] = result
+                _sid = result.get("sandbox_id")
+                if _sid:
+                    sandbox_map[node_id] = _sid
+                    retained_sandboxes.add(_sid)
+                    run_state = self._runs.get(run_id, {})
+                    run_state.setdefault("_sandbox_map", {})
+                    run_state["_sandbox_map"][node_id] = _sid
+                    try:
+                        commit_hash = await self._checkpoint.auto_commit(
+                            _sid, message=f"after [{node_id}]"
+                        )
+                        if commit_hash:
+                            commit_map[node_id] = commit_hash
+                            run_state.setdefault("_commit_map", {})
+                            run_state["_commit_map"][node_id] = commit_hash
+                            await self._write_node_git_artifacts(
+                                run_id=run_id,
+                                node_id=node_id,
+                                workspace_directory=workspace_directory,
+                                sandbox_id=_sid,
+                                commit_hash=commit_hash,
+                            )
+                    except Exception:
+                        logger.debug("Failed to auto-commit task-layer sandbox for %s", node_id, exc_info=True)
+
+        total = len(task_db_map)
+        completed_count = sum(
+            1 for result in layer_results.values()
+            if isinstance(result, dict) and result.get("state") == "completed"
+        )
+        failed_count = sum(
+            1 for result in layer_results.values()
+            if isinstance(result, dict) and result.get("state") != "completed"
+        )
+        if total:
+            await self._emit(
+                "progress_summary", run_id, "",
+                total=total,
+                completed=completed_count,
+                failed=failed_count,
+            )
+
+        for sandbox_id in retained_sandboxes:
+            try:
+                await self._sandbox.destroy(sandbox_id)
+            except Exception:
+                logger.debug("Failed to destroy retained task-layer sandbox %s", sandbox_id, exc_info=True)
 
         return layer_results
 
@@ -568,7 +1554,23 @@ class LocalDAGExecutor:
                 run_row = result.scalar_one_or_none()
                 if run_row is not None:
                     run_row.status = status
+                    if status in ("completed", "failed", "cancelled"):
+                        from datetime import datetime as _datetime
+                        run_row.completed_at = _datetime.utcnow()
                     await session.commit()
+            run_state = self._runs.get(run_id, {})
+            await self._write_mas_run_manifest(
+                run_id=run_id,
+                workspace_directory=run_state.get("workspace_directory"),
+                kind=run_state.get("kind", "run"),
+                status=status,
+                payload={
+                    "dag_json": run_state.get("dag_json"),
+                    "layers": run_state.get("layers"),
+                    "global_config": run_state.get("global_config", {}),
+                    "recovered": bool(run_state.get("recovered")),
+                },
+            )
         except Exception:
             logger.warning("Failed to update run status in DB for %s", run_id, exc_info=True)
 
@@ -600,6 +1602,121 @@ class LocalDAGExecutor:
         except Exception:
             logger.warning("Failed to update task status for %s", task_id, exc_info=True)
 
+    async def _get_run_workflow_id(self, run_id: str) -> str | None:
+        try:
+            from app.core.database import async_session_factory
+            from app.models.db import Run as RunModel
+            from sqlalchemy import select
+            from uuid import UUID as _UUID
+
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(RunModel).where(RunModel.id == _UUID(run_id))
+                )
+                run_row = result.scalar_one_or_none()
+                return str(run_row.workflow_id) if run_row is not None else None
+        except Exception:
+            logger.warning("Failed to load workflow id for run %s", run_id, exc_info=True)
+            return None
+
+    def _artifact_type_for_node(self, agent_type: str) -> str:
+        if agent_type == "explore":
+            return "research_note"
+        if agent_type == "review":
+            return "review_report"
+        if agent_type == "merge":
+            return "merge_report"
+        if agent_type == "shell":
+            return "test_result"
+        if agent_type == "plan":
+            return "final_output"
+        return "file_change"
+
+    async def _create_artifact_for_task(
+        self,
+        run_id: str,
+        workflow_id: str | None,
+        task_id: str | None,
+        node_id: str,
+        agent_type: str,
+        title: str,
+        result: dict[str, Any],
+    ) -> str | None:
+        """Persist a structured artifact and emit artifact/message events."""
+        if not workflow_id:
+            return None
+
+        try:
+            from app.core.database import async_session_factory
+            from app.models.task import Artifact as ArtifactModel, TaskMessage as TaskMessageModel
+            from uuid import UUID as _UUID, uuid4
+
+            raw = result.get("raw_output", "") if isinstance(result, dict) else ""
+            summary = self._task_scheduler._summarize(raw, max_len=1200) if raw else ""
+            if raw and not summary:
+                summary = raw.strip()[:1200]
+            if not summary:
+                summary = result.get("error", "") if isinstance(result, dict) else ""
+            if not summary:
+                summary = f"Task finished with state={result.get('state', 'unknown')}"
+
+            artifact_type = self._artifact_type_for_node(agent_type)
+            artifact_id = uuid4()
+            task_uuid = _UUID(task_id) if task_id else None
+
+            async with async_session_factory() as session:
+                artifact = ArtifactModel(
+                    id=artifact_id,
+                    run_id=_UUID(run_id),
+                    workflow_id=_UUID(workflow_id),
+                    task_id=task_uuid,
+                    node_id=node_id,
+                    type=artifact_type,
+                    title=title[:512] or f"{agent_type} artifact",
+                    content=summary,
+                    metadata_json={
+                        "state": result.get("state"),
+                        "exit_code": result.get("exit_code"),
+                        "agent_type": agent_type,
+                    },
+                    created_by=node_id or agent_type,
+                )
+                session.add(artifact)
+                if task_uuid:
+                    session.add(
+                        TaskMessageModel(
+                            task_id=task_uuid,
+                            sender_type="planner" if agent_type == "plan" else "worker",
+                            sender_id=node_id or agent_type,
+                            message_type="artifact_created",
+                            content=f"Artifact created: {artifact.title}",
+                            artifact_id=artifact_id,
+                        )
+                    )
+                await session.commit()
+
+            await self._emit(
+                "artifact_created", run_id, node_id,
+                artifact_id=str(artifact_id),
+                task_id=task_id or "",
+                artifact_type=artifact_type,
+                title=title[:512],
+            )
+            if task_id:
+                await self._emit(
+                    "task_message", run_id, node_id,
+                    task_id=task_id,
+                    sender_type="planner" if agent_type == "plan" else "worker",
+                    sender_id=node_id or agent_type,
+                    message_type="artifact_created",
+                    content=f"Artifact created: {title[:512]}",
+                    artifact_id=str(artifact_id),
+                )
+            return str(artifact_id)
+        except Exception:
+            logger.warning("Failed to create artifact for node %s", node_id, exc_info=True)
+            return None
+
     async def _execute_task_dag(
         self,
         run_id: str,
@@ -622,7 +1739,19 @@ class LocalDAGExecutor:
             from uuid import uuid4
 
             task_db_map: dict[str, str] = {}
+            task_type_map: dict[str, str] = {}
+            task_label_map: dict[str, str] = {}
             normalized_nodes: list[dict] = []
+            auto_child_model_map = global_config.get("_auto_child_model_map", {})
+            edges = dag_json.get("edges", [])
+            deps_by_node: dict[str, list[str]] = {}
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                source = edge.get("source")
+                target = edge.get("target")
+                if source and target:
+                    deps_by_node.setdefault(str(target), []).append(str(source))
 
             async with async_session_factory() as session:
                 for node in dag_json.get("nodes", []):
@@ -655,6 +1784,14 @@ class LocalDAGExecutor:
                         or data.get("modelId")
                         or ""
                     )
+                    if not model_provider or not model_id:
+                        fallback_provider, fallback_model_id = _resolve_auto_child_model(
+                            auto_child_model_map, str(agent_type)
+                        )
+                        if not model_provider:
+                            model_provider = fallback_provider
+                        if not model_id:
+                            model_id = fallback_model_id
 
                     task_id = uuid4()
                     db_task = TaskModel(
@@ -665,9 +1802,12 @@ class LocalDAGExecutor:
                         status="pending",
                         assigned_node_id=node_id,
                         assigned_worker_label=str(label),
+                        dependencies=json.dumps(deps_by_node.get(node_id, [])) if deps_by_node.get(node_id) else None,
                     )
                     session.add(db_task)
                     task_db_map[node_id] = str(task_id)
+                    task_type_map[node_id] = agent_type
+                    task_label_map[node_id] = str(label)
 
                     normalized_nodes.append({
                         "id": node_id,
@@ -691,6 +1831,7 @@ class LocalDAGExecutor:
                         task_description=db_task.description,
                         status="pending",
                         child_node_id=node_id,
+                        dependencies=db_task.dependencies or "",
                     )
                     await self._emit(
                         "child_created", run_id, "planner",
@@ -707,16 +1848,25 @@ class LocalDAGExecutor:
 
             sub_dag = {
                 "nodes": normalized_nodes,
-                "edges": dag_json.get("edges", []),
+                "edges": edges,
             }
             layers = compile_dag(sub_dag)
             global_config["_edges"] = sub_dag["edges"]
             global_config["_task_db_map"] = task_db_map
             global_config["_disable_dynamic_plan"] = True
 
-            child_results = await self._execute_layers(
-                run_id, layers, sub_dag["edges"], global_config, cancel_event,
+            child_results = await self._execute_task_layers(
+                run_id=run_id,
+                layers=layers,
+                edges=sub_dag["edges"],
+                global_config=global_config,
+                cancel_event=cancel_event,
+                task_db_map=task_db_map,
+                task_type_map=task_type_map,
+                task_label_map=task_label_map,
                 workspace_directory=workspace_directory,
+                planner_node=None,
+                parent_node_id="planner",
             )
 
             for node_id, result in child_results.items():
@@ -747,16 +1897,243 @@ class LocalDAGExecutor:
 
             has_failed = any(
                 isinstance(result, dict) and result.get("state") == "failed"
-                for result in layer_results.values()
+                for result in child_results.values()
             )
             status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
             self._runs[run_id]["status"] = status
+            if status == "completed":
+                await self._create_artifact_for_task(
+                    run_id=run_id,
+                    workflow_id=await self._get_run_workflow_id(run_id),
+                    task_id=None,
+                    node_id="planner",
+                    agent_type="plan",
+                    title="Final output",
+                    result={"state": status, "raw_output": f"Run completed with {len(child_results)} task results."},
+                )
             event_type = "run_completed" if status == "completed" else "run_failed"
             await self._emit(event_type, run_id, "", content=f"status={status}")
             await self._update_run_status_db(run_id, status)
 
         except Exception as exc:
             logger.exception("Task DAG execution failed for run %s", run_id)
+            self._runs[run_id]["status"] = "failed"
+            await self._emit("run_failed", run_id, "", content=str(exc))
+            await self._update_run_status_db(run_id, "failed")
+
+    async def _resume_task_dag(
+        self,
+        run_id: str,
+        dag_json: dict,
+        global_config: dict,
+        cancel_event: asyncio.Event,
+        workspace_directory: str | None = None,
+    ) -> None:
+        """Resume an existing auto DAG from persisted task rows.
+
+        Completed tasks are treated as immutable upstream context. Pending,
+        stale running, and blocked tasks are re-enqueued. This avoids restarting
+        the entire workflow after a backend crash.
+        """
+        logger.info("Task DAG recovery STARTED for run %s", run_id)
+        try:
+            await self._emit("status", run_id, "", content="running")
+
+            from app.core.database import async_session_factory
+            from app.models.task import Task as TaskModel
+            from sqlalchemy import select
+            from uuid import uuid4
+
+            edges = dag_json.get("edges", [])
+            deps_by_node: dict[str, list[str]] = {}
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                source = edge.get("source")
+                target = edge.get("target")
+                if source and target:
+                    deps_by_node.setdefault(str(target), []).append(str(source))
+
+            task_db_map: dict[str, str] = {}
+            task_type_map: dict[str, str] = {}
+            task_label_map: dict[str, str] = {}
+            completed_results: dict[str, dict[str, Any]] = {}
+            normalized_nodes: list[dict] = []
+            auto_child_model_map = global_config.get("_auto_child_model_map", {})
+
+            async with async_session_factory() as session:
+                task_result = await session.execute(
+                    select(TaskModel).where(TaskModel.run_id == uuid.UUID(run_id))
+                )
+                tasks_by_node = {
+                    task.assigned_node_id: task
+                    for task in task_result.scalars().all()
+                    if task.assigned_node_id
+                }
+
+                for node in dag_json.get("nodes", []):
+                    if not isinstance(node, dict):
+                        continue
+                    node_id = str(node.get("id") or "")
+                    if not node_id:
+                        continue
+
+                    data = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
+                    agent_type = (
+                        node.get("agent_type")
+                        or data.get("agent_type")
+                        or data.get("agentType")
+                        or node.get("type")
+                        or "coder"
+                    )
+                    label = str(data.get("label") or node.get("label") or node_id)
+                    prompt = node.get("prompt") or data.get("prompt") or ""
+                    model_provider = (
+                        node.get("model_provider")
+                        or data.get("model_provider")
+                        or data.get("modelProvider")
+                        or ""
+                    )
+                    model_id = (
+                        node.get("model_id")
+                        or data.get("model_id")
+                        or data.get("modelId")
+                        or ""
+                    )
+                    if not model_provider or not model_id:
+                        fallback_provider, fallback_model_id = _resolve_auto_child_model(
+                            auto_child_model_map, str(agent_type)
+                        )
+                        if not model_provider:
+                            model_provider = fallback_provider
+                        if not model_id:
+                            model_id = fallback_model_id
+
+                    task = tasks_by_node.get(node_id)
+                    if task is None:
+                        task = TaskModel(
+                            id=uuid4(),
+                            run_id=uuid.UUID(run_id),
+                            title=label[:200],
+                            description=prompt,
+                            status="pending",
+                            assigned_node_id=node_id,
+                            assigned_worker_label=label,
+                            dependencies=json.dumps(deps_by_node.get(node_id, [])) if deps_by_node.get(node_id) else None,
+                        )
+                        session.add(task)
+                        await self._emit(
+                            "task_created", run_id, "planner",
+                            task_id=str(task.id),
+                            task_title=task.title,
+                            task_description=task.description,
+                            status="pending",
+                            child_node_id=node_id,
+                            dependencies=task.dependencies or "",
+                        )
+                    elif task.status in ("running", "blocked"):
+                        task.status = "pending"
+
+                    task_db_map[node_id] = str(task.id)
+                    task_type_map[node_id] = agent_type
+                    task_label_map[node_id] = label
+
+                    if task.status == "completed":
+                        completed_results[node_id] = {
+                            "state": "completed",
+                            "node_id": node_id,
+                            "raw_output": task.result_summary or "",
+                            "recovered": True,
+                        }
+
+                    normalized_nodes.append({
+                        "id": node_id,
+                        "agent_type": agent_type,
+                        "model_provider": model_provider,
+                        "model_id": model_id,
+                        "prompt": (
+                            prompt
+                            + f"\n\n---\nTask ID: {node_id}\n"
+                            + f"When you need help or are stuck, output a line:\n"
+                            + f"{ESCALATION_MARKER} <your question>\n"
+                            + f"To report progress, output a line:\n"
+                            + f"{PROGRESS_MARKER} <0-100>\n"
+                        ),
+                    })
+
+                await session.commit()
+
+            sub_dag = {"nodes": normalized_nodes, "edges": edges}
+            layers = compile_dag(sub_dag)
+            global_config["_edges"] = edges
+            global_config["_task_db_map"] = task_db_map
+            global_config["_disable_dynamic_plan"] = True
+            global_config["_recovered"] = True
+
+            child_results = await self._execute_task_layers(
+                run_id=run_id,
+                layers=layers,
+                edges=edges,
+                global_config=global_config,
+                cancel_event=cancel_event,
+                task_db_map=task_db_map,
+                task_type_map=task_type_map,
+                task_label_map=task_label_map,
+                workspace_directory=workspace_directory,
+                planner_node=None,
+                parent_node_id="planner",
+                completed_results=completed_results,
+            )
+
+            for node_id, result in child_results.items():
+                task_id = task_db_map.get(node_id)
+                if not task_id:
+                    continue
+                state = result.get("state", "failed") if isinstance(result, dict) else "failed"
+                if node_id in completed_results and state == "completed":
+                    continue
+                summary = ""
+                if isinstance(result, dict):
+                    summary = result.get("error", "")
+                    if state == "completed":
+                        raw = result.get("raw_output", "")
+                        summary = self._task_scheduler._summarize(raw) if raw else "completed"
+                await self._update_task_status_db(
+                    task_id,
+                    state,
+                    progress=100 if state == "completed" else 0,
+                    result_summary=summary,
+                )
+                await self._emit(
+                    "task_updated", run_id, "",
+                    task_id=task_id,
+                    status=state,
+                    progress=100 if state == "completed" else 0,
+                    result_summary=summary,
+                )
+
+            has_failed = any(
+                isinstance(result, dict) and result.get("state") == "failed"
+                for result in child_results.values()
+            )
+            status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
+            self._runs[run_id]["status"] = status
+            if status == "completed":
+                await self._create_artifact_for_task(
+                    run_id=run_id,
+                    workflow_id=await self._get_run_workflow_id(run_id),
+                    task_id=None,
+                    node_id="planner",
+                    agent_type="plan",
+                    title="Final output",
+                    result={"state": status, "raw_output": f"Recovered run completed with {len(child_results)} task results."},
+                )
+            event_type = "run_completed" if status == "completed" else "run_failed"
+            await self._emit(event_type, run_id, "", content=f"status={status}")
+            await self._update_run_status_db(run_id, status)
+
+        except Exception as exc:
+            logger.exception("Task DAG recovery failed for run %s", run_id)
             self._runs[run_id]["status"] = "failed"
             await self._emit("run_failed", run_id, "", content=str(exc))
             await self._update_run_status_db(run_id, "failed")
@@ -795,10 +2172,20 @@ class LocalDAGExecutor:
 
             has_failed = any(
                 isinstance(result, dict) and result.get("state") == "failed"
-                for result in child_results.values()
+                for result in layer_results.values()
             )
             status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
             self._runs[run_id]["status"] = status
+            if status == "completed":
+                await self._create_artifact_for_task(
+                    run_id=run_id,
+                    workflow_id=await self._get_run_workflow_id(run_id),
+                    task_id=None,
+                    node_id="planner",
+                    agent_type="plan",
+                    title="Final output",
+                    result={"state": status, "raw_output": f"Run completed with {len(layer_results)} node results."},
+                )
             event_type = "run_completed" if status == "completed" else "run_failed"
             await self._emit(event_type, run_id, "", content=f"status={status}")
             await self._update_run_status_db(run_id, status)
@@ -834,6 +2221,10 @@ class LocalDAGExecutor:
 
         await self._emit("node_started", run_id, node_id)
         await self._emit("status", run_id, node_id, content="running")
+        await self._write_mas_node_state(
+            run_id, node_id, "running", node=node,
+            extra={"started_at": datetime.now(timezone.utc).isoformat()},
+        )
 
         # 1. Create sandbox container (use workspace_directory as template if set)
         _owns_sandbox = False
@@ -846,6 +2237,10 @@ class LocalDAGExecutor:
             logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
         else:
             logger.info("Reusing sandbox %s for node %s", sandbox_id[:12], node_id)
+
+        await self._prepare_node_output_workspace(
+            run_id, node_id, workspace_directory, sandbox_id,
+        )
 
         stream_file = "/workspace/.agent/stream.jsonl"
 
@@ -886,9 +2281,10 @@ class LocalDAGExecutor:
             )
             default_model_cfg = _load_default_model_config()
             if not model_provider:
-                model_provider = default_model_cfg.get("provider", "")
+                model_provider = str(default_model_cfg.get("provider", ""))
             if not model_id:
-                model_id = default_model_cfg.get("model", "")
+                model_id = str(default_model_cfg.get("model", ""))
+            model_cfg = _load_model_config(model_provider, model_id)
             prompt: str = (
                 node.get("prompt")
                 or (data.get("prompt") if isinstance(data, dict) else "")
@@ -977,10 +2373,12 @@ class LocalDAGExecutor:
             # Resolve provider URL + API key from models.json
             from app.api.models import load_provider_config
             provider_cfg = load_provider_config().get(model_provider, {})
-            provider_url = default_model_cfg.get("url", "") if default_model_cfg.get("provider") == model_provider else ""
-            provider_key = default_model_cfg.get("key", "") if default_model_cfg.get("provider") == model_provider else ""
+            provider_url = str(model_cfg.get("url", ""))
+            provider_key = str(model_cfg.get("key", ""))
             provider_url = provider_url or provider_cfg.get("url", "")
             provider_key = provider_key or provider_cfg.get("key", "")
+            context_window = int(model_cfg.get("context_window") or 128000)
+            max_output_tokens = int(model_cfg.get("max_output_tokens") or 4096)
 
             # Write prompt to file to avoid shell argument length limits
             prompt_file = "/workspace/.agent/prompt.txt"
@@ -994,8 +2392,11 @@ class LocalDAGExecutor:
                 f"--agent-type {shlex.quote(agent_type)} "
                 f"--run-id {shlex.quote(run_id)} "
                 f"--node-id {shlex.quote(node_id)} "
+                f"--workspace /workspace "
                 f"--prompt-file {shlex.quote(prompt_file)} "
                 f"--stream-dir /workspace/.agent "
+                f"--max-tokens {max_output_tokens} "
+                f"--context-window {context_window} "
             )
             if provider_url:
                 cmd += f"--provider-url {shlex.quote(provider_url)} "
@@ -1006,6 +2407,16 @@ class LocalDAGExecutor:
 
             # 5. Run agent asynchronously
             exec_id = await self._sandbox.exec_async(sandbox_id, cmd, env=subprocess_env)
+            await self._write_mas_node_state(
+                run_id, node_id, "running", node=node,
+                extra={
+                    "sandbox_id": sandbox_id,
+                    "exec_id": exec_id,
+                    "command": cmd,
+                    "prompt_file": prompt_file,
+                    "stream_file": stream_file,
+                },
+            )
             logger.info(
                 "Started mas_agent exec %s in sandbox %s",
                 exec_id[:12], sandbox_id[:12],
@@ -1048,6 +2459,16 @@ class LocalDAGExecutor:
                 content=f"exit_code={exit_code}",
             )
             await self._emit("status", run_id, node_id, content=state)
+            await self._write_mas_node_state(
+                run_id, node_id, state, node=node,
+                extra={
+                    "sandbox_id": sandbox_id,
+                    "exec_id": exec_id,
+                    "exit_code": exit_code,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "log_pos": log_pos,
+                },
+            )
 
             result: dict[str, Any] = {
                 "state": state,
@@ -1070,21 +2491,27 @@ class LocalDAGExecutor:
                 except Exception:
                     pass
 
-            # Plan nodes: capture raw output for child-task parsing
-            if agent_type == "plan" and state == "completed":
-                try:
-                    raw_log, _ = await self._sandbox.exec(
-                        sandbox_id,
-                        f"cat {stream_file} 2>/dev/null || true",
-                        env=subprocess_env,
-                    )
-                    result["raw_output"] = raw_log
-                except Exception as exc:
-                    logger.warning("Failed to read raw_output for plan node %s: %s", node_id, exc)
+            # Capture raw stream output for summaries, artifacts, and plan parsing.
+            try:
+                raw_log, _ = await self._sandbox.exec(
+                    sandbox_id,
+                    f"cat {stream_file} 2>/dev/null || true",
+                    env=subprocess_env,
+                )
+                result["raw_output"] = raw_log
+            except Exception as exc:
+                logger.warning("Failed to read raw_output for node %s: %s", node_id, exc)
+
+            result["result_summary"] = self._result_summary_text(result)
+
+            await self._write_node_report_files(
+                run_id, node_id, agent_type, workspace_directory, result,
+            )
 
             return result
 
         finally:
+            final_agent_type = self._node_agent_type(node)
             # Sync sandbox changes back to the workspace directory if configured
             if workspace_directory:
                 try:
@@ -1094,6 +2521,27 @@ class LocalDAGExecutor:
                         "sync_back failed for sandbox %s -> %s",
                         sandbox_id[:12], workspace_directory, exc_info=True,
                     )
+
+            if final_agent_type == "merge":
+                try:
+                    await self._write_integration_workspace_snapshot(
+                        run_id, workspace_directory, sandbox_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to snapshot integration workspace for merge node %s",
+                        node_id, exc_info=True,
+                    )
+
+            try:
+                await self._finalize_node_output_workspace(
+                    run_id, node_id, workspace_directory, sandbox_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to finalize node output workspace for sandbox %s",
+                    sandbox_id[:12], exc_info=True,
+                )
 
             # Only destroy the sandbox if we created it and the DAG layer
             # executor does not need to reuse it for downstream nodes.
@@ -1145,6 +2593,18 @@ class LocalDAGExecutor:
                         tool_name=ev.get("tool_name", ""),
                         timestamp=ev.get("timestamp", 0),
                     )
+                    content = ev.get("content", "")
+                    if isinstance(content, str):
+                        if "ESCALATE_TO_PLANNER:" in content:
+                            await self._emit(
+                                "planner_guidance", run_id, node_id,
+                                content=content.split("ESCALATE_TO_PLANNER:", 1)[1].strip(),
+                            )
+                        if "ASK_WORKER:" in content or "BROADCAST_TO_PEERS:" in content:
+                            await self._emit(
+                                "worker_message", run_id, node_id,
+                                content=content,
+                            )
                 elif event_type == "text":
                     # Backward compat: some agents emit "text" for LLM tokens
                     await self._emit(
@@ -1178,6 +2638,7 @@ class LocalDAGExecutor:
         global_config: dict,
         cancel_event: asyncio.Event,
         planner_node: dict | None = None,
+        workspace_directory: str | None = None,
     ) -> dict[str, Any]:
         """After a planner node completes, parse its output for child tasks,
         persist them as Task rows, and execute them.
@@ -1211,6 +2672,14 @@ class LocalDAGExecutor:
             dag_result = parse_plan_to_dag(extracted_text)
             if dag_result:
                 child_nodes, child_edges = dag_result
+                deps_by_child: dict[str, list[str]] = {}
+                for edge in child_edges:
+                    if not isinstance(edge, dict):
+                        continue
+                    source = edge.get("source")
+                    target = edge.get("target")
+                    if source and target:
+                        deps_by_child.setdefault(str(target), []).append(str(source))
                 logger.info(
                     "_execute_dynamic_plan (auto): parse_plan_to_dag returned %d nodes, %d edges",
                     len(child_nodes), len(child_edges),
@@ -1225,6 +2694,7 @@ class LocalDAGExecutor:
                         "title": nd.get("label") or dag_node.get("id", ""),
                         "type": nd.get("agent_type") or dag_node.get("type", "coder"),
                         "prompt": nd.get("prompt", ""),
+                        "depends_on": deps_by_child.get(dag_node.get("id", ""), []),
                     }
                     if nd.get("model"):
                         task_entry["model"] = nd["model"]
@@ -1249,6 +2719,26 @@ class LocalDAGExecutor:
             "Plan node %s produced %d child tasks", parent_node_id, len(parsed_tasks),
         )
 
+        # Load shared document for worker context injection
+        shared_doc_content = ""
+        try:
+            from app.models.db import SharedDocument as SharedDocModel
+            from sqlalchemy import select as sa_select
+            wf_id = global_config.get("_workflow_id")
+            if wf_id:
+                from app.core.database import async_session_factory as _doc_session_factory
+                async with _doc_session_factory() as doc_session:
+                    doc_result = await doc_session.execute(
+                        sa_select(SharedDocModel).where(
+                            SharedDocModel.workflow_id == uuid.UUID(wf_id)
+                        )
+                    )
+                    doc_row = doc_result.scalar_one_or_none()
+                    if doc_row and doc_row.content.strip():
+                        shared_doc_content = doc_row.content.strip()
+        except Exception:
+            logger.debug("Failed to load shared doc for workers", exc_info=True)
+
         # Persist tasks to DB and emit events
         from app.core.database import async_session_factory
         from app.models.task import Task as TaskModel
@@ -1256,7 +2746,8 @@ class LocalDAGExecutor:
 
         # Build worker node dicts and persist to DB in one pass
         worker_nodes: list[dict] = []
-        task_db_map: dict[str, tuple] = {}  # node_id -> (task_id, session_managed)
+        task_db_map: dict[str, tuple] = {}  # node_id -> (task_id, label, type)
+        auto_child_model_map = global_config.get("_auto_child_model_map", {})
 
         async with async_session_factory() as session:
             for idx, parsed in enumerate(parsed_tasks):
@@ -1266,6 +2757,11 @@ class LocalDAGExecutor:
                 task_id = uuid4()
                 task_type = parsed.get("type", "coder")
                 worker_label = parsed.get("title") or f"{task_type} #{idx + 1}"
+
+                # Compute dependencies from DAG edges or task depends_on
+                deps_list = parsed.get("depends_on", []) or parsed.get("dependencies", [])
+                deps_json = json.dumps(deps_list) if deps_list else None
+
                 db_task = TaskModel(
                     id=task_id,
                     run_id=uuid.UUID(run_id),
@@ -1274,6 +2770,7 @@ class LocalDAGExecutor:
                     status="pending",
                     assigned_node_id=child_node_id,
                     assigned_worker_label=worker_label,
+                    dependencies=deps_json,
                 )
                 session.add(db_task)
                 await session.commit()
@@ -1286,22 +2783,20 @@ class LocalDAGExecutor:
                     task_description=db_task.description,
                     status="pending",
                     child_node_id=child_node_id,
-                )
-
-                # Also emit child_created for backward compat (frontend canvas)
-                await self._emit(
-                    "child_created", run_id, parent_node_id,
-                    child_node_id=child_node_id,
-                    child_type=parsed.get("type", "coder"),
-                    child_prompt=parsed.get("prompt", ""),
-                    child_model=parsed.get("model", ""),
+                    dependencies=db_task.dependencies or "",
                 )
 
                 # Build the worker node dict
                 model_str = parsed.get("model", "")
-                model_parts = model_str.split("/", 1) if model_str else ("", "")
-                model_provider = model_parts[0] if len(model_parts) > 1 else ""
-                model_id = model_parts[1] if len(model_parts) > 1 else model_str
+                model_provider, model_id = _parse_full_model_id(model_str)
+
+                strategy_provider, strategy_model_id = _resolve_auto_child_model(
+                    auto_child_model_map, str(task_type)
+                )
+                if not model_provider and strategy_provider:
+                    model_provider = strategy_provider
+                if not model_id and strategy_model_id:
+                    model_id = strategy_model_id
 
                 # Inherit planner's model config as fallback when task doesn't specify one
                 if not model_provider or not model_id:
@@ -1319,8 +2814,47 @@ class LocalDAGExecutor:
                     if not model_id and fallback_model:
                         model_id = fallback_model
 
+                resolved_model = (
+                    f"{model_provider}/{model_id}"
+                    if model_provider and model_id
+                    else model_id
+                )
+
+                # Also emit child_created for backward compat (frontend canvas)
+                await self._emit(
+                    "child_created", run_id, parent_node_id,
+                    child_node_id=child_node_id,
+                    child_type=parsed.get("type", "coder"),
+                    child_prompt=parsed.get("prompt", ""),
+                    child_model=resolved_model,
+                )
+
                 # Inject escalation protocol into worker prompt
                 worker_prompt = parsed.get("prompt", "")
+
+                # Inject project context
+                project_goal = global_config.get("_goal", "")
+                if project_goal:
+                    worker_prompt = f"## 项目目标\n{project_goal}\n\n---\n\n{worker_prompt}"
+
+                # Inject sibling task summary for context awareness
+                if len(parsed_tasks) > 1:
+                    sibling_lines = []
+                    for si, sib in enumerate(parsed_tasks):
+                        sib_id = sib.get("node_id") or f"{parent_node_id}_child_{si}"
+                        sib_title = sib.get("title") or sib.get("prompt", "")[:60]
+                        sib_type = sib.get("type", "coder")
+                        marker = " → " if sib_id == child_node_id else "   "
+                        sibling_lines.append(f"{marker}[{sib_type}] {sib_title}")
+                    worker_prompt += (
+                        f"\n\n## 任务上下文（共 {len(parsed_tasks)} 个子任务，当前第 {idx + 1} 个）\n"
+                        + "\n".join(sibling_lines)
+                    )
+
+                # Inject shared document context
+                if shared_doc_content:
+                    worker_prompt += f"\n\n## 项目共享文档\n{shared_doc_content}"
+
                 worker_prompt += (
                     f"\n\n---\nTask ID: {child_node_id}\n"
                     f"When you need help or are stuck, output a line:\n"
@@ -1337,7 +2871,7 @@ class LocalDAGExecutor:
                     "prompt": worker_prompt,
                 }
                 worker_nodes.append(worker_node)
-                task_db_map[child_node_id] = (str(task_id), worker_label)
+                task_db_map[child_node_id] = (str(task_id), worker_label, task_type)
 
             # ---------- Execute child tasks ----------
 
@@ -1384,116 +2918,54 @@ class LocalDAGExecutor:
                         li, [n.get("id", "?") for n in layer],
                     )
 
-                # Execute the sub-DAG via _execute_layers
-                child_results = await self._execute_layers(
-                    run_id, sub_layers, child_edges_dag, global_config, cancel_event,
-                    workspace_directory=None,
+                child_results = await self._execute_task_layers(
+                    run_id=run_id,
+                    layers=sub_layers,
+                    edges=child_edges_dag,
+                    global_config=global_config,
+                    cancel_event=cancel_event,
+                    task_db_map={node_id: meta[0] for node_id, meta in task_db_map.items()},
+                    task_type_map={node_id: meta[2] for node_id, meta in task_db_map.items()},
+                    task_label_map={node_id: meta[1] for node_id, meta in task_db_map.items()},
+                    workspace_directory=workspace_directory,
+                    planner_node=planner_node,
+                    parent_node_id=parent_node_id,
                 )
-
-                # Update DB task statuses based on results
-                for node_id, result in child_results.items():
-                    if node_id not in task_db_map:
-                        continue
-                    task_id_str, _label = task_db_map[node_id]
-                    state = result.get("state", "failed") if isinstance(result, dict) else "failed"
-                    try:
-                        from app.models.task import Task as TaskModel
-                        from sqlalchemy import select
-                        from uuid import UUID as _UUID
-                        db_result = await session.execute(
-                            select(TaskModel).where(TaskModel.id == _UUID(task_id_str))
-                        )
-                        row = db_result.scalar_one_or_none()
-                        if row:
-                            row.status = state
-                            if state == "completed":
-                                raw = result.get("raw_output", "")
-                                summary = self._task_scheduler._summarize(raw) if raw else ""
-                                row.result_summary = summary or f"state={state}"
-                            else:
-                                row.result_summary = result.get("error", "execution failed")
-                            await session.commit()
-                    except Exception:
-                        logger.warning(
-                            "Failed to update DB task %s status", task_id_str, exc_info=True,
-                        )
-
-                    await self._emit(
-                        "child_completed", run_id, parent_node_id,
-                        child_node_id=node_id,
-                        content=f"state={state}",
-                    )
-                    await self._emit(
-                        "task_updated", run_id, "",
-                        task_id=task_id_str,
-                        status=state,
-                        progress=100 if state == "completed" else 0,
-                        result_summary=result.get("error", "") if state != "completed" else "",
-                    )
 
                 return child_results
 
             else:
-                # --- Legacy sequential execution via TaskScheduler ---
-                managed_tasks: list = []
+                worker_ids = {node["id"] for node in worker_nodes}
+                legacy_edges: list[dict] = []
+                for idx, parsed in enumerate(parsed_tasks):
+                    target_id = parsed.get("node_id") or f"{parent_node_id}_child_{idx}"
+                    for dep in parsed.get("depends_on", []) or parsed.get("dependencies", []) or []:
+                        dep_id = str(dep)
+                        if dep_id in worker_ids:
+                            legacy_edges.append({
+                                "id": f"e_{dep_id}_{target_id}",
+                                "source": dep_id,
+                                "target": target_id,
+                            })
 
-                for worker_node in worker_nodes:
-                    child_node_id = worker_node["id"]
-                    if child_node_id not in task_db_map:
-                        continue
-                    task_id_str, _label = task_db_map[child_node_id]
+                try:
+                    legacy_layers = compile_dag({
+                        "nodes": worker_nodes,
+                        "edges": legacy_edges,
+                    })
+                except ValueError:
+                    legacy_layers = [[node] for node in worker_nodes]
 
-                    from app.core.task_scheduler import ManagedTask
-                    managed = ManagedTask(
-                        db_id=task_id_str,
-                        run_id=run_id,
-                        title=worker_node.get("prompt", "")[:200],
-                        description=worker_node.get("prompt", ""),
-                        status="pending",
-                        assigned_node_id=child_node_id,
-                    )
-                    managed_tasks.append((managed, worker_node))
-
-                child_results: dict[str, Any] = {}
-
-                # Run all tasks via the scheduler (with escalation support)
-                for managed, worker_node in managed_tasks:
-                    managed.worker_task = asyncio.create_task(
-                        self._task_scheduler.run_worker_task(
-                            worker_node=worker_node,
-                            task=managed,
-                            global_config=global_config,
-                            cancel_event=cancel_event,
-                            db_session=session,
-                            planner_node=planner_node,
-                        ),
-                        name=f"worker-{managed.assigned_node_id}",
-                    )
-
-                # Wait for all workers to complete
-                for managed, worker_node in managed_tasks:
-                    try:
-                        result = await asyncio.wait_for(
-                            managed.worker_task, timeout=300,
-                        )
-                    except asyncio.TimeoutError:
-                        result = {"state": "failed", "error": "timeout"}
-                        await self._task_scheduler.update_task_status(
-                            managed, "failed", session, result_summary="timeout",
-                        )
-                    except Exception as exc:
-                        result = {"state": "failed", "error": str(exc)}
-                        await self._task_scheduler.update_task_status(
-                            managed, "failed", session, result_summary=str(exc),
-                        )
-
-                    child_node_id = managed.assigned_node_id or ""
-                    child_results[child_node_id] = result
-
-                    await self._emit(
-                        "child_completed", run_id, parent_node_id,
-                        child_node_id=child_node_id,
-                        content=f"state={result.get('state', 'unknown')}",
-                    )
-
-                return child_results
+                return await self._execute_task_layers(
+                    run_id=run_id,
+                    layers=legacy_layers,
+                    edges=legacy_edges,
+                    global_config=global_config,
+                    cancel_event=cancel_event,
+                    task_db_map={node_id: meta[0] for node_id, meta in task_db_map.items()},
+                    task_type_map={node_id: meta[2] for node_id, meta in task_db_map.items()},
+                    task_label_map={node_id: meta[1] for node_id, meta in task_db_map.items()},
+                    workspace_directory=workspace_directory,
+                    planner_node=planner_node,
+                    parent_node_id=parent_node_id,
+                )

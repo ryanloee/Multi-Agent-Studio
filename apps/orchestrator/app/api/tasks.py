@@ -248,9 +248,14 @@ async def restart_task(
                 "prompt": worker_prompt,
             }
 
-            # Find planner node for escalation support
             cancel_event = asyncio.Event()
-            planner_node = None
+            planner_node = {
+                "id": "planner",
+                "agent_type": "plan",
+                "model_provider": "",
+                "model_id": "",
+                "prompt": "Answer worker escalation questions concisely using the run context.",
+            }
 
             # Start execution in background
             async def _run_task():
@@ -263,13 +268,23 @@ async def restart_task(
                     execute_node_fn=_engine._execute_node,
                     emit_fn=_engine._emit,
                 )
-                await scheduler.run_worker_task(
+                result = await scheduler.run_worker_task(
                     worker_node=worker_node,
                     task=managed,
-                    global_config={},
+                    global_config={"_workflow_id": str(run_obj.workflow_id) if run_obj else ""},
                     cancel_event=cancel_event,
                     planner_node=planner_node,
                 )
+                if result.get("state") == "completed":
+                    await _engine._create_artifact_for_task(
+                        run_id=str(run_id),
+                        workflow_id=await _engine._get_run_workflow_id(str(run_id)),
+                        task_id=str(task.id),
+                        node_id=node_id,
+                        agent_type=worker_node.get("agent_type", "coder"),
+                        title=task.title,
+                        result=result,
+                    )
 
             asyncio.create_task(_run_task(), name=f"restart-{task_id}")
 
@@ -356,14 +371,14 @@ async def assign_task(
             "prompt": worker_prompt,
         }
 
-        # Find planner node for escalation support
         cancel_event = asyncio.Event()
-        planner_node = None
-        if _engine and _engine._runs:
-            # Try to find the plan node from the workflow
-            for rid, _run_info in _engine._runs.items():
-                if rid == str(run_id):
-                    break
+        planner_node = {
+            "id": "planner",
+            "agent_type": "plan",
+            "model_provider": "",
+            "model_id": "",
+            "prompt": "Answer worker escalation questions concisely using the run context.",
+        }
 
         # Start execution in background
         async def _run_task():
@@ -376,13 +391,24 @@ async def assign_task(
                 execute_node_fn=_engine._execute_node,
                 emit_fn=_engine._emit,
             )
-            await scheduler.run_worker_task(
+            workflow_id = await _engine._get_run_workflow_id(str(run_id))
+            result = await scheduler.run_worker_task(
                 worker_node=worker_node,
                 task=managed,
-                global_config={},
+                global_config={"_workflow_id": workflow_id or ""},
                 cancel_event=cancel_event,
                 planner_node=planner_node,
             )
+            if result.get("state") == "completed":
+                await _engine._create_artifact_for_task(
+                    run_id=str(run_id),
+                    workflow_id=workflow_id,
+                    task_id=str(task.id),
+                    node_id=body.node_id,
+                    agent_type=worker_node.get("agent_type", "coder"),
+                    title=task.title,
+                    result=result,
+                )
 
         asyncio.create_task(_run_task(), name=f"assign-{task_id}")
 
@@ -415,6 +441,8 @@ async def send_task_message(
         sender_id=body.sender_id,
         message_type=body.message_type,
         content=body.content,
+        target_node_id=body.target_node_id,
+        artifact_id=body.artifact_id,
     )
     db.add(msg)
     await db.flush()

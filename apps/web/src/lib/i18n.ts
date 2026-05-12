@@ -25,6 +25,20 @@ export const translations: Record<Locale, Record<string, string>> = {
 
     // ─── LeftPanel ───
     "leftPanel.tasks": "任务",
+    "leftPanel.sharedDoc": "项目文档",
+
+    // ─── SharedDoc ───
+    "sharedDoc.placeholder": "在这里编写项目文档、架构决策、API 设计等...\n\n此文档对 Planner 和所有 Worker 可见。",
+    "sharedDoc.editMode": "编辑",
+    "sharedDoc.viewMode": "预览",
+    "sharedDoc.lastUpdated": "最后更新",
+    "sharedDoc.expand": "展开",
+    "sharedDoc.collapse": "收起",
+    "sharedDoc.close": "关闭",
+
+    // ─── TaskBoard ───
+    "taskBoard.viewTopology": "拓扑",
+    "taskBoard.viewFlat": "列表",
 
     // ─── ConfigPanel ───
     "config.label": "标签",
@@ -36,6 +50,8 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.closePanel": "关闭面板",
     "config.deleteNode": "删除节点",
     "config.workflowSettings": "工作流设置",
+    "config.childModels": "子节点模型策略",
+    "config.childModelsDesc": "预先指定 Planner 创建的各类子节点默认模型。任务未显式声明模型时，优先使用这里的配置。",
     "config.workspaceDirectory": "工作区目录",
     "config.workspaceDirectoryPlaceholder": "例如: /path/to/project 或 C:\\workspace",
 
@@ -62,10 +78,13 @@ export const translations: Record<Locale, Record<string, string>> = {
     "output.tab.shell": "终端",
     "output.tab.tools": "工具",
     "output.tab.comm": "通讯",
+    "output.tab.timeline": "时间线",
     "output.tab.chat": "Chat",
     "output.filter.allNodes": "所有节点",
     "output.collapse": "收起面板",
     "output.expand": "展开面板",
+    "output.fullscreen": "全屏展开",
+    "output.exitFullscreen": "退出全屏",
     "output.clearNodeFilter": "清除节点筛选",
 
     // ─── PlanNode ───
@@ -151,6 +170,8 @@ export const translations: Record<Locale, Record<string, string>> = {
     "node.plan.description": "分析任务并创建执行计划",
     "node.explore.label": "探索器",
     "node.explore.description": "搜索代码库并收集信息",
+    "node.merge.label": "合并器",
+    "node.merge.description": "集成并行代码改动并处理冲突",
     "node.shell.label": "Shell",
     "node.shell.description": "执行 Shell 命令",
     "node.review.label": "审查器",
@@ -208,6 +229,10 @@ export const translations: Record<Locale, Record<string, string>> = {
     "settings.noModels": "暂无模型配置，请从左侧添加",
     "settings.modelFormat": "API 格式",
     "settings.modelName": "名称",
+    "settings.contextWindow": "上下文窗口",
+    "settings.maxOutputTokens": "输出上限",
+    "settings.contextWindowShort": "上下文",
+    "settings.maxOutputShort": "输出",
     "settings.testUrl": "测试连通性",
     "settings.deleteModel": "删除模型",
     "settings.testSuccess": "连通成功",
@@ -254,6 +279,20 @@ export const translations: Record<Locale, Record<string, string>> = {
 
     // ─── LeftPanel ───
     "leftPanel.tasks": "Tasks",
+    "leftPanel.sharedDoc": "Project Doc",
+
+    // ─── SharedDoc ───
+    "sharedDoc.placeholder": "Write project docs, architecture decisions, API designs here...\n\nThis document is visible to Planner and all Workers.",
+    "sharedDoc.editMode": "Edit",
+    "sharedDoc.viewMode": "Preview",
+    "sharedDoc.lastUpdated": "Last updated",
+    "sharedDoc.expand": "Expand",
+    "sharedDoc.collapse": "Collapse",
+    "sharedDoc.close": "Close",
+
+    // ─── TaskBoard ───
+    "taskBoard.viewTopology": "Topology",
+    "taskBoard.viewFlat": "List",
 
     // ─── ConfigPanel ───
     "config.label": "Label",
@@ -265,6 +304,8 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.closePanel": "Close panel",
     "config.deleteNode": "Delete node",
     "config.workflowSettings": "Workflow Settings",
+    "config.childModels": "Child Model Strategy",
+    "config.childModelsDesc": "Predefine the default model for each child worker type created by the Planner. If a task does not explicitly declare a model, this mapping is used first.",
     "config.workspaceDirectory": "Workspace Directory",
     "config.workspaceDirectoryPlaceholder": "e.g. /path/to/project or C:\\workspace",
 
@@ -291,9 +332,12 @@ export const translations: Record<Locale, Record<string, string>> = {
     "output.tab.shell": "Shell",
     "output.tab.tools": "Tools",
     "output.tab.comm": "Comm",
+    "output.tab.timeline": "Timeline",
     "output.filter.allNodes": "All Nodes",
     "output.collapse": "Collapse panel",
     "output.expand": "Expand panel",
+    "output.fullscreen": "Fullscreen",
+    "output.exitFullscreen": "Exit fullscreen",
     "output.clearNodeFilter": "Clear node filter",
 
     // ─── PlanNode ───
@@ -379,6 +423,8 @@ export const translations: Record<Locale, Record<string, string>> = {
     "node.plan.description": "Analyses tasks and creates execution plans",
     "node.explore.label": "Explorer",
     "node.explore.description": "Searches codebase and gathers information",
+    "node.merge.label": "Merger",
+    "node.merge.description": "Integrates parallel code changes and handles conflicts",
     "node.shell.label": "Shell",
     "node.shell.description": "Executes shell commands",
     "node.review.label": "Reviewer",
@@ -436,6 +482,10 @@ export const translations: Record<Locale, Record<string, string>> = {
     "settings.noModels": "No models configured. Add one from the left.",
     "settings.modelFormat": "API Format",
     "settings.modelName": "Name",
+    "settings.contextWindow": "Context Window",
+    "settings.maxOutputTokens": "Max Output",
+    "settings.contextWindowShort": "Context",
+    "settings.maxOutputShort": "Output",
     "settings.testUrl": "Test Connectivity",
     "settings.deleteModel": "Delete Model",
     "settings.testSuccess": "Connection successful",

@@ -23,10 +23,12 @@ import {
 import { useTaskStore } from "@/stores/taskStore";
 import { useRunStore } from "@/stores/runStore";
 import { useWorkflowStore } from "@/stores/workflowStore";
-import type { Task, TaskStatus, TaskMessage } from "@/types/task";
+import { useLocaleStore } from "@/stores/localeStore";
+import type { Artifact, Task, TaskStatus, TaskMessage } from "@/types/task";
 import { TASK_STATUS_CONFIG } from "@/types/task";
 import type { NodeData } from "@/types/workflow";
 import type { LucideIcon } from "lucide-react";
+import TaskTopology from "./TaskTopology";
 
 // ---------------------------------------------------------------------------
 // Status icon mapping
@@ -57,6 +59,7 @@ const TaskLeaf = memo(function TaskLeaf({
   isSelected,
   onSelect,
   messages,
+  artifacts,
   onSendMessage,
   onRestart,
   onUpdate,
@@ -67,6 +70,7 @@ const TaskLeaf = memo(function TaskLeaf({
   isSelected: boolean;
   onSelect: () => void;
   messages: TaskMessage[];
+  artifacts: Artifact[];
   onSendMessage: (text: string) => void;
   onRestart: () => void;
   onUpdate: (patch: Partial<Task>) => void;
@@ -315,6 +319,24 @@ const TaskLeaf = memo(function TaskLeaf({
             </div>
           )}
 
+          {artifacts.length > 0 && !editing && (
+            <div className="space-y-1 max-h-28 overflow-y-auto">
+              {artifacts.map((artifact) => (
+                <div key={artifact.id} className="rounded border border-emerald-100 bg-emerald-50/60 p-1.5 text-[10px]">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-medium text-emerald-700 truncate">{artifact.title}</span>
+                    <span className="shrink-0 text-[9px] text-emerald-600">{artifact.type}</span>
+                  </div>
+                  {artifact.content && (
+                    <div className="mt-0.5 line-clamp-3 whitespace-pre-wrap text-gray-600">
+                      {artifact.content}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Action bar */}
           <div className="flex items-center gap-1.5 pt-0.5">
             {editing ? (
@@ -456,11 +478,13 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
   const selectedTaskId = useTaskStore((s) => s.selectedTaskId);
   const selectTask = useTaskStore((s) => s.selectTask);
   const taskMessages = useTaskStore((s) => s.taskMessages);
+  const artifacts = useTaskStore((s) => s.artifacts);
   const upsertTask = useTaskStore((s) => s.upsertTask);
   const optimisticUpdateTask = useTaskStore((s) => s.optimisticUpdateTask);
   const currentRunId = useTaskStore((s) => s.currentRunId);
   const runStatus = useRunStore((s) => s.status);
   const runId = useRunStore((s) => s.runId);
+  const progressSummary = useRunStore((s) => s.progressSummary);
 
   // Workflow nodes for assignment — use stable selector + useMemo to avoid
   // creating new array references on every render (which causes infinite
@@ -480,6 +504,8 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
 
   const [filterStatus, setFilterStatus] = useState<TaskStatus | "all">("all");
   const [showNewTask, setShowNewTask] = useState(false);
+  const [viewMode, setViewMode] = useState<"topology" | "flat">("topology");
+  const t = useLocaleStore((s) => s.t);
 
   // On mount: find latest run with tasks
   useEffect(() => {
@@ -502,6 +528,14 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
           if (fetched.length > 0) {
             useTaskStore.getState().setTasks(fetched);
             useTaskStore.getState().setCurrentRunId(run.id);
+            const fetchedArtifacts = await api.listArtifacts(run.id);
+            useTaskStore.getState().setArtifacts(fetchedArtifacts);
+            const messagePairs = await Promise.all(
+              fetched.map(async (task) => [task.id, await api.listTaskMessages(run.id, task.id)] as const)
+            );
+            for (const [taskId, messages] of messagePairs) {
+              useTaskStore.getState().setTaskMessages(taskId, messages);
+            }
             return;
           }
         }
@@ -526,6 +560,16 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
         const fetched = await api.listTasks(activeRunId);
         if (!cancelled && fetched.length > 0) {
           useTaskStore.getState().setTasks(fetched);
+          const fetchedArtifacts = await api.listArtifacts(activeRunId);
+          if (!cancelled) useTaskStore.getState().setArtifacts(fetchedArtifacts);
+          const messagePairs = await Promise.all(
+            fetched.map(async (task) => [task.id, await api.listTaskMessages(activeRunId, task.id)] as const)
+          );
+          if (!cancelled) {
+            for (const [taskId, messages] of messagePairs) {
+              useTaskStore.getState().setTaskMessages(taskId, messages);
+            }
+          }
           if (!useTaskStore.getState().currentRunId) {
             useTaskStore.getState().setCurrentRunId(activeRunId);
           }
@@ -691,8 +735,56 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
 
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
+      {/* Progress summary bar */}
+      {progressSummary && progressSummary.total > 0 && (
+        <div className="px-3 py-2 border-b border-gray-100 shrink-0">
+          <div className="flex items-center justify-between mb-1">
+            <span className="text-[10px] text-gray-500">
+              {progressSummary.completed}/{progressSummary.total} 任务完成
+            </span>
+            <span className="text-[10px] text-gray-400">
+              {progressSummary.failed > 0 && `${progressSummary.failed} 失败`}
+            </span>
+          </div>
+          <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden flex">
+            {progressSummary.completed > 0 && (
+              <div
+                className="h-full bg-green-500 transition-all duration-300"
+                style={{ width: `${(progressSummary.completed / progressSummary.total) * 100}%` }}
+              />
+            )}
+            {progressSummary.failed > 0 && (
+              <div
+                className="h-full bg-red-400 transition-all duration-300"
+                style={{ width: `${(progressSummary.failed / progressSummary.total) * 100}%` }}
+              />
+            )}
+          </div>
+        </div>
+      )}
+
       {/* Filter bar + new task button */}
       <div className="flex items-center gap-1 px-3 py-2 border-b border-gray-100 flex-wrap">
+        {/* View toggle */}
+        <div className="flex items-center bg-gray-100 rounded-full p-0.5 mr-1">
+          <button
+            onClick={() => setViewMode("topology")}
+            className={`text-[10px] font-medium px-2 py-0.5 rounded-full transition-colors ${
+              viewMode === "topology" ? "bg-white text-gray-800 shadow-sm" : "text-gray-500 hover:text-gray-700"
+            }`}
+          >
+            {t("taskBoard.viewTopology") || "拓扑"}
+          </button>
+          <button
+            onClick={() => setViewMode("flat")}
+            className={`text-[10px] font-medium px-2 py-0.5 rounded-full transition-colors ${
+              viewMode === "flat" ? "bg-white text-gray-800 shadow-sm" : "text-gray-500 hover:text-gray-700"
+            }`}
+          >
+            {t("taskBoard.viewFlat") || "列表"}
+          </button>
+        </div>
+
         {(["all", "running", "pending", "blocked", "completed", "failed"] as const).map(
           (status) => (
             <button
@@ -727,7 +819,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
         />
       )}
 
-      {/* Flat task list — task-title-centric */}
+      {/* Task list — topology or flat */}
       <div className="flex-1 overflow-y-auto divide-y divide-gray-100">
         {filteredTasks.length === 0 ? (
           <div className="text-center py-8">
@@ -735,6 +827,14 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
               {filterStatus === "all" ? "No tasks yet" : `No ${STATUS_LABELS[filterStatus]} tasks`}
             </p>
           </div>
+        ) : viewMode === "topology" ? (
+          <TaskTopology
+            tasks={filteredTasks}
+            artifacts={artifacts}
+            messages={taskMessages}
+            selectedTaskId={selectedTaskId}
+            onSelect={(taskId) => selectTask(selectedTaskId === taskId ? null : taskId)}
+          />
         ) : (
           filteredTasks.map((task) => (
             <TaskLeaf
@@ -743,6 +843,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
               isSelected={selectedTaskId === task.id}
               onSelect={() => selectTask(selectedTaskId === task.id ? null : task.id)}
               messages={taskMessages[task.id] ?? []}
+              artifacts={artifacts.filter((artifact) => artifact.task_id === task.id)}
               onSendMessage={(text) => handleSendMessage(task.id, text)}
               onRestart={() => handleRestart(task.id)}
               onUpdate={(patch) => handleUpdateTask(task.id, patch)}

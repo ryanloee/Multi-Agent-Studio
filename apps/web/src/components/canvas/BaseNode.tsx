@@ -5,6 +5,7 @@ import { NODE_META, STATUS_COLORS } from "@/lib/constants";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import type { StreamEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
@@ -15,6 +16,7 @@ const COLOR_MAP: Record<string, string> = {
   green: "#22c55e",
   yellow: "#eab308",
   gray: "#6b7280",
+  teal: "#0d9488",
   purple: "#a855f7",
   orange: "#f97316",
 };
@@ -48,6 +50,15 @@ const ICON_MAP: Record<string, JSX.Element> = {
     <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2}>
       <polyline points="4 17 10 11 4 5" />
       <line x1="12" y1="19" x2="20" y2="19" />
+    </svg>
+  ),
+  GitMerge: (
+    <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2}>
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="6" cy="6" r="3" />
+      <circle cx="18" cy="18" r="3" />
+      <path d="M6 9v6" />
+      <path d="M9 6c6 0 3 12 6 12" />
     </svg>
   ),
   FileCheck: (
@@ -140,12 +151,31 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
   const colorHex = COLOR_MAP[meta.color] ?? "#6b7280";
   const icon = ICON_MAP[meta.icon] ?? ICON_MAP.Code;
   const t = useLocaleStore((s) => s.t);
+  const defaultModel = useSettingsStore((s) => {
+    const models = s.settings.models;
+    return Array.isArray(models) && models.length > 0 ? models[0] : null;
+  });
+  const effectiveModel =
+    nodeData.modelId
+      ? (nodeData.modelProvider ? `${nodeData.modelProvider}/${nodeData.modelId}` : nodeData.modelId)
+      : defaultModel && nodeData.agentType !== "shell" && nodeData.agentType !== "human"
+        ? `${defaultModel.format}/${defaultModel.default_model || defaultModel.name}`
+        : "";
+  const modelIsDefault = Boolean(effectiveModel && !nodeData.modelId);
 
   // Read node run status from runStore
   const nodeStatus: RunStatus = useRunStore(
     (state) => state.nodeStatuses[id] ?? "idle"
   );
   const statusClasses = STATUS_COLORS[nodeStatus];
+  const nodeStatusClass =
+    nodeStatus === "running"
+      ? "mas-node-running"
+      : nodeStatus === "completed"
+        ? "mas-node-completed"
+        : nodeStatus === "failed"
+          ? "mas-node-failed"
+          : "";
 
   // Get node events to derive current action
   const allEvents = useRunStore((s) => s.events);
@@ -163,6 +193,14 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
   const taskMessages = useTaskStore((s) =>
     taskForNode ? (s.taskMessages[taskForNode.id] ?? EMPTY_TASK_MESSAGES) : EMPTY_TASK_MESSAGES
   );
+  const artifactCount = useTaskStore((s) =>
+    taskForNode ? s.artifacts.filter((artifact) => artifact.task_id === taskForNode.id).length : 0
+  );
+  const collaborationCount = taskMessages.filter((message) =>
+    message.message_type === "worker_question" ||
+    message.message_type === "planner_question" ||
+    message.message_type === "planner_answer"
+  ).length;
   const lastTaskMessage = taskMessages[taskMessages.length - 1];
   const detailText =
     (lastTaskMessage?.content && truncate(lastTaskMessage.content)) ||
@@ -173,7 +211,8 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
   return (
     <div
       className={[
-        "relative rounded-md border bg-white shadow-sm transition-shadow overflow-hidden",
+        "mas-node-shell relative rounded-md border bg-white shadow-sm transition-shadow overflow-hidden",
+        nodeStatusClass,
         selected ? "ring-2 ring-blue-500" : "",
       ].join(" ")}
       style={{ width: 260 }}
@@ -198,6 +237,11 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
           <span className="block text-[10px] uppercase tracking-wide text-gray-400">
             {nodeData.agentType}
           </span>
+          {effectiveModel && (
+            <span className="block text-[10px] text-gray-500 truncate">
+              模型: {effectiveModel}{modelIsDefault ? " (默认)" : ""}
+            </span>
+          )}
         </div>
       </div>
 
@@ -274,6 +318,12 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
               <span className="shrink-0 font-mono text-gray-400">
                 {taskForNode.progress ?? 0}%
               </span>
+            </div>
+          )}
+          {taskForNode && (artifactCount > 0 || collaborationCount > 0) && (
+            <div className="mb-1 flex items-center gap-2 text-[10px] text-gray-500">
+              {artifactCount > 0 && <span>{artifactCount} artifacts</span>}
+              {collaborationCount > 0 && <span>{collaborationCount} messages</span>}
             </div>
           )}
           {detailText && (

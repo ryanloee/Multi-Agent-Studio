@@ -9,7 +9,6 @@ import {
   Globe,
   Check,
   Target,
-  PenLine,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -33,7 +32,8 @@ export default function Toolbar({
 }: ToolbarProps) {
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
-  const mode = useWorkflowStore((s) => s.mode);
+  const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
+  const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
 
   const runId = useRunStore((s) => s.runId);
   const status = useRunStore((s) => s.status);
@@ -51,6 +51,7 @@ export default function Toolbar({
 
   const isRunning = status === "running";
   const isPaused = status === "paused";
+  const hasWorkspaceDirectory = workspaceDirectory.trim().length > 0;
 
   const STATUS_LABELS: Record<RunStatus, string> = {
     idle: t("toolbar.status.idle"),
@@ -67,7 +68,12 @@ export default function Toolbar({
     setSaving(true);
     setSaved(false);
     try {
-      await api.updateWorkflow(workflowId, { name: workflowName, nodes, edges });
+      await api.updateWorkflow(workflowId, {
+        name: workflowName,
+        nodes,
+        edges,
+        metadata: { auto_child_model_map: autoChildModelMap },
+      });
       setSaved(true);
       onSave?.();
       setTimeout(() => setSaved(false), 2000);
@@ -76,11 +82,15 @@ export default function Toolbar({
     } finally {
       setSaving(false);
     }
-  }, [workflowId, workflowName, nodes, edges, onSave]);
+  }, [workflowId, workflowName, nodes, edges, autoChildModelMap, onSave]);
 
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
 
   const handleRun = useCallback(async () => {
+    if (!hasWorkspaceDirectory) {
+      window.alert("请先设置工作目录后再启动工作流。");
+      return;
+    }
     setTriggering(true);
     try {
       clearEvents();
@@ -92,11 +102,12 @@ export default function Toolbar({
       loadWorkflow(updated);
     } catch (err) {
       console.error("Run trigger failed:", err);
-      setStatus("failed");
+      window.alert(err instanceof Error ? err.message : "启动工作流失败");
+      setStatus("idle");
     } finally {
       setTriggering(false);
     }
-  }, [workflowId, clearEvents, setRunId, setStatus, loadWorkflow]);
+  }, [workflowId, clearEvents, setRunId, setStatus, loadWorkflow, hasWorkspaceDirectory]);
 
   const handleCancel = useCallback(async () => {
     if (!runId) return;
@@ -177,14 +188,9 @@ export default function Toolbar({
           </button>
         )}
 
-        {/* Mode badge (read-only, set at creation time) */}
-        <div className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none ${
-          mode === "auto"
-            ? "bg-blue-100 text-blue-700"
-            : "bg-gray-100 text-gray-600"
-        }`}>
-          {mode === "auto" ? <Target size={12} /> : <PenLine size={12} />}
-          {mode === "auto" ? t("workflow.modeAuto") : t("workflow.modeManual")}
+        <div className="flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none bg-blue-100 text-blue-700">
+          <Target size={12} />
+          {t("workflow.modeAuto")}
         </div>
       </div>
 
@@ -225,7 +231,7 @@ export default function Toolbar({
             onClick={handleRun}
             disabled={triggering || nodes.length === 0}
             className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700 transition-all shadow-sm disabled:opacity-50"
-            title={t("toolbar.runShortcut")}
+            title={hasWorkspaceDirectory ? t("toolbar.runShortcut") : "请先设置工作目录"}
           >
             {triggering ? (
               <Loader2 size={14} className="animate-spin" />

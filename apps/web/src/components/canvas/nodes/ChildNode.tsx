@@ -12,6 +12,7 @@ import type { RunStatus } from "@/types/workflow";
 const TYPE_COLORS: Record<string, { bg: string; text: string; border: string }> = {
   coder:   { bg: "bg-blue-50",  text: "text-blue-600",  border: "border-blue-200" },
   explore: { bg: "bg-amber-50", text: "text-amber-600", border: "border-amber-200" },
+  merge:   { bg: "bg-teal-50",  text: "text-teal-600",  border: "border-teal-200" },
   shell:   { bg: "bg-gray-100", text: "text-gray-600",  border: "border-gray-200" },
   review:  { bg: "bg-purple-50", text: "text-purple-600", border: "border-purple-200" },
 };

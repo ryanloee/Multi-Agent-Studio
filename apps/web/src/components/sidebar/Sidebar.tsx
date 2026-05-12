@@ -39,6 +39,15 @@ const ICON_MAP: Record<string, JSX.Element> = {
       <line x1="16" y1="17" x2="8" y2="17" />
     </svg>
   ),
+  GitMerge: (
+    <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2}>
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="6" cy="6" r="3" />
+      <circle cx="18" cy="18" r="3" />
+      <path d="M6 9v6" />
+      <path d="M9 6c6 0 3 12 6 12" />
+    </svg>
+  ),
   User: (
     <svg viewBox="0 0 24 24" className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2}>
       <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
@@ -54,9 +63,10 @@ const COLOR_MAP: Record<string, { bg: string; text: string; border: string }> = 
   gray: { bg: "bg-gray-50", text: "text-gray-600", border: "border-gray-200" },
   purple: { bg: "bg-purple-50", text: "text-purple-600", border: "border-purple-200" },
   orange: { bg: "bg-orange-50", text: "text-orange-600", border: "border-orange-200" },
+  teal: { bg: "bg-teal-50", text: "text-teal-600", border: "border-teal-200" },
 };
 
-const NODE_ORDER: AgentNodeType[] = ["coder", "plan", "explore", "shell", "review", "human"];
+const NODE_ORDER: AgentNodeType[] = ["coder", "plan", "explore", "merge", "shell", "review", "human"];
 
 export default function Sidebar() {
   const t = useLocaleStore((s) => s.t);

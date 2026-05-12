@@ -1,13 +1,14 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Send, Bot, User, Play, Loader2, Target } from "lucide-react";
+import { Send, Bot, User, Play, Loader2, Target, Brain } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { api } from "@/lib/api";
 import { authHeaders } from "@/lib/auth";
+import { parsePlannerObservableContent } from "@/lib/plannerObservable";
 import MarkdownMessage from "@/components/common/MarkdownMessage";
 import type { EdgeData } from "@/types/workflow";
 
@@ -47,6 +48,7 @@ const NODE_STYLES: Record<string, { bg: string; border: string; text: string; la
   plan:    { bg: "bg-purple-50",  border: "border-purple-300", text: "text-purple-700", label: "规划器" },
   coder:   { bg: "bg-blue-50",    border: "border-blue-300",   text: "text-blue-700",   label: "编码器" },
   explore: { bg: "bg-green-50",   border: "border-green-300", text: "text-green-700",  label: "探索器" },
+  merge:   { bg: "bg-teal-50",    border: "border-teal-300",  text: "text-teal-700",   label: "合并器" },
   review:  { bg: "bg-amber-50",   border: "border-amber-300",  text: "text-amber-700", label: "审查器" },
   shell:   { bg: "bg-gray-50",    border: "border-gray-300",   text: "text-gray-700",  label: "执行器" },
   human:   { bg: "bg-rose-50",    border: "border-rose-300",  text: "text-rose-700",   label: "人工" },
@@ -97,6 +99,7 @@ function dagPosition(nodeId: string, dag: DagData, fallbackIndex: number): { x: 
 
 export default function PlannerChat() {
   const currentWorkflowId = useWorkflowStore((s) => s.currentWorkflowId);
+  const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
   const goal = useWorkflowStore((s) => s.goal);
   const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
   const nodes = useWorkflowStore((s) => s.nodes);
@@ -106,14 +109,25 @@ export default function PlannerChat() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
+  const [waitingSeconds, setWaitingSeconds] = useState(0);
+  const [streamingChars, setStreamingChars] = useState(0);
+  const [dagUpdateCount, setDagUpdateCount] = useState(0);
+  const [observableTrace, setObservableTrace] = useState<string[]>([]);
   const [currentDag, setCurrentDag] = useState<DagData | null>(null);
   const [plannerReady, setPlannerReady] = useState(false);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const triggerRun = useCallback(async () => {
-    if (!currentWorkflowId) return;
+  const triggerRun = useCallback(async (): Promise<boolean> => {
+    if (!currentWorkflowId) return false;
+    if (!workspaceDirectory.trim()) {
+      setMessages((prev) => [
+        ...prev,
+        { role: "assistant", content: "未设置工作目录，不能开始执行。请先在工作流配置里设置项目目录。" },
+      ]);
+      return false;
+    }
 
     const runStore = useRunStore.getState();
     const taskStore = useTaskStore.getState();
@@ -132,7 +146,8 @@ export default function PlannerChat() {
 
     const updated = await api.getWorkflow(currentWorkflowId);
     useWorkflowStore.getState().loadWorkflow(updated);
-  }, [currentWorkflowId]);
+    return true;
+  }, [currentWorkflowId, workspaceDirectory]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -140,6 +155,18 @@ export default function PlannerChat() {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
   }, [messages]);
+
+  useEffect(() => {
+    if (!streaming) {
+      setWaitingSeconds(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = setInterval(() => {
+      setWaitingSeconds(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [streaming]);
 
   // Send initial goal as first message if goal is set
   const handleStartConversation = useCallback(() => {
@@ -157,6 +184,9 @@ export default function PlannerChat() {
     setMessages((prev) => [...prev, userMsg]);
     setInput("");
     setStreaming(true);
+    setStreamingChars(0);
+    setDagUpdateCount(0);
+    setObservableTrace([]);
 
     // Build history for the API
     const history = messages.map((m) => ({
@@ -220,18 +250,22 @@ export default function PlannerChat() {
 
             if (event.type === "text") {
               assistantContent += event.content;
+              setStreamingChars(assistantContent.length);
+              const parsed = parsePlannerObservableContent(assistantContent);
+              setObservableTrace(parsed.traceLines);
               // Update the last assistant message
               setMessages((prev) => {
                 const updated = [...prev];
                 if (updated.length > 0 && updated[updated.length - 1].role === "assistant") {
                   updated[updated.length - 1] = {
                     ...updated[updated.length - 1],
-                    content: assistantContent,
+                    content: parsed.visibleContent,
                   };
                 }
                 return updated;
               });
             } else if (event.type === "dag_update") {
+              setDagUpdateCount((count) => count + 1);
               const dag = event.dag as DagData;
               latestDag = dag;
               setCurrentDag(dag);
@@ -260,11 +294,13 @@ export default function PlannerChat() {
 
       if (isExecutionRequest(text)) {
         try {
-          await triggerRun();
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: "已开始执行工作流，任务面板会显示各节点任务。" },
-          ]);
+          const started = await triggerRun();
+          if (started) {
+            setMessages((prev) => [
+              ...prev,
+              { role: "assistant", content: "已开始执行工作流，任务面板会显示各节点任务。" },
+            ]);
+          }
         } catch (err) {
           setMessages((prev) => [
             ...prev,
@@ -286,10 +322,17 @@ export default function PlannerChat() {
   // Sync the DAG from Planner to the workflow store so it can be executed
   const syncDagToStore = useCallback((dag: DagData) => {
     const store = useWorkflowStore.getState();
+    const autoChildModelMap = store.autoChildModelMap ?? {};
     // Clear existing dynamic nodes (keep only user-created ones)
     // For auto mode, all nodes are planner-created
+    const existingById = new Map(store.nodes.map((node) => [node.id, node]));
     const workflowNodes = dag.nodes.map((n, idx) => {
       const style = NODE_STYLES[n.type] || NODE_STYLES.coder;
+      const existing = existingById.get(n.id);
+      const strategyModel = autoChildModelMap[n.type as keyof typeof autoChildModelMap] || "";
+      const modelParts = strategyModel.split("/", 2);
+      const strategyProvider = modelParts.length > 1 ? modelParts[0] : "";
+      const strategyModelId = modelParts.length > 1 ? modelParts[1] : strategyModel;
       return {
         id: n.id,
         type: n.type,
@@ -297,8 +340,8 @@ export default function PlannerChat() {
         data: {
           label: n.label || style.label,
           agentType: n.type,
-          modelProvider: "",
-          modelId: "",
+          modelProvider: existing?.data?.modelProvider || strategyProvider,
+          modelId: existing?.data?.modelId || strategyModelId,
           prompt: n.prompt || "",
           permissions: {},
           command: "",
@@ -407,7 +450,10 @@ export default function PlannerChat() {
               }`}
             >
               {/* Render text content */}
-              <MarkdownMessage content={msg.content} inverted={msg.role === "user"} />
+              <MarkdownMessage
+                content={msg.role === "assistant" ? parsePlannerObservableContent(msg.content).visibleContent : msg.content}
+                inverted={msg.role === "user"}
+              />
 
               {/* Render DAG preview */}
               {msg.dag && (
@@ -422,14 +468,55 @@ export default function PlannerChat() {
           </div>
         ))}
 
-        {/* Streaming indicator */}
-        {streaming && (
+        {streaming && messages[messages.length - 1]?.role !== "assistant" && (
           <div className="flex gap-3">
             <div className="w-8 h-8 rounded-lg bg-blue-100 flex items-center justify-center shrink-0">
               <Bot size={16} className="text-blue-600" />
             </div>
-            <div className="bg-gray-50 rounded-2xl px-4 py-3 border border-gray-100">
-              <Loader2 size={16} className="animate-spin text-blue-500" />
+            <div className="bg-gray-50 rounded-2xl px-4 py-3 border border-gray-100 text-sm text-gray-500">
+              <div>
+                <Loader2 size={16} className="animate-spin text-blue-500 inline mr-2" />
+                Planner 正在思考和规划，已等待 {waitingSeconds}s
+              </div>
+              <div className="mt-3 rounded-xl border border-blue-100 bg-blue-50/70 px-3 py-2 text-xs text-blue-900">
+                <div className="font-medium text-blue-700">规划轨迹</div>
+                <div className="mt-1 space-y-1 leading-relaxed">
+                  {observableTrace.length > 0 ? (
+                    observableTrace.map((line, index) => (
+                      <div key={`${index}-${line}`}>- {line}</div>
+                    ))
+                  ) : (
+                    <div>正在等待模型输出本轮规划轨迹。</div>
+                  )}
+                  <div>已接收模型可见输出：{streamingChars} 字。</div>
+                  <div>DAG 更新事件：{dagUpdateCount} 次。</div>
+                  {currentDag && <div>当前候选 DAG：{currentDag.nodes.length} 个节点，{currentDag.edges.length} 条连线。</div>}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {streaming && messages[messages.length - 1]?.role === "assistant" && messages[messages.length - 1]?.content === "" && (
+          <div className="ml-11 rounded-lg border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-700">
+            <div className="flex items-center gap-2">
+              <Brain size={13} />
+              <Loader2 size={12} className="animate-spin" />
+              Planner 正在思考和组织方案，已等待 {waitingSeconds}s
+            </div>
+            <div className="mt-2 rounded-lg border border-blue-200 bg-white/70 px-3 py-2 text-[11px] leading-relaxed">
+              <div className="font-medium text-blue-700">规划轨迹</div>
+              <div className="mt-1 space-y-1">
+                {observableTrace.length > 0 ? (
+                  observableTrace.map((line, index) => (
+                    <div key={`${index}-${line}`}>- {line}</div>
+                  ))
+                ) : (
+                  <div>正在等待模型输出本轮规划轨迹。</div>
+                )}
+                <div>已接收模型可见输出：{streamingChars} 字。</div>
+                <div>DAG 更新事件：{dagUpdateCount} 次。</div>
+                {currentDag && <div>当前候选 DAG：{currentDag.nodes.length} 个节点，{currentDag.edges.length} 条连线。</div>}
+              </div>
             </div>
           </div>
         )}

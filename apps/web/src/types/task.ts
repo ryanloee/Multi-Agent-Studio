@@ -11,8 +11,33 @@ export interface Task {
   assigned_worker_label: string | null;
   progress: number;
   result_summary: string;
+  dependencies?: string;
   created_at: string;
   updated_at: string;
+}
+
+export type ArtifactType =
+  | "file_change"
+  | "research_note"
+  | "test_result"
+  | "review_report"
+  | "merge_report"
+  | "decision"
+  | "final_output";
+
+export interface Artifact {
+  id: string;
+  run_id: string;
+  workflow_id: string;
+  task_id: string | null;
+  node_id: string | null;
+  type: ArtifactType;
+  title: string;
+  content: string;
+  metadata: Record<string, unknown>;
+  metadata_json?: Record<string, unknown> | null;
+  created_by: string;
+  created_at: string;
 }
 
 export type TaskStatus =
@@ -34,8 +59,15 @@ export interface TaskMessage {
     | "answer"
     | "escalation"
     | "update"
-    | "user_edit";
+    | "user_edit"
+    | "worker_question"
+    | "worker_answer"
+    | "planner_question"
+    | "planner_answer"
+    | "artifact_created";
   content: string;
+  target_node_id?: string | null;
+  artifact_id?: string | null;
   created_at: string;
 }
 

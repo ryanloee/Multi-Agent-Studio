@@ -56,10 +56,10 @@ def _register_real_tools():
     ToolRegistry.register(_StubTool("grep"))
 
     # Restricted tools — matching the real registration
-    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["plan", "coder", "review", "shell"]))
-    ToolRegistry.register(_StubTool("write", allowed_agent_types=["plan", "coder", "shell"]))
-    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["plan", "coder", "shell"]))
-    ToolRegistry.register(_StubTool("apply_patch", allowed_agent_types=["plan", "coder"]))
+    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["plan", "coder", "merge", "review", "shell"]))
+    ToolRegistry.register(_StubTool("write", allowed_agent_types=["plan", "coder", "merge", "shell"]))
+    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["plan", "coder", "merge", "shell"]))
+    ToolRegistry.register(_StubTool("apply_patch", allowed_agent_types=["plan", "coder", "merge"]))
 
 
 # ===========================================================================
@@ -308,6 +308,15 @@ class TestValidateExecution:
             assert not any("Permission denied" in w for w in warnings)
             assert len(warnings) == 0, f"coder write {path} got warnings: {warnings}"
 
+    def test_merge_full_access(self):
+        """Merge should be able to use integration-oriented tools without coarse denial."""
+        _register_real_tools()
+        for tool_name in ("edit", "write", "shell", "read", "glob", "grep", "apply_patch"):
+            warnings = ToolRegistry.validate_execution("merge", tool_name, {"path": "/workspace/test.py"})
+            assert not any("Permission denied" in w for w in warnings), (
+                f"merge should use {tool_name}"
+            )
+
     # ------------------------------------------------------------------
     # Unknown tool
     # ------------------------------------------------------------------
@@ -322,7 +331,7 @@ class TestValidateExecution:
     def test_unknown_tool_any_agent(self):
         """Unknown tool returns error regardless of agent type."""
         _register_real_tools()
-        for agent_type in ("coder", "explore", "plan", "review", "shell", "human"):
+        for agent_type in ("coder", "explore", "merge", "plan", "review", "shell", "human"):
             warnings = ToolRegistry.validate_execution(agent_type, "nonexistent", {})
             assert len(warnings) > 0
             assert "Unknown tool" in warnings[0]

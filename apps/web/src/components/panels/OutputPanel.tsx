@@ -4,6 +4,8 @@ import { useState, useCallback, useMemo, useEffect, useRef } from "react";
 import {
   PanelBottomOpen,
   PanelBottomClose,
+  Maximize2,
+  Minimize2,
   Brain,
   Terminal,
   Wrench,
@@ -11,6 +13,7 @@ import {
   X,
   MessageSquare,
   MessageCircle,
+  ListTree,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -22,6 +25,7 @@ import XtermStream from "./XtermStream";
 import ToolCallList from "./ToolCallList";
 import CommunicationPanel from "./CommunicationPanel";
 import PlannerChatTab from "./PlannerChatTab";
+import TimelinePanel from "./TimelinePanel";
 
 // ---------------------------------------------------------------------------
 // Tab definitions — Chat tab is added dynamically when in auto mode
@@ -31,11 +35,12 @@ const BASE_TABS = [
   { key: "shell", labelKey: "output.tab.shell", icon: Terminal },
   { key: "tools", labelKey: "output.tab.tools", icon: Wrench },
   { key: "comm", labelKey: "output.tab.comm", icon: MessageSquare },
+  { key: "timeline", labelKey: "output.tab.timeline", icon: ListTree },
 ] as const;
 
 const CHAT_TAB = { key: "chat", labelKey: "output.tab.chat", icon: MessageCircle } as const;
 
-type TabKey = "llm" | "shell" | "tools" | "comm" | "chat";
+type TabKey = "llm" | "shell" | "tools" | "comm" | "timeline" | "chat";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -78,6 +83,7 @@ function StatusDot({ status }: { status: RunStatus }) {
 // ---------------------------------------------------------------------------
 export default function OutputPanel() {
   const [expanded, setExpanded] = useState(false);
+  const [fullscreen, setFullscreen] = useState(false);
   const [activeTab, setActiveTab] = useState<TabKey>("shell");
   const autoExpandedRef = useRef(false);
 
@@ -155,12 +161,33 @@ export default function OutputPanel() {
   );
 
   const toggleExpanded = useCallback(() => setExpanded((v) => !v), []);
+  const toggleFullscreen = useCallback(() => {
+    setFullscreen((value) => {
+      if (!value) {
+        setExpanded(true);
+      }
+      return !value;
+    });
+  }, []);
 
   const handleTabChange = useCallback((tab: TabKey) => {
     setActiveTab(tab);
     // Auto-expand when switching tabs
     setExpanded(true);
   }, []);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setFullscreen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [fullscreen]);
 
   const handleNodeFilter = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -169,7 +196,7 @@ export default function OutputPanel() {
     []
   );
 
-  const panelHeight = expanded ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
+  const panelHeight = fullscreen ? undefined : expanded ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT;
 
   // Derive info for the selected run node header
   const runNode = useMemo(() => {
@@ -185,8 +212,12 @@ export default function OutputPanel() {
 
   return (
     <div
-      className={`w-full border-t border-gray-200 flex flex-col transition-[height] duration-200 ease-in-out overflow-hidden ${activeTab === "shell" && expanded ? "bg-[#1e1e1e]" : "bg-white"}`}
-      style={{ height: panelHeight }}
+      className={`w-full border-t border-gray-200 flex flex-col overflow-hidden ${
+        fullscreen
+          ? "fixed inset-0 z-[80] border-0 shadow-2xl"
+          : "transition-[height] duration-200 ease-in-out"
+      } ${activeTab === "shell" && expanded ? "bg-[#1e1e1e]" : "bg-white"}`}
+      style={panelHeight ? { height: panelHeight } : undefined}
     >
       {/* ---- Header bar (always visible) ---- */}
       <div className="flex items-center h-9 shrink-0 border-b border-gray-100 px-2 gap-1">
@@ -234,9 +265,25 @@ export default function OutputPanel() {
           </select>
         </div>
 
+        <button
+          onClick={toggleFullscreen}
+          className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
+          aria-label={fullscreen ? t("output.exitFullscreen") : t("output.fullscreen")}
+          title={fullscreen ? t("output.exitFullscreen") : t("output.fullscreen")}
+        >
+          {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+        </button>
+
         {/* Collapse / expand toggle */}
         <button
-          onClick={toggleExpanded}
+          onClick={() => {
+            if (fullscreen && expanded) {
+              setFullscreen(false);
+              setExpanded(false);
+              return;
+            }
+            toggleExpanded();
+          }}
           className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
           aria-label={expanded ? t("output.collapse") : t("output.expand")}
         >
@@ -286,6 +333,7 @@ export default function OutputPanel() {
             {activeTab === "shell" && <XtermStream nodeId={filterNodeId} />}
             {activeTab === "tools" && <ToolCallList nodeId={filterNodeId} />}
             {activeTab === "comm" && <CommunicationPanel nodeId={filterNodeId} />}
+            {activeTab === "timeline" && <TimelinePanel nodeId={filterNodeId} />}
             {activeTab === "chat" && <PlannerChatTab />}
           </div>
         </>

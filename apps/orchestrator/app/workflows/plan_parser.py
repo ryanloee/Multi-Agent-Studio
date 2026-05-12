@@ -15,27 +15,53 @@ logger = logging.getLogger(__name__)
 
 PLAN_SYSTEM_SUFFIX = """
 
-When your analysis is complete, output a JSON plan in this exact format at the end:
+You are the high-level orchestrator for a white-box multi-agent system. Your job is to understand the goal, decompose it into a precise DAG, assign independently executable work to workers, and make the resulting execution observable.
+
+When your analysis is complete, output a Markdown explanation followed by a JSON DAG in this exact format at the end:
 ```json
 {
   "tasks": [
     {
-      "id": "step_1",
-      "type": "coder",
-      "prompt": "Detailed task description",
+      "id": "step_1_explore_structure",
+      "type": "explore",
+      "prompt": "Search the codebase for X. Focus on: 1) file paths 2) key function signatures 3) existing patterns. Report all findings with file paths.",
       "depends_on": []
     },
     {
-      "id": "step_2",
+      "id": "step_2_implement_feature",
+      "type": "coder",
+      "prompt": "Based on exploration results, implement Y. Requirements:\\n1. Specific requirement\\n2. Another requirement\\n3. Error handling\\n\\nAcceptance criteria: X works correctly when Y.",
+      "depends_on": ["step_1_explore_structure"]
+    },
+    {
+      "id": "step_3_review",
       "type": "review",
-      "prompt": "Review the code",
-      "depends_on": ["step_1"]
+      "prompt": "Review the implementation for: 1) correctness 2) edge cases 3) code style. List issues found with severity.",
+      "depends_on": ["step_2_implement_feature"]
     }
   ]
 }
 ```
-Each task must have: "id" (unique string identifier like "step_1"), "type" (coder/explore/review/shell), "prompt" (what the agent should do).
+
+## Task decomposition principles:
+- **Single responsibility**: Each task should focus on ONE specific operation
+- **Specify target files**: Include target file paths in the prompt when possible
+- **Numbered requirements**: List implementation steps as numbered items
+- **Acceptance criteria**: Each prompt should state how to verify completion
+- **Avoid large tasks**: Split "implement feature X" into explore → implement → review → test
+- **15-30 tasks**: Create enough fine-grained tasks for the project complexity
+
+Each task must have: "id" (unique descriptive string like "step_1_explore_auth"), "type" (coder/explore/review/shell), "prompt" (detailed description with context, requirements, and acceptance criteria).
 Optional: "depends_on" (list of task ID strings that must complete first).
+
+## Orchestrator requirements:
+- Parallelize independent tasks by leaving their "depends_on" empty or pointing only to real prerequisites.
+- Do not create coarse tasks such as "develop frontend", "implement backend", "fix all bugs", or "write tests". Split them into file/module-level tasks a worker can complete independently.
+- Every worker prompt must include: goal, context, inputs, ordered steps, output format, acceptance criteria, boundaries, escalation rules, peer collaboration rules, and artifact requirements.
+- Workers may consult the planner by outputting `ESCALATE_TO_PLANNER: <question>`. Tell them to use this only for blockers or scope decisions.
+- Workers may collaborate with related DAG peers by outputting `ASK_WORKER: <target_node_id>: <question>` or `BROADCAST_TO_PEERS: <message>`. Restrict this to direct upstream, direct downstream, or same-layer parallel peers unless the prompt explicitly authorizes broader communication.
+- Every worker must produce an artifact summary. Use file_change for coder tasks, research_note for explore tasks, review_report for review tasks, test_result for shell/test tasks, decision for key decisions, and final_output for final delivery.
+- Hidden reasoning is not an artifact. Ask workers to report observable findings, commands, files, diffs, decisions, and results.
 
 Alternatively, use todowrite to list your planned tasks — each todo item will be treated as a child task.
 """
@@ -196,6 +222,8 @@ def parse_todowrite_tasks(raw_output: str) -> list[dict]:
 def _infer_task_type(content: str) -> str:
     """Infer the agent type from a task description."""
     lower = content.lower()
+    if any(kw in lower for kw in ("merge", "integrate", "conflict", "resolve conflict", "合并", "冲突", "集成")):
+        return "merge"
     if any(kw in lower for kw in ("search", "find", "explore", "look for", "investigate", "查找", "搜索")):
         return "explore"
     if any(kw in lower for kw in ("review", "check", "verify", "test", "审计", "检查", "验证")):
@@ -328,7 +356,7 @@ def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
 
 def _validate_tasks(tasks: list) -> list[dict]:
     """Validate and normalize task definitions."""
-    valid_types = {"coder", "explore", "review", "shell", "build", "plan"}
+    valid_types = {"coder", "explore", "merge", "review", "shell", "build", "plan"}
     result = []
     for task in tasks:
         if not isinstance(task, dict):

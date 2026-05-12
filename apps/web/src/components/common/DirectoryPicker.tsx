@@ -126,28 +126,7 @@ export default function DirectoryPicker({
   // Native dialogs may work on desktop Linux with DISPLAY. If they do not,
   // fall back to a server-side directory browser that returns absolute paths.
   const handleBrowse = useCallback(async () => {
-    setBrowsing(true);
-    try {
-      const resp = await fetch(`${apiBase}/settings/browse-dir`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ current_path: value || "" }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        if (data.path) {
-          onChange(data.path);
-          validatePath(data.path);
-          setBrowsing(false);
-          return;
-        }
-      }
-    } catch {
-      // Fall through to the server-side browser.
-    }
-
-    setBrowsing(false);
-    await loadServerDirectory(value || "~");
+    await loadServerDirectory(value || "/");
   }, [apiBase, value, onChange, validatePath, loadServerDirectory]);
 
   const selectBrowserPath = useCallback(() => {

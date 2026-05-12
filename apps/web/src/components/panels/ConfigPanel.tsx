@@ -7,20 +7,20 @@ import {
   Search,
   Terminal,
   FileCheck,
+  GitMerge,
   User,
   X,
-  Trash2,
   Settings,
   FolderOpen,
   ArrowRight,
   Target,
-  PenLine,
   type LucideProps,
 } from "lucide-react";
-import type { AgentNodeType, EdgeData, WorkflowNode, WorkflowEdge } from "@/types/workflow";
+import type { AgentNodeType, EdgeData, WorkflowNode, WorkflowEdge, WorkerAgentType } from "@/types/workflow";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { NODE_META } from "@/lib/constants";
 import ModelSelector from "./ModelSelector";
 import PromptEditor from "./PromptEditor";
@@ -29,7 +29,7 @@ import CommandEditor from "./CommandEditor";
 import DirectoryPicker from "@/components/common/DirectoryPicker";
 
 const ICON_MAP: Record<string, ComponentType<LucideProps>> = {
-  Code, Map, Search, Terminal, FileCheck, User,
+  Code, Map, Search, Terminal, FileCheck, GitMerge, User,
 };
 
 const COLOR_MAP: Record<string, { bg: string; text: string }> = {
@@ -39,6 +39,7 @@ const COLOR_MAP: Record<string, { bg: string; text: string }> = {
   gray: { bg: "bg-gray-100", text: "text-gray-500" },
   purple: { bg: "bg-purple-50", text: "text-purple-500" },
   orange: { bg: "bg-orange-50", text: "text-orange-500" },
+  teal: { bg: "bg-teal-50", text: "text-teal-500" },
 };
 
 interface FeatureFlags {
@@ -54,10 +55,13 @@ const FEATURES: Record<AgentNodeType, FeatureFlags> = {
   coder:   { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
   plan:    { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
   explore: { agentType: true,  model: true,  prompt: true,  permissions: false, command: false, description: false },
+  merge:   { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
   shell:   { agentType: false, model: false, prompt: false, permissions: false, command: true,  description: false },
   review:  { agentType: true,  model: true,  prompt: true,  permissions: false, command: false, description: false },
   human:   { agentType: false, model: false, prompt: false, permissions: false, command: false, description: true  },
 };
+
+const CHILD_MODEL_TYPES: WorkerAgentType[] = ["explore", "coder", "merge", "review", "shell"];
 
 export default function ConfigPanel() {
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
@@ -66,7 +70,6 @@ export default function ConfigPanel() {
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const updateNodeData = useWorkflowStore((s) => s.updateNodeData);
   const updateEdgeData = useWorkflowStore((s) => s.updateEdgeData);
-  const removeNode = useWorkflowStore((s) => s.removeNode);
   const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
   const setSelectedEdge = useWorkflowStore((s) => s.setSelectedEdge);
   const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
@@ -74,7 +77,13 @@ export default function ConfigPanel() {
   const mode = useWorkflowStore((s) => s.mode);
   const goal = useWorkflowStore((s) => s.goal);
   const updateGoal = useWorkflowStore((s) => s.updateGoal);
+  const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
+  const updateAutoChildModelMap = useWorkflowStore((s) => s.updateAutoChildModelMap);
   const t = useLocaleStore((s) => s.t);
+  const defaultModel = useSettingsStore((s) => {
+    const models = s.settings.models;
+    return Array.isArray(models) && models.length > 0 ? models[0] : null;
+  });
 
   // Local state for workspace directory input (allows debounced saving)
   const [localDir, setLocalDir] = useState(workspaceDirectory);
@@ -100,11 +109,6 @@ export default function ConfigPanel() {
     setSelectedNode(null);
     setSelectedEdge(null);
   }, [setSelectedNode, setSelectedEdge]);
-  const handleDelete = useCallback(() => {
-    if (selectedNodeId) {
-      removeNode(selectedNodeId);
-    }
-  }, [selectedNodeId, removeNode]);
 
   // Derived node data
   const data = node?.data;
@@ -157,15 +161,6 @@ export default function ConfigPanel() {
                 {t(`node.${nodeType}.description`)}
               </span>
             </div>
-            {mode !== "auto" && (
-              <button
-                onClick={handleDelete}
-                className="p-1.5 rounded-lg hover:bg-red-50 text-gray-400 hover:text-red-500 transition-colors"
-                aria-label={t("config.deleteNode")}
-              >
-                <Trash2 size={16} />
-              </button>
-            )}
           </div>
 
           {/* Body */}
@@ -199,28 +194,44 @@ export default function ConfigPanel() {
 
             {/* Model */}
             {features.model && (
-              <ModelSelector
-                value={data.modelProvider && data.modelId ? `${data.modelProvider}/${data.modelId}` : ""}
-                onChange={(fullId) => {
-                  // The value from ModelSelector is "format/base_url/model_name"
-                  // We only store format as modelProvider and model_name as modelId
-                  // The base_url and api_key are resolved from settings at runtime
-                  const parts = fullId.split("/");
-                  if (parts.length >= 3) {
-                    updateNodeData(node.id, {
-                      modelProvider: parts[0],
-                      modelId: parts.slice(2).join("/"),
-                    });
-                  } else if (parts.length === 2) {
-                    updateNodeData(node.id, {
-                      modelProvider: parts[0],
-                      modelId: parts[1],
-                    });
-                  } else {
-                    updateNodeData(node.id, { modelProvider: "", modelId: fullId });
+              <div className="space-y-1">
+                <ModelSelector
+                  value={
+                    data.modelProvider && data.modelId
+                      ? `${data.modelProvider}/${data.modelId}`
+                      : defaultModel
+                        ? `${defaultModel.format}/${defaultModel.default_model || defaultModel.name}`
+                        : ""
                   }
-                }}
-                disabled={mode === "auto"}
+                  onChange={(fullId) => {
+                    // The value from ModelSelector is "format/model_name".
+                    // Base URL and API key are resolved from settings at runtime.
+                    const parts = fullId.split("/");
+                    if (parts.length >= 2) {
+                      updateNodeData(node.id, {
+                        modelProvider: parts[0],
+                        modelId: parts.slice(1).join("/"),
+                      });
+                    } else {
+                      updateNodeData(node.id, { modelProvider: "", modelId: fullId });
+                    }
+                  }}
+                  disabled={false}
+                />
+                {!data.modelId && defaultModel && (
+                  <p className="text-[10px] text-gray-400">
+                    当前节点未单独指定模型，运行时使用默认模型。
+                  </p>
+                )}
+              </div>
+            )}
+
+            {nodeType === "plan" && (
+              <ChildModelStrategySection
+                autoChildModelMap={autoChildModelMap}
+                updateAutoChildModelMap={updateAutoChildModelMap}
+                defaultModel={defaultModel ? `${defaultModel.format}/${defaultModel.default_model || defaultModel.name}` : ""}
+                t={t}
               />
             )}
 
@@ -291,48 +302,89 @@ export default function ConfigPanel() {
             label={t("config.workspaceDirectory")}
           />
 
-          {/* Workflow Mode (read-only badge, set at creation time) */}
+          {/* Workflow Mode */}
           <div className="space-y-1.5">
             <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
               {t("config.workflowMode") || "工作流模式"}
             </label>
-            <div className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium ${
-              mode === "auto"
-                ? "bg-blue-100 text-blue-700"
-                : "bg-gray-100 text-gray-600"
-            }`}>
-              {mode === "auto" ? <Target size={12} /> : <PenLine size={12} />}
-              {mode === "auto" ? t("workflow.modeAuto") : t("workflow.modeManual")}
+            <div className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-blue-100 text-blue-700">
+              <Target size={12} />
+              {t("workflow.modeAuto")}
             </div>
             <p className="text-xs text-gray-400 mt-1">
-              {mode === "auto"
-                ? (t("config.modeAutoHint") || "自动模式：输入目标，Planner 自动规划并构建工作流 DAG")
-                : (t("config.modeManualHint") || "手动模式：在画布上拖拽节点、连线，自定义工作流")
-              }
+              {t("config.modeAutoHint") || "自动模式：输入目标，Planner 自动规划并构建工作流 DAG"}
             </p>
           </div>
 
-          {/* Goal input (auto mode only) */}
-          {mode === "auto" && (
-            <div className="space-y-1.5">
-              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
-                {t("workflow.goalLabel")}
-              </label>
-              <textarea
-                value={goal}
-                onChange={(e) => updateGoal(e.target.value)}
-                placeholder={t("workflow.goalPlaceholder")}
-                rows={4}
-                className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
-              />
-            </div>
-          )}
+          <div className="space-y-1.5">
+            <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+              {t("workflow.goalLabel")}
+            </label>
+            <textarea
+              value={goal}
+              onChange={(e) => updateGoal(e.target.value)}
+              placeholder={t("workflow.goalPlaceholder")}
+              rows={4}
+              className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-sm text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all"
+            />
+          </div>
+
+          <ChildModelStrategySection
+            autoChildModelMap={autoChildModelMap}
+            updateAutoChildModelMap={updateAutoChildModelMap}
+            defaultModel={defaultModel ? `${defaultModel.format}/${defaultModel.default_model || defaultModel.name}` : ""}
+            t={t}
+          />
 
           <p className="text-xs text-gray-400 text-center mt-4">
             {t("config.selectNodeHint") || "Select a node on the canvas to edit its configuration"}
           </p>
         </div>
       )}
+    </div>
+  );
+}
+
+function ChildModelStrategySection({
+  autoChildModelMap,
+  updateAutoChildModelMap,
+  defaultModel,
+  t,
+}: {
+  autoChildModelMap: Partial<Record<WorkerAgentType, string>>;
+  updateAutoChildModelMap: (agentType: WorkerAgentType, model: string) => Promise<void>;
+  defaultModel: string;
+  t: (key: string) => string;
+}) {
+  return (
+    <div className="space-y-3 rounded-xl border border-gray-200 bg-gray-50/70 p-3">
+      <div>
+        <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+          {t("config.childModels") || "子节点模型策略"}
+        </label>
+        <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+          {t("config.childModelsDesc") || "预先指定 Planner 创建的各类子节点默认模型。任务未显式声明模型时，优先使用这里的配置。"}
+        </p>
+      </div>
+      {CHILD_MODEL_TYPES.map((agentType) => (
+        <div key={agentType} className="space-y-1">
+          <div className="text-[11px] font-medium text-gray-600">
+            {t(`node.${agentType}.label`)}
+          </div>
+          <ModelSelector
+            value={autoChildModelMap[agentType] || ""}
+            onChange={(fullId) => {
+              void updateAutoChildModelMap(agentType, fullId);
+            }}
+            disabled={false}
+          />
+          {!autoChildModelMap[agentType] && defaultModel && (
+            <p className="text-[10px] text-gray-400">
+              未单独指定时，将回退到 Planner/默认模型：{defaultModel}
+            </p>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

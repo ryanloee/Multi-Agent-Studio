@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -24,8 +25,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.models.db import NodeExecution, Run
-from app.models.schemas import NodeExecutionResponse, RunResponse, TriggerRunRequest
+from app.models.db import NodeExecution, Run, RunEvent
+from app.models.schemas import NodeExecutionResponse, RunEventResponse, RunResponse, TriggerRunRequest
 
 if TYPE_CHECKING:
     from app.core.local_engine import LocalDAGExecutor
@@ -106,12 +107,24 @@ async def trigger_run(
     if workflow is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
+    workspace_directory = (workflow.workspace_directory or "").strip()
+    if not workspace_directory:
+        raise HTTPException(status_code=400, detail="请先设置工作目录后再启动工作流")
+    workspace_path = Path(workspace_directory).expanduser()
+    if not workspace_path.exists() or not workspace_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"工作目录不存在或不可用: {workspace_directory}")
+
     payload = body or TriggerRunRequest()
     global_config = payload.config or {}
-    workflow_mode = getattr(workflow, "mode", "manual") or "manual"
+    workflow_mode = "auto"
     dag_json: dict | None = None
     run_id = uuid4()
     start_as_task_dag = False
+    workflow_metadata = (
+        workflow.dag_json.get("metadata", {})
+        if isinstance(workflow.dag_json, dict)
+        else {}
+    )
 
     # 2. Route based on mode
     if workflow_mode == "auto":
@@ -175,6 +188,7 @@ async def trigger_run(
                     "label": "Planner",
                     "agentType": "plan",
                     "prompt": goal,
+                    "autoChildModelMap": workflow_metadata.get("auto_child_model_map", {}),
                 },
                 "model_provider": "",
                 "model_id": "",
@@ -195,10 +209,12 @@ async def trigger_run(
                             "label": "Planner",
                             "agentType": "plan",
                             "prompt": goal,
+                            "autoChildModelMap": workflow_metadata.get("auto_child_model_map", {}),
                         },
                     }
                 ],
                 "edges": [],
+                "metadata": workflow_metadata,
             }
             db.add(workflow)
             await db.flush()
@@ -249,6 +265,8 @@ async def trigger_run(
             layers_data.append(layer_list)
 
     global_config["_edges"] = (dag_json or workflow.dag_json or {}).get("edges", [])
+    global_config["_workflow_id"] = str(workflow_id)
+    global_config["_auto_child_model_map"] = workflow_metadata.get("auto_child_model_map", {})
 
     # 5. Persist run record before starting background execution. Dynamic
     # tasks are inserted from a separate DB session and need this FK visible.
@@ -268,14 +286,14 @@ async def trigger_run(
             run_id=str(run_id),
             dag_json=dag_json or {},
             global_config=global_config,
-            workspace_directory=workflow.workspace_directory,
+            workspace_directory=workspace_directory,
         )
     else:
         await engine.start_workflow(
             run_id=str(run_id),
             layers=layers_data,
             global_config=global_config,
-            workspace_directory=workflow.workspace_directory,
+            workspace_directory=workspace_directory,
         )
 
     return run
@@ -320,6 +338,33 @@ async def get_run(
             pass  # Engine not available, return DB status
 
     return run
+
+
+@router.get("/{run_id}/events", response_model=list[RunEventResponse])
+async def list_run_events(
+    run_id: UUID,
+    limit: int = 5000,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return persisted white-box event history for a run.
+
+    The frontend uses this to restore LLM, shell, tool, communication, and
+    timeline panels after refresh or after reconnecting to an in-progress run.
+    """
+    run_result = await db.execute(select(Run.id).where(Run.id == run_id))
+    if run_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    query = (
+        select(RunEvent)
+        .where(RunEvent.run_id == run_id)
+        .order_by(RunEvent.created_at.asc(), RunEvent.id.asc())
+        .offset(offset)
+        .limit(min(max(limit, 1), 20000))
+    )
+    result = await db.execute(query)
+    return result.scalars().all()
 
 
 @router.post("/{run_id}/cancel")

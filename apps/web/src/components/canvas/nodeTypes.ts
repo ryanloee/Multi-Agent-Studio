@@ -5,6 +5,7 @@ import PlanNode from "@/components/canvas/nodes/PlanNode";
 import ShellNode from "@/components/canvas/nodes/ShellNode";
 import ReviewNode from "@/components/canvas/nodes/ReviewNode";
 import ExploreNode from "@/components/canvas/nodes/ExploreNode";
+import MergeNode from "@/components/canvas/nodes/MergeNode";
 import HumanNode from "@/components/canvas/nodes/HumanNode";
 import ChildNode from "@/components/canvas/nodes/ChildNode";
 
@@ -20,6 +21,7 @@ export const nodeTypes: NodeTypes = {
   shell: ShellNode,
   review: ReviewNode,
   explore: ExploreNode,
+  merge: MergeNode,
   human: HumanNode,
   child: ChildNode,
 };

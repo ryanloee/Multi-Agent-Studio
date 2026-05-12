@@ -29,6 +29,7 @@ class CreateWorkflowRequest(BaseModel):
     workspace_directory: Optional[str] = None
     mode: Optional[str] = Field("manual", pattern="^(auto|manual)$")
     goal: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
 
 
 class UpdateWorkflowRequest(BaseModel):
@@ -38,6 +39,7 @@ class UpdateWorkflowRequest(BaseModel):
     workspace_directory: Optional[str] = None
     mode: Optional[str] = Field(None, pattern="^(auto|manual)$")
     goal: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
     nodes: Optional[list[dict[str, Any]]] = None
     edges: Optional[list[dict[str, Any]]] = None
 
@@ -49,6 +51,8 @@ class UpdateWorkflowRequest(BaseModel):
                 "nodes": self.nodes or [],
                 "edges": self.edges or [],
             }
+            if self.metadata is not None:
+                self.dag_json["metadata"] = self.metadata
         return self
 
 
@@ -77,6 +81,11 @@ class WorkflowResponse(BaseModel):
     @property
     def edges(self) -> list[dict[str, Any]]:
         return self.dag_json.get("edges", []) if self.dag_json else []
+
+    @computed_field
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self.dag_json.get("metadata", {}) if self.dag_json else {}
 
     model_config = {"from_attributes": True}
 
@@ -125,6 +134,22 @@ class NodeExecutionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RunEventResponse(BaseModel):
+    id: UUID
+    run_id: UUID
+    event_type: str
+    node_id: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _utc_aware(cls, v: datetime) -> datetime:
+        return _ensure_utc(v)
+
+    model_config = {"from_attributes": True}
+
+
 # ---------------------------------------------------------------------------
 # Task schemas
 # ---------------------------------------------------------------------------
@@ -146,6 +171,7 @@ class TaskUpdate(BaseModel):
     assigned_worker_label: Optional[str] = None
     progress: Optional[int] = Field(None, ge=0, le=100)
     result_summary: Optional[str] = None
+    dependencies: Optional[str] = None
 
 
 class TaskAssignRequest(BaseModel):
@@ -169,6 +195,7 @@ class TaskResponse(BaseModel):
     assigned_worker_label: Optional[str] = None
     progress: int
     result_summary: str
+    dependencies: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -187,8 +214,13 @@ class TaskResponse(BaseModel):
 class TaskMessageCreate(BaseModel):
     sender_type: str = Field(..., pattern="^(planner|worker|user)$")
     sender_id: str
-    message_type: str = Field(..., pattern="^(assignment|question|answer|escalation|update|user_edit)$")
+    message_type: str = Field(
+        ...,
+        pattern="^(assignment|question|answer|escalation|update|user_edit|worker_question|worker_answer|planner_question|planner_answer|artifact_created)$",
+    )
     content: str
+    target_node_id: Optional[str] = None
+    artifact_id: Optional[UUID] = None
 
 
 class TaskMessageResponse(BaseModel):
@@ -198,11 +230,67 @@ class TaskMessageResponse(BaseModel):
     sender_id: str
     message_type: str
     content: str
+    target_node_id: Optional[str] = None
+    artifact_id: Optional[UUID] = None
     created_at: datetime
 
     @field_validator("created_at", mode="before")
     @classmethod
     def _utc_aware(cls, v: datetime) -> datetime:
+        return _ensure_utc(v)
+
+    model_config = {"from_attributes": True}
+
+
+# ---------------------------------------------------------------------------
+# Artifact schemas
+# ---------------------------------------------------------------------------
+
+class ArtifactCreate(BaseModel):
+    workflow_id: UUID
+    task_id: Optional[UUID] = None
+    node_id: Optional[str] = None
+    type: str = Field(
+        ...,
+        pattern="^(file_change|research_note|test_result|review_report|merge_report|decision|final_output)$",
+    )
+    title: str = Field(..., min_length=1, max_length=512)
+    content: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    created_by: str = "system"
+
+
+class ArtifactUpdate(BaseModel):
+    type: Optional[str] = Field(
+        None,
+        pattern="^(file_change|research_note|test_result|review_report|merge_report|decision|final_output)$",
+    )
+    title: Optional[str] = Field(None, min_length=1, max_length=512)
+    content: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
+
+
+class ArtifactResponse(BaseModel):
+    id: UUID
+    run_id: UUID
+    workflow_id: UUID
+    task_id: Optional[UUID] = None
+    node_id: Optional[str] = None
+    type: str
+    title: str
+    content: str
+    metadata_json: Optional[dict[str, Any]] = None
+    created_by: str
+    created_at: datetime
+
+    @computed_field
+    @property
+    def metadata(self) -> dict[str, Any]:
+        return self.metadata_json or {}
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def _artifact_utc_aware(cls, v: datetime) -> datetime:
         return _ensure_utc(v)
 
     model_config = {"from_attributes": True}

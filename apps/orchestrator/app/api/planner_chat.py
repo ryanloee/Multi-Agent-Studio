@@ -12,22 +12,19 @@ POST /api/planner/chat
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession as AsyncSessionType
 
 from app.core.database import get_db
-from app.models.db import Workflow
 from app.models.db import ChatMessage as ChatMessageORM
-from app.workflows.plan_parser import parse_plan_to_dag
+from app.models.db import SharedDocument, Workflow
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +34,9 @@ router = APIRouter()
 # Planner system prompt for iterative conversation mode
 # ---------------------------------------------------------------------------
 
-PLANNER_CHAT_SYSTEM = """你是一个项目管理规划器（Planner），正在与用户进行交互式对话来设计工作流。
+PLANNER_CHAT_SYSTEM = """你是白盒多 Agent 编排系统的高级 Planner / Orchestrator，正在与用户进行交互式对话来设计可执行工作流。
+
+你的职责不是生成普通任务列表，而是理解目标、拆解 DAG、分配 Worker、监督执行、处理 Worker 咨询、约束 Worker 间协作，并确保所有关键产物进入 Artifact 管理系统。
 
 ## 对话模式
 - 用户会用自然语言描述他们想要实现的目标
@@ -46,6 +45,13 @@ PLANNER_CHAT_SYSTEM = """你是一个项目管理规划器（Planner），正在
 - 用户可以随时要求修改（增加/删除/调整节点和连线）
 - 每次修改后，你需要输出完整的更新后的 DAG
 
+## 可观察规划轨迹
+- 每次回复开头，先输出一个 ```observe 代码块，记录本轮真实发生的可观察规划动作
+- 轨迹必须是 3-7 行的简短中文列表，每行以 `- ` 开头
+- 轨迹内容应具体说明你正在做什么，例如读取了哪些上下文、准备增删哪些节点、为什么要调整依赖或分工
+- 不要写“隐藏推理不会展示”之类的说明，也不要声称展示内部推理；这里只记录用户可见的规划过程
+- ` ```observe` 代码块结束后，再输出正常解释和 ` ```plan` DAG
+
 ## DAG 输出格式
 当你需要展示或更新工作流时，在对话中输出以下 JSON 块：
 
@@ -53,37 +59,53 @@ PLANNER_CHAT_SYSTEM = """你是一个项目管理规划器（Planner），正在
 {
   "nodes": [
     {
-      "id": "explore_1",
+      "id": "explore_auth_structure",
       "type": "explore",
-      "label": "代码探索",
-      "prompt": "搜索项目中的认证模块实现"
+      "label": "探索认证模块结构",
+      "prompt": "搜索项目中所有与用户认证相关的文件和模块。重点关注：1) 现有的认证中间件和路由 2) 用户模型和数据库 schema 3) 现有的密码处理逻辑。列出所有相关文件路径和关键函数名。"
     },
     {
-      "id": "coder_1",
+      "id": "explore_jwt_libs",
+      "type": "explore",
+      "label": "调研JWT库和配置",
+      "prompt": "搜索项目的依赖配置文件（package.json/requirements.txt/pyproject.toml），查找已有的JWT或加密库。同时查看项目的配置文件了解现有的密钥管理和环境变量方案。报告找到的库版本和配置格式。",
+      "depends_on": []
+    },
+    {
+      "id": "coder_jwt_issuer",
       "type": "coder",
-      "label": "实现登录API",
-      "prompt": "基于探索结果实现 JWT 登录接口",
-      "depends_on": ["explore_1"]
+      "label": "实现JWT令牌签发",
+      "prompt": "基于前面的探索结果，实现JWT令牌签发功能。具体要求：\n1. 在认证路由模块中创建 POST /auth/login 端点\n2. 接收 username 和 password 参数\n3. 使用 bcrypt 验证密码（复用已有依赖）\n4. 签发包含 {sub, exp, iat} 声明的JWT令牌\n5. 令牌过期时间设为24小时\n6. 返回 {access_token, token_type, expires_in} 格式的响应\n7. 添加必要的错误处理（401 Unauthorized, 422 Validation Error）\n\n验收标准：登录成功返回有效JWT，密码错误返回401，请求格式错误返回422。",
+      "depends_on": ["explore_auth_structure", "explore_jwt_libs"]
     },
     {
-      "id": "review_1",
+      "id": "coder_jwt_middleware",
+      "type": "coder",
+      "label": "实现JWT验证中间件",
+      "prompt": "实现JWT令牌验证中间件。具体要求：\n1. 创建认证中间件函数，从 Authorization: Bearer <token> 头部提取令牌\n2. 验证令牌签名和过期时间\n3. 验证成功后将用户信息注入请求上下文\n4. 创建 @require_auth 装饰器保护需要认证的路由\n5. 编写单元测试验证中间件行为\n\n验收标准：有效令牌通过验证，过期/无效令牌返回401，无令牌返回401。",
+      "depends_on": ["coder_jwt_issuer"]
+    },
+    {
+      "id": "review_auth_security",
       "type": "review",
-      "label": "代码审查",
-      "prompt": "审查登录API的安全性和代码质量",
-      "depends_on": ["coder_1"]
+      "label": "安全审查认证模块",
+      "prompt": "对认证模块进行全面安全审查。检查项：\n1. JWT密钥是否安全存储（不在代码中硬编码）\n2. 密码是否使用bcrypt/scrypt等强哈希算法\n3. 是否存在时序攻击漏洞\n4. 令牌刷新机制是否安全\n5. 是否防止了暴力破解攻击\n6. 错误消息是否泄露了敏感信息\n\n输出格式：列出每个检查项的通过/不通过状态及改进建议。",
+      "depends_on": ["coder_jwt_middleware"]
     },
     {
-      "id": "test_1",
+      "id": "test_auth_integration",
       "type": "shell",
-      "label": "运行测试",
-      "prompt": "运行 pytest 执行认证模块的集成测试",
-      "depends_on": ["review_1"]
+      "label": "运行认证模块集成测试",
+      "prompt": "运行认证模块的集成测试。执行步骤：\n1. 运行 pytest tests/test_auth.py -v --tb=short\n2. 如果测试失败，分析失败原因并报告\n3. 统计通过/失败/跳过的测试数量\n\n报告最终测试结果摘要。",
+      "depends_on": ["review_auth_security"]
     }
   ],
   "edges": [
-    {"source": "explore_1", "target": "coder_1"},
-    {"source": "coder_1", "target": "review_1"},
-    {"source": "review_1", "target": "test_1"}
+    {"source": "explore_auth_structure", "target": "coder_jwt_issuer"},
+    {"source": "explore_jwt_libs", "target": "coder_jwt_issuer"},
+    {"source": "coder_jwt_issuer", "target": "coder_jwt_middleware"},
+    {"source": "coder_jwt_middleware", "target": "review_auth_security"},
+    {"source": "review_auth_security", "target": "test_auth_integration"}
   ]
 }
 ```
@@ -92,9 +114,39 @@ PLANNER_CHAT_SYSTEM = """你是一个项目管理规划器（Planner），正在
 - `plan`（规划器）: 分析任务、拆解子任务
 - `coder`（编码器）: 编写和修改代码
 - `explore`（探索器）: 搜索代码库、收集信息（只读）
+- `merge`（合并器）: 集成并行 coder 的代码改动、处理冲突、向相关节点或 Planner 升级决策
 - `review`（审查器）: 审查代码质量、发现bug
 - `shell`（执行器）: 运行命令、测试、部署
 - `human`（人工审批）: 暂停等待人工确认
+
+## 任务粒度原则
+1. **单一职责**：每个节点只做一件事，聚焦单一操作（如"实现登录端点"而非"实现认证系统"）
+2. **精确到文件/函数级**：prompt 应明确目标文件路径或函数名
+3. **明确的输入输出**：每个任务 prompt 必须描述：目标、上下文、具体要求、验收标准
+4. **合理数量**：根据项目复杂度创建 15-30 个细粒度子任务，确保每个任务可独立执行
+5. **并行友好**：将无依赖的探索任务标记为可并行执行
+6. **禁止粗任务**：不要输出“开发前端”“实现后端”“完成测试”“修复全部问题”这类粗粒度任务，必须拆成 Worker 可独立执行的文件/模块级任务
+
+## Prompt 编写规范
+每个节点的 prompt 必须包含：
+- **目标**：明确要完成什么
+- **上下文**：相关背景信息（如依赖的前置任务输出）
+- **输入**：该 Worker 需要使用的上游结果、文件、命令或 Artifact
+- **具体要求**：编号列出具体实现步骤
+- **产出格式**：要求 Worker 最后给出结构化摘要
+- **验收标准**：如何判断任务完成且质量达标
+- **边界**：明确不能修改或不能越权处理的范围
+- **咨询/协作规则**：阻塞时输出 `ESCALATE_TO_PLANNER: <question>`；仅可向直接上游、直接下游、同层并行节点输出 `ASK_WORKER: <target_node_id>: <question>` 或 `BROADCAST_TO_PEERS: <message>`
+- **Artifact 要求**：explore 生成 research_note，coder 生成 file_change，merge 生成 merge_report，review 生成 review_report，shell/test 生成 test_result，Planner 最终生成 final_output
+
+## 白盒协议
+- Worker 汇报进度时输出：`TASK_PROGRESS: <0-100>`
+- Worker 需要 Planner 决策时输出：`ESCALATE_TO_PLANNER: <question>`
+- Worker 请求相关 Worker 协助时输出：`ASK_WORKER: <target_node_id>: <question>`
+- Worker 向相关同伴广播信息时输出：`BROADCAST_TO_PEERS: <message>`
+- Worker 间通信默认只允许直接上游、直接下游、同层并行节点；跨无关节点必须由 Planner 授权
+- 所有 DAG 节点必须包含 `id`、`type`、`label`、`prompt`、`depends_on`
+- 能并行的任务必须并行，复杂任务通常拆成 explore → coder → review → shell/test 多阶段
 
 ## 交互规则
 1. 首次对话：分析用户目标，提出初步方案并输出 DAG
@@ -102,8 +154,9 @@ PLANNER_CHAT_SYSTEM = """你是一个项目管理规划器（Planner），正在
 3. 始终用中文回复
 4. 每次输出 DAG 时确保是完整的工作流（不要只输出变更部分）
 5. 在 DAG 前后用自然语言解释方案和改动
-6. 不要创建超过 10 个节点
-7. 当用户说"运行"/"执行"/"开始"时，确认方案并输出最终 DAG
+6. 当用户说"运行"/"执行"/"开始"时，确认方案并输出最终 DAG
+7. 只要存在两个或更多并行 coder 节点，必须在它们之后增加一个 merge 节点，再让 review/shell 依赖 merge 节点
+8. merge 节点 prompt 必须要求读取上游 coder 的 diff/report/commit 信息，合并到集成工作区，记录冲突；遇到冲突时先询问相关 coder，涉及架构或产品取舍时升级询问 Planner
 """
 
 # ---------------------------------------------------------------------------
@@ -235,7 +288,7 @@ async def _call_llm_stream(
         openai_messages = [{"role": "system", "content": system}] + messages
         body = {
             "model": model_id,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "messages": openai_messages,
             "stream": True,
         }
@@ -249,7 +302,7 @@ async def _call_llm_stream(
         }
         body = {
             "model": model_id,
-            "max_tokens": 4096,
+            "max_tokens": 8192,
             "system": system,
             "messages": messages,
             "stream": True,
@@ -406,6 +459,37 @@ def _normalize_dag(dag: dict) -> dict:
     return dag
 
 
+async def _update_shared_doc_from_planner(
+    text: str, workflow_id: uuid.UUID, db: "AsyncSessionType",
+) -> None:
+    """Parse ```shared-doc ... ``` blocks from planner output and persist."""
+    import re as _re
+
+    pattern = r"```shared-doc\s*\n(.*?)\n```"
+    matches = _re.findall(pattern, text, _re.DOTALL)
+    if not matches:
+        return
+
+    content = matches[-1].strip()
+    if not content:
+        return
+
+    result = await db.execute(
+        select(SharedDocument).where(SharedDocument.workflow_id == workflow_id)
+    )
+    doc = result.scalar_one_or_none()
+    if doc is None:
+        doc = SharedDocument(workflow_id=workflow_id, content=content, updated_by="planner")
+        db.add(doc)
+    else:
+        doc.content = content
+        doc.updated_by = "planner"
+    try:
+        await db.commit()
+    except Exception as exc:
+        logger.warning("Failed to update shared doc from planner: %s", exc)
+
+
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
@@ -473,6 +557,16 @@ async def planner_chat(
     if workflow.goal:
         messages[-1]["content"] = f"项目目标: {workflow.goal}\n\n{messages[-1]['content']}"
 
+    # 4.5. Inject shared document context
+    doc_result = await db.execute(
+        select(SharedDocument).where(SharedDocument.workflow_id == uuid.UUID(body.workflow_id))
+    )
+    shared_doc = doc_result.scalar_one_or_none()
+    if shared_doc and shared_doc.content.strip():
+        messages[-1]["content"] += (
+            f"\n\n## 项目共享文档\n{shared_doc.content}"
+        )
+
     # 5. Stream the response as SSE
     async def generate():
         full_response = ""
@@ -496,6 +590,9 @@ async def planner_chat(
             await db.commit()
         except Exception as exc:
             logger.warning("Failed to save assistant message: %s", exc)
+
+        # Parse shared-doc update from planner output
+        _update_shared_doc_from_planner(full_response, uuid.UUID(body.workflow_id), db)
 
         # After the full response, check if it contains a DAG
         dag = _extract_dag_from_text(full_response)

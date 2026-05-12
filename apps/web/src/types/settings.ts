@@ -8,6 +8,8 @@ export interface ModelEntry {
   base_url: string;
   api_key: string;
   default_model: string;
+  context_window: number;
+  max_output_tokens: number;
 }
 
 export interface GeneralSettings {

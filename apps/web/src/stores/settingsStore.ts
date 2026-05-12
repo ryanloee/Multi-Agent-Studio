@@ -3,6 +3,44 @@ import { persist } from "zustand/middleware";
 import type { AppSettings, GeneralSettings, DisplaySettings, ModelEntry } from "@/types/settings";
 import { api } from "@/lib/api";
 
+const DEFAULT_CONTEXT_WINDOW = 128000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
+function normalizeTokenField(
+  value: unknown,
+  fallback: number,
+  minValue: number,
+): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed) || parsed < minValue) {
+    return fallback;
+  }
+  return Math.round(parsed);
+}
+
+function normalizeModelEntry(model: ModelEntry): ModelEntry {
+  return {
+    ...model,
+    context_window: normalizeTokenField(
+      model.context_window,
+      DEFAULT_CONTEXT_WINDOW,
+      1024,
+    ),
+    max_output_tokens: normalizeTokenField(
+      model.max_output_tokens,
+      DEFAULT_MAX_OUTPUT_TOKENS,
+      256,
+    ),
+  };
+}
+
+function normalizeModels(models: ModelEntry[] | undefined): ModelEntry[] {
+  if (!Array.isArray(models)) return [];
+  return models.map(normalizeModelEntry);
+}
+
+let settingsRequestSeq = 0;
+
 // ---------------------------------------------------------------------------
 // Default settings
 // ---------------------------------------------------------------------------
@@ -62,16 +100,21 @@ export const useSettingsStore = create<SettingsState>()(
       closeModal: () => set({ modalOpen: false }),
 
       loadFromServer: async () => {
+        const requestSeq = ++settingsRequestSeq;
         set({ loading: true });
         try {
           const serverSettings = await api.getSettings();
-          // Migration: old format had models: { openai: {}, claude: {} }
-          // New format expects models: ModelEntry[]
-          if (serverSettings.models && !Array.isArray(serverSettings.models)) {
-            serverSettings.models = [];
-          }
-          set({ settings: { ...DEFAULT_SETTINGS, ...serverSettings, models: serverSettings.models || [] }, loading: false });
+          if (requestSeq !== settingsRequestSeq) return;
+          set({
+            settings: {
+              ...DEFAULT_SETTINGS,
+              ...serverSettings,
+              models: normalizeModels(serverSettings.models),
+            },
+            loading: false,
+          });
         } catch {
+          if (requestSeq !== settingsRequestSeq) return;
           set({ loading: false });
         }
       },
@@ -94,7 +137,7 @@ export const useSettingsStore = create<SettingsState>()(
         set((s) => {
           const models = Array.isArray(s.settings.models) ? s.settings.models : [];
           return {
-            settings: { ...s.settings, models: [...models, model] },
+            settings: { ...s.settings, models: [...models, normalizeModelEntry(model)] },
             saveError: null,
           };
         });
@@ -107,7 +150,7 @@ export const useSettingsStore = create<SettingsState>()(
             settings: {
               ...s.settings,
               models: models.map((m) =>
-                m.id === id ? { ...m, ...patch } : m
+                m.id === id ? normalizeModelEntry({ ...m, ...patch }) : m
               ),
             },
             saveError: null,
@@ -126,19 +169,27 @@ export const useSettingsStore = create<SettingsState>()(
       },
 
       save: async () => {
+        const requestSeq = ++settingsRequestSeq;
         set({ loading: true, saveError: null });
         try {
           const settingsToSave = {
             ...get().settings,
-            models: Array.isArray(get().settings.models) ? get().settings.models : [],
+            models: normalizeModels(get().settings.models),
           };
           const saved = await api.updateSettings(settingsToSave);
-          // Ensure models is always an array after save
-          if (!Array.isArray(saved.models)) {
-            saved.models = [];
-          }
-          set({ settings: saved, loading: false, lastSaved: Date.now(), saveError: null });
+          if (requestSeq !== settingsRequestSeq) return;
+          set({
+            settings: {
+              ...DEFAULT_SETTINGS,
+              ...saved,
+              models: normalizeModels(saved.models),
+            },
+            loading: false,
+            lastSaved: Date.now(),
+            saveError: null,
+          });
         } catch (err) {
+          if (requestSeq !== settingsRequestSeq) return;
           const msg = err instanceof Error ? err.message : "保存失败";
           set({ loading: false, saveError: msg });
           throw err;

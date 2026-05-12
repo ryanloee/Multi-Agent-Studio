@@ -1,4 +1,4 @@
-import type { WorkflowNode, WorkflowEdge, RunStatus } from "./workflow";
+import type { WorkflowNode, WorkflowEdge, RunStatus, AutoChildModelMap } from "./workflow";
 
 // ---------------------------------------------------------------------------
 // Model types
@@ -54,6 +54,9 @@ export interface WorkflowDetail {
   mode?: string;
   /** Natural-language goal for auto-mode workflows */
   goal?: string;
+  metadata?: {
+    auto_child_model_map?: AutoChildModelMap;
+  };
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   updated_at: string;
@@ -69,6 +72,9 @@ export interface CreateWorkflowRequest {
   mode?: "auto" | "manual";
   /** Natural-language goal for auto-mode workflows */
   goal?: string;
+  metadata?: {
+    auto_child_model_map?: AutoChildModelMap;
+  };
 }
 
 /** Request body for PUT /api/workflows/:id */
@@ -78,6 +84,9 @@ export interface UpdateWorkflowRequest {
   workspace_directory?: string;
   mode?: "auto" | "manual";
   goal?: string;
+  metadata?: {
+    auto_child_model_map?: AutoChildModelMap;
+  };
   nodes?: WorkflowNode[];
   edges?: WorkflowEdge[];
 }

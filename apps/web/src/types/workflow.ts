@@ -7,9 +7,14 @@ export type AgentNodeType =
   | "coder"
   | "plan"
   | "explore"
+  | "merge"
   | "shell"
   | "review"
   | "human";
+
+export type WorkerAgentType = Exclude<AgentNodeType, "plan" | "human">;
+
+export type AutoChildModelMap = Partial<Record<WorkerAgentType, string>>;
 
 // ---------------------------------------------------------------------------
 // Node Data — the business data stored inside each workflow node

@@ -25,6 +25,18 @@ from app.workflows.compiler import compile_dag
 router = APIRouter()
 
 
+def _default_workspace_directory() -> str:
+    """Read the configured default workspace without failing workflow creation."""
+    try:
+        from app.api.settings import _read_settings
+
+        settings = _read_settings()
+        general = settings.get("general", {}) if isinstance(settings, dict) else {}
+        return str(general.get("default_workspace") or "").strip()
+    except Exception:
+        return ""
+
+
 @router.post("", response_model=WorkflowResponse, status_code=201)
 async def create_workflow(
     body: CreateWorkflowRequest,
@@ -42,13 +54,13 @@ async def create_workflow(
         name=body.name,
         description=body.description,
         dag_json=body.dag_json,
-        workspace_directory=body.workspace_directory,
-        mode=body.mode or "manual",
+        workspace_directory=body.workspace_directory or _default_workspace_directory() or None,
+        mode="auto",
         goal=body.goal,
     )
 
     # Auto mode: initialize with a default Planner node
-    if (body.mode or "manual") == "auto" and body.dag_json is None:
+    if body.dag_json is None:
         workflow.dag_json = {
             "nodes": [
                 {
@@ -68,6 +80,12 @@ async def create_workflow(
                 }
             ],
             "edges": [],
+            "metadata": body.metadata or {},
+        }
+    elif body.metadata is not None:
+        workflow.dag_json = {
+            **(workflow.dag_json or {}),
+            "metadata": body.metadata,
         }
 
     db.add(workflow)
@@ -130,10 +148,15 @@ async def update_workflow(
         workflow.description = body.description
     if body.dag_json is not None:
         workflow.dag_json = body.dag_json
+    if body.metadata is not None:
+        workflow.dag_json = {
+            **(workflow.dag_json or {"nodes": [], "edges": []}),
+            "metadata": body.metadata,
+        }
     if body.workspace_directory is not None:
         workflow.workspace_directory = body.workspace_directory
     if body.mode is not None:
-        workflow.mode = body.mode
+        workflow.mode = "auto"
     if body.goal is not None:
         workflow.goal = body.goal
 

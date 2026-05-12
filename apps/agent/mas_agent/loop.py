@@ -235,9 +235,10 @@ class AgentLoop:
                     }
                     self.messages.append(tool_result_msg)
 
-                # Compact message history if approaching context window limit
-                if should_compact(self.messages, self.config.max_tokens):
-                    self.messages = compact_messages(self.messages, self.config.max_tokens)
+                # Compact message history if approaching the model context window.
+                # max_tokens is output budget; context_window is the total input+output window.
+                if should_compact(self.messages, self.config.context_window):
+                    self.messages = compact_messages(self.messages, self.config.context_window)
                     self.stream.emit_status("context_compacted")
 
             self.stream.emit_status("completed")

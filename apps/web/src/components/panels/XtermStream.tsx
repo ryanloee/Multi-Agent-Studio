@@ -36,9 +36,6 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
     [allEvents, nodeId]
   );
 
-  // Track how many events we have already written to avoid duplicates
-  const writtenCount = useRef(0);
-
   // -----------------------------------------------------------------------
   // Initialise xterm.js via dynamic import (browser-only)
   // -----------------------------------------------------------------------
@@ -115,26 +112,22 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
   }, []);
 
   // -----------------------------------------------------------------------
-  // Write new events to terminal (or fallback <pre>)
+  // Rebuild terminal content from current event history. This keeps the view
+  // correct after node switches, refresh restores, and late xterm initialisation.
   // -----------------------------------------------------------------------
   useEffect(() => {
-    const newEvents = events.slice(writtenCount.current);
-    if (newEvents.length === 0) return;
-    writtenCount.current = events.length;
+    const text = events.map((ev) => ev.content).join("\n");
 
     if (termRef.current) {
-      for (const ev of newEvents) {
-        termRef.current.write(ev.content + "\n");
-      }
+      termRef.current.clear();
+      if (text) termRef.current.write(text + "\n");
       termRef.current.scrollToBottom();
     } else if (fallbackRef.current) {
       const pre = fallbackRef.current;
-      for (const ev of newEvents) {
-        pre.textContent += ev.content + "\n";
-      }
+      pre.textContent = text ? `${text}\n` : "";
       pre.scrollTop = pre.scrollHeight;
     }
-  }, [events]);
+  }, [events, xtermReady, nodeId]);
 
   return (
     <div className="w-full h-full relative bg-[#1e1e1e] overflow-hidden">

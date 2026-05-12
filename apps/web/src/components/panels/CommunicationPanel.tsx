@@ -3,6 +3,7 @@
 import { useMemo } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { useRunStore } from "@/stores/runStore";
+import { useTaskStore } from "@/stores/taskStore";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import type { StreamEvent } from "@/types/events";
@@ -23,6 +24,8 @@ export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const allEvents = useRunStore((s) => s.events);
+  const tasks = useTaskStore((s) => s.tasks);
+  const taskMessages = useTaskStore((s) => s.taskMessages);
 
   // Get the effective node ID: use provided nodeId or the store's selectedRunNodeId
   const selectedRunNodeId = useRunStore((s) => s.selectedRunNodeId);
@@ -117,15 +120,34 @@ export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
       }
     }
 
+    for (const task of tasks) {
+      const messages = taskMessages[task.id] ?? [];
+      const taskNodeId = task.assigned_node_id || "";
+      for (const msg of messages) {
+        const related =
+          !effectiveNodeId ||
+          taskNodeId === effectiveNodeId ||
+          msg.sender_id === effectiveNodeId ||
+          msg.target_node_id === effectiveNodeId;
+        if (!related) continue;
+        result.push({
+          timestamp: new Date(msg.created_at).getTime(),
+          direction: msg.sender_id === effectiveNodeId ? "out" : "in",
+          summary: `${msg.sender_type}:${msg.sender_id}${msg.target_node_id ? ` -> ${msg.target_node_id}` : ""}: ${msg.content.slice(0, 120)}`,
+          eventType: msg.message_type,
+        });
+      }
+    }
+
     // Sort by timestamp
     result.sort((a, b) => a.timestamp - b.timestamp);
     return result;
-  }, [allEvents, effectiveNodeId, upstreamNodeIds, nodes, t, childIds]);
+  }, [allEvents, effectiveNodeId, upstreamNodeIds, nodes, t, childIds, tasks, taskMessages]);
 
   // Format timestamp
   function formatTime(ts: number): string {
     // Handle both seconds and milliseconds
-    const ms = ts > 1e12 ? ts : ts * 1000;
+    const ms = ts > 1e12 ? ts : ts > 1e9 ? ts * 1000 : ts;
     const d = new Date(ms);
     return d.toLocaleTimeString("zh-CN", { hour12: false });
   }

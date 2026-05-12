@@ -20,12 +20,23 @@ export type StreamEventType =
   | "node_failed"
   | "child_created"
   | "child_completed"
+  | "task_created"
+  | "task_updated"
+  | "task_message"
+  | "worker_message"
+  | "planner_guidance"
+  | "task_blocked"
+  | "task_unblocked"
+  | "artifact_created"
+  | "progress_summary"
   | "ping";
 
 // ---------------------------------------------------------------------------
 // Base event shape — every event carries these fields
 // ---------------------------------------------------------------------------
 export interface StreamEvent {
+  /** Stable persisted/delivered event ID, when provided by the backend */
+  event_id?: string;
   /** Event type discriminator */
   type: StreamEventType;
   /** Which workflow run this event belongs to */
@@ -163,6 +174,22 @@ export interface ChildCompletedEvent extends StreamEvent {
   content?: string;
 }
 
+/** Progress summary after DAG layer execution */
+export interface ProgressSummaryEvent extends StreamEvent {
+  type: "progress_summary";
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface ArtifactCreatedEvent extends StreamEvent {
+  type: "artifact_created";
+  artifact_id: string;
+  task_id?: string;
+  artifact_type: string;
+  title: string;
+}
+
 // ---------------------------------------------------------------------------
 // Event map — maps type discriminator to the concrete event interface
 // ---------------------------------------------------------------------------
@@ -183,4 +210,13 @@ export interface StreamEventMap {
   node_failed: NodeFailedEvent;
   child_created: ChildCreatedEvent;
   child_completed: ChildCompletedEvent;
+  task_created: StreamEvent;
+  task_updated: StreamEvent;
+  task_message: StreamEvent;
+  worker_message: StreamEvent;
+  planner_guidance: StreamEvent;
+  task_blocked: StreamEvent;
+  task_unblocked: StreamEvent;
+  artifact_created: ArtifactCreatedEvent;
+  progress_summary: ProgressSummaryEvent;
 }

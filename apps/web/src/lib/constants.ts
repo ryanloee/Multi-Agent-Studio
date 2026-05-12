@@ -6,7 +6,7 @@ import type {
 } from "@/types/workflow";
 
 // ---------------------------------------------------------------------------
-// NODE_META — metadata for each of the 6 agent node types
+// NODE_META — metadata for each agent node type
 // ---------------------------------------------------------------------------
 export const NODE_META: Record<
   AgentNodeType,
@@ -58,6 +58,22 @@ export const NODE_META: Record<
     defaultData: {
       label: "Explorer",
       agentType: "explore",
+      modelProvider: "mimo",
+      modelId: "mimo-v2.5",
+      prompt: "",
+      permissions: {},
+      command: "",
+      description: "",
+    },
+  },
+  merge: {
+    icon: "GitMerge",
+    color: "teal",
+    label: "Merger",
+    description: "Integrates parallel code changes and resolves conflicts",
+    defaultData: {
+      label: "Merger",
+      agentType: "merge",
       modelProvider: "mimo",
       modelId: "mimo-v2.5",
       prompt: "",
@@ -133,6 +149,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   { source: "coder", target: "explore" },
   { source: "coder", target: "shell" },
   { source: "coder", target: "review" },
+  { source: "coder", target: "merge" },
   { source: "coder", target: "human" },
 
   // plan → *
@@ -141,6 +158,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   { source: "plan", target: "explore" },
   { source: "plan", target: "shell" },
   { source: "plan", target: "review" },
+  { source: "plan", target: "merge" },
   { source: "plan", target: "human" },
 
   // explore → *
@@ -149,6 +167,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   { source: "explore", target: "explore" },
   { source: "explore", target: "shell" },
   { source: "explore", target: "review" },
+  { source: "explore", target: "merge" },
   { source: "explore", target: "human" },
 
   // shell → * (no shell→review)
@@ -156,6 +175,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   { source: "shell", target: "plan" },
   { source: "shell", target: "explore" },
   { source: "shell", target: "shell" },
+  { source: "shell", target: "merge" },
   { source: "shell", target: "human" },
 
   // review → * (no review→shell)
@@ -163,7 +183,16 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   { source: "review", target: "plan" },
   { source: "review", target: "explore" },
   { source: "review", target: "review" },
+  { source: "review", target: "merge" },
   { source: "review", target: "human" },
+
+  // merge → downstream validation / review / planner feedback
+  { source: "merge", target: "coder" },
+  { source: "merge", target: "plan" },
+  { source: "merge", target: "explore" },
+  { source: "merge", target: "shell" },
+  { source: "merge", target: "review" },
+  { source: "merge", target: "human" },
 
   // human is sink-only — no outgoing connections
 ];

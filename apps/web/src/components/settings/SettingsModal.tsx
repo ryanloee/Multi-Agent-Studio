@@ -35,6 +35,32 @@ const TABS: { key: SettingsTab; icon: typeof Globe; labelKey: string }[] = [
   { key: "models", icon: Cpu, labelKey: "settings.tabModels" },
 ];
 
+const DEFAULT_CONTEXT_WINDOW = 128000;
+const DEFAULT_MAX_OUTPUT_TOKENS = 4096;
+
+function normalizeNumericInput(
+  raw: string,
+  fallback: number,
+  minValue: number,
+): number {
+  const parsed = Number(raw.trim());
+  if (!Number.isFinite(parsed) || parsed < minValue) {
+    return fallback;
+  }
+  return Math.round(parsed);
+}
+
+function parseValidNumericInput(
+  raw: string,
+  minValue: number,
+): number | null {
+  const parsed = Number(raw.trim());
+  if (!Number.isFinite(parsed) || parsed < minValue) {
+    return null;
+  }
+  return Math.round(parsed);
+}
+
 // ---------------------------------------------------------------------------
 // Helper: generate model ID
 // ---------------------------------------------------------------------------
@@ -73,6 +99,11 @@ export default function SettingsModal() {
   }, [lastSaved, t]);
 
   const handleSave = useCallback(async () => {
+    const activeElement = document.activeElement;
+    if (activeElement instanceof HTMLElement) {
+      activeElement.blur();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    }
     setSaving(true);
     setSuccessMsg("");
     try {
@@ -299,13 +330,17 @@ function ModelsTab() {
   const rawModels = useSettingsStore((s) => s.settings.models);
   const models: ModelEntry[] = Array.isArray(rawModels) ? rawModels : [];
   const addModel = useSettingsStore((s) => s.addModel);
+  const updateModel = useSettingsStore((s) => s.updateModel);
   const removeModel = useSettingsStore((s) => s.removeModel);
 
   // Form state
   const [formFormat, setFormFormat] = useState<"openai" | "anthropic">("openai");
   const [formBaseUrl, setFormBaseUrl] = useState("https://api.openai.com/v1");
   const [formApiKey, setFormApiKey] = useState("");
+  const [formContextWindow, setFormContextWindow] = useState(String(DEFAULT_CONTEXT_WINDOW));
+  const [formMaxOutputTokens, setFormMaxOutputTokens] = useState(String(DEFAULT_MAX_OUTPUT_TOKENS));
   const [showApiKey, setShowApiKey] = useState(false);
+  const [modelDrafts, setModelDrafts] = useState<Record<string, { contextWindow: string; maxOutputTokens: string }>>({});
 
   // Fetch state — after connecting, show available models
   const [fetching, setFetching] = useState(false);
@@ -316,6 +351,36 @@ function ModelsTab() {
   // Test state per model in the list
   const [testResults, setTestResults] = useState<Record<string, import("@/types/settings").ModelTestResult>>({});
   const [testingIds, setTestingIds] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    setModelDrafts((prev) => {
+      const next: Record<string, { contextWindow: string; maxOutputTokens: string }> = {};
+      for (const model of models) {
+        next[model.id] = prev[model.id] ?? {
+          contextWindow: String(model.context_window ?? DEFAULT_CONTEXT_WINDOW),
+          maxOutputTokens: String(model.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS),
+        };
+      }
+      return next;
+    });
+  }, [models]);
+
+  useEffect(() => {
+    for (const model of models) {
+      const draft = modelDrafts[model.id];
+      if (!draft) continue;
+
+      const parsedContext = parseValidNumericInput(draft.contextWindow, 1024);
+      if (parsedContext !== null && parsedContext !== model.context_window) {
+        updateModel(model.id, { context_window: parsedContext });
+      }
+
+      const parsedOutput = parseValidNumericInput(draft.maxOutputTokens, 256);
+      if (parsedOutput !== null && parsedOutput !== model.max_output_tokens) {
+        updateModel(model.id, { max_output_tokens: parsedOutput });
+      }
+    }
+  }, [modelDrafts, models, updateModel]);
 
   // Reset form defaults when format changes
   const handleFormatChange = useCallback((format: "openai" | "anthropic") => {
@@ -376,13 +441,15 @@ function ModelsTab() {
         base_url: formBaseUrl.trim(),
         api_key: formApiKey.trim(),
         default_model: modelName,
+        context_window: normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024),
+        max_output_tokens: normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256),
       });
       existingIds.add(dedupeKey);
     }
     // Reset fetch state but keep connection info
     setFetchedModels([]);
     setSelectedModels(new Set());
-  }, [selectedModels, formFormat, formBaseUrl, formApiKey, models, addModel]);
+  }, [selectedModels, formFormat, formBaseUrl, formApiKey, formContextWindow, formMaxOutputTokens, models, addModel]);
 
   // Add a single custom model (for Anthropic or manual entry)
   const [customModelName, setCustomModelName] = useState("");
@@ -395,9 +462,39 @@ function ModelsTab() {
       base_url: formBaseUrl.trim(),
       api_key: formApiKey.trim(),
       default_model: customModelName.trim(),
+      context_window: normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024),
+      max_output_tokens: normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256),
     });
     setCustomModelName("");
-  }, [customModelName, formFormat, formBaseUrl, formApiKey, addModel]);
+  }, [customModelName, formFormat, formBaseUrl, formApiKey, formContextWindow, formMaxOutputTokens, addModel]);
+
+  const commitModelNumericField = useCallback((
+    model: ModelEntry,
+    key: "context_window" | "max_output_tokens",
+  ) => {
+    const draft = modelDrafts[model.id];
+    const fallback = key === "context_window" ? DEFAULT_CONTEXT_WINDOW : DEFAULT_MAX_OUTPUT_TOKENS;
+    const minValue = key === "context_window" ? 1024 : 256;
+    const raw =
+      key === "context_window"
+        ? draft?.contextWindow ?? String(model.context_window ?? fallback)
+        : draft?.maxOutputTokens ?? String(model.max_output_tokens ?? fallback);
+    const normalized = normalizeNumericInput(raw, fallback, minValue);
+    updateModel(model.id, { [key]: normalized });
+    setModelDrafts((prev) => ({
+      ...prev,
+      [model.id]: {
+        contextWindow:
+          key === "context_window"
+            ? String(normalized)
+            : (prev[model.id]?.contextWindow ?? String(model.context_window ?? DEFAULT_CONTEXT_WINDOW)),
+        maxOutputTokens:
+          key === "max_output_tokens"
+            ? String(normalized)
+            : (prev[model.id]?.maxOutputTokens ?? String(model.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS)),
+      },
+    }));
+  }, [modelDrafts, updateModel]);
 
   // Toggle model selection
   const toggleModel = useCallback((name: string) => {
@@ -511,6 +608,41 @@ function ModelsTab() {
         </div>
 
         {/* Fetch / Connect button */}
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">
+              {t("settings.contextWindow")}
+            </label>
+            <input
+              type="number"
+              min={1024}
+              step={1024}
+              value={formContextWindow}
+              onChange={(e) => setFormContextWindow(e.target.value)}
+              onBlur={() => setFormContextWindow(String(
+                normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024)
+              ))}
+              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-200 focus:outline-none"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-600 mb-1">
+              {t("settings.maxOutputTokens")}
+            </label>
+            <input
+              type="number"
+              min={256}
+              step={256}
+              value={formMaxOutputTokens}
+              onChange={(e) => setFormMaxOutputTokens(e.target.value)}
+              onBlur={() => setFormMaxOutputTokens(String(
+                normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256)
+              ))}
+              className="w-full rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-200 focus:outline-none"
+            />
+          </div>
+        </div>
+
         <button
           onClick={handleFetchModels}
           disabled={fetching || !formBaseUrl.trim()}
@@ -655,9 +787,64 @@ function ModelsTab() {
 
                   <div className="flex items-center gap-3 mt-1.5 text-xs text-gray-500">
                     <span>{model.default_model}</span>
+                    <span>{t("settings.contextWindowShort")}: {model.context_window ?? 128000}</span>
+                    <span>{t("settings.maxOutputShort")}: {model.max_output_tokens ?? 4096}</span>
                     {model.api_key && (
                       <span className="text-gray-300">•••{model.api_key.slice(-4)}</span>
                     )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2 mt-2">
+                    <label className="text-[10px] text-gray-500">
+                      {t("settings.contextWindow")}
+                      <input
+                        type="number"
+                        min={1024}
+                        step={1024}
+                        value={modelDrafts[model.id]?.contextWindow ?? String(model.context_window ?? DEFAULT_CONTEXT_WINDOW)}
+                        onChange={(e) => {
+                          const nextValue = e.target.value;
+                          setModelDrafts((prev) => ({
+                            ...prev,
+                            [model.id]: {
+                              contextWindow: nextValue,
+                              maxOutputTokens: prev[model.id]?.maxOutputTokens ?? String(model.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS),
+                            },
+                          }));
+                          const parsed = parseValidNumericInput(nextValue, 1024);
+                          if (parsed !== null) {
+                            updateModel(model.id, { context_window: parsed });
+                          }
+                        }}
+                        onBlur={() => commitModelNumericField(model, "context_window")}
+                        className="mt-1 w-full rounded border border-gray-200 px-2 py-1 text-xs text-gray-700 focus:border-blue-400 focus:outline-none"
+                      />
+                    </label>
+                    <label className="text-[10px] text-gray-500">
+                      {t("settings.maxOutputTokens")}
+                      <input
+                        type="number"
+                        min={256}
+                        step={256}
+                        value={modelDrafts[model.id]?.maxOutputTokens ?? String(model.max_output_tokens ?? DEFAULT_MAX_OUTPUT_TOKENS)}
+                        onChange={(e) => {
+                          const nextValue = e.target.value;
+                          setModelDrafts((prev) => ({
+                            ...prev,
+                            [model.id]: {
+                              contextWindow: prev[model.id]?.contextWindow ?? String(model.context_window ?? DEFAULT_CONTEXT_WINDOW),
+                              maxOutputTokens: nextValue,
+                            },
+                          }));
+                          const parsed = parseValidNumericInput(nextValue, 256);
+                          if (parsed !== null) {
+                            updateModel(model.id, { max_output_tokens: parsed });
+                          }
+                        }}
+                        onBlur={() => commitModelNumericField(model, "max_output_tokens")}
+                        className="mt-1 w-full rounded border border-gray-200 px-2 py-1 text-xs text-gray-700 focus:border-blue-400 focus:outline-none"
+                      />
+                    </label>
                   </div>
 
                   {testResult && (

@@ -16,6 +16,7 @@ class LoopConfig:
     prompt: str = ""
     max_turns: int = 50
     max_tokens: int = 4096
+    context_window: int = 128000
     workspace: str = "/workspace"
     stream_dir: str = "/workspace/.agent"
 
