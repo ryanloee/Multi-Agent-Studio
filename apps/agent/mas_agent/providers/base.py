@@ -26,5 +26,6 @@ class BaseLLMProvider:
         system: str = "",
         tools: list[dict] | None = None,
         max_tokens: int = 4096,
+        thinking_level: str = "off",
     ):
         raise NotImplementedError

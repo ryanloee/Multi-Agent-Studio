@@ -87,7 +87,7 @@ function splitTableRow(line: string): string[] {
 }
 
 function renderInline(text: string, inverted: boolean): ReactNode[] {
-  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+  const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g);
   return parts.map((part, idx) => {
     if (part.startsWith("`") && part.endsWith("`")) {
       return (
@@ -103,6 +103,23 @@ function renderInline(text: string, inverted: boolean): ReactNode[] {
     }
     if (part.startsWith("**") && part.endsWith("**")) {
       return <strong key={idx} className="font-semibold">{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith("*") && part.endsWith("*")) {
+      return <em key={idx} className="italic">{part.slice(1, -1)}</em>;
+    }
+    const linkMatch = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+    if (linkMatch) {
+      return (
+        <a
+          key={idx}
+          href={linkMatch[2]}
+          target="_blank"
+          rel="noreferrer"
+          className={`underline underline-offset-2 ${inverted ? "text-white" : "text-blue-600"}`}
+        >
+          {linkMatch[1]}
+        </a>
+      );
     }
     return part;
   });

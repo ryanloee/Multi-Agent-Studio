@@ -31,7 +31,7 @@ from app.models.schemas import NodeExecutionResponse, RunEventResponse, RunRespo
 if TYPE_CHECKING:
     from app.core.local_engine import LocalDAGExecutor
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter()
 
@@ -73,6 +73,142 @@ def clear_approval(run_id: str) -> None:
     _approval_results.pop(run_id, None)
 
 
+def _extract_node_model(node: dict) -> str:
+    data = node.get("data", {}) if isinstance(node, dict) else {}
+    provider = (
+        data.get("modelProvider")
+        or data.get("model_provider")
+        or node.get("model_provider")
+        or ""
+    )
+    model_id = (
+        data.get("modelId")
+        or data.get("model_id")
+        or node.get("model_id")
+        or ""
+    )
+    if provider and model_id:
+        return f"{provider}/{model_id}"
+    return str(model_id or provider or "").strip()
+
+
+def _workflow_has_model_fallback(workflow, agent_type: str) -> bool:
+    dag_json = workflow.dag_json or {}
+    metadata = dag_json.get("metadata", {}) if isinstance(dag_json, dict) else {}
+    auto_map = metadata.get("auto_child_model_map", {}) if isinstance(metadata, dict) else {}
+    if isinstance(auto_map, dict) and auto_map.get(agent_type):
+        return True
+
+    try:
+        settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
+        import json
+
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        models = payload.get("models", [])
+        has_model = isinstance(models, list) and any(
+            isinstance(item, dict) and item.get("default_model")
+            for item in models
+        )
+        logger.info(
+            "Run model fallback lookup: agent_type=%s settings_path=%s has_model=%s",
+            agent_type, settings_path, has_model,
+        )
+        return has_model
+    except Exception:
+        logger.exception("Run model fallback lookup failed for agent_type=%s", agent_type)
+        return False
+
+
+def _validate_run_request(
+    workflow,
+    dag_json: dict | None,
+) -> list[dict[str, str]]:
+    blockers: list[dict[str, str]] = []
+    workspace_directory = (workflow.workspace_directory or "").strip()
+    if not workspace_directory:
+        blockers.append({
+            "code": "workspace_missing",
+            "message": "请先设置工作目录后再启动工作流。",
+        })
+    else:
+        workspace_path = Path(workspace_directory).expanduser()
+        if not workspace_path.exists() or not workspace_path.is_dir():
+            blockers.append({
+                "code": "workspace_missing",
+                "message": f"工作目录不存在或不可用: {workspace_directory}",
+            })
+
+    nodes = [
+        node for node in (dag_json or {}).get("nodes", [])
+        if isinstance(node, dict)
+    ]
+    executable_nodes = [node for node in nodes if node.get("id") != "planner"]
+    logger.info(
+        "Run preflight: workflow=%s workspace=%s nodes=%d executable_nodes=%d edges=%d",
+        getattr(workflow, "id", ""),
+        workspace_directory or "<missing>",
+        len(nodes),
+        len(executable_nodes),
+        len((dag_json or {}).get("edges", []) or []),
+    )
+    if not executable_nodes:
+        blockers.append({
+            "code": "dag_empty",
+            "message": "当前画布还没有可执行节点，不能启动运行。",
+        })
+
+    edges = [
+        edge for edge in (dag_json or {}).get("edges", [])
+        if isinstance(edge, dict)
+    ]
+    incoming: dict[str, int] = {}
+    for edge in edges:
+        target = str(edge.get("target") or "")
+        if target:
+            incoming[target] = incoming.get(target, 0) + 1
+
+    for node in executable_nodes:
+        agent_type = (
+            node.get("type")
+            or (node.get("data", {}) if isinstance(node.get("data"), dict) else {}).get("agentType")
+            or "coder"
+        )
+        node_id = str(node.get("id") or "")
+        node_model = _extract_node_model(node)
+        has_fallback = _workflow_has_model_fallback(workflow, agent_type)
+        logger.info(
+            "Run preflight node: workflow=%s node=%s type=%s model=%s fallback=%s",
+            getattr(workflow, "id", ""),
+            node_id,
+            agent_type,
+            node_model or "<missing>",
+            has_fallback,
+        )
+        if agent_type == "merge" and incoming.get(node_id, 0) == 0:
+            blockers.append({
+                "code": "merge_missing_inputs",
+                "message": f"Merge 节点 {node_id} 没有上游依赖，无法执行。",
+            })
+        if (
+            agent_type in {"plan", "coder", "explore", "merge", "review"}
+            and not node_model
+            and not has_fallback
+        ):
+            blockers.append({
+                "code": "model_missing",
+                "message": f"节点 {node_id} 缺少可解析模型，请在节点或模型策略中补齐。",
+            })
+    if blockers:
+        logger.warning(
+            "Run preflight blocked: workflow=%s blockers=%s",
+            getattr(workflow, "id", ""),
+            blockers,
+        )
+    else:
+        logger.info("Run preflight passed: workflow=%s", getattr(workflow, "id", ""))
+    return blockers
+
+
 @router.post("/{workflow_id}/run", response_model=RunResponse, status_code=201)
 async def trigger_run(
     workflow_id: UUID,
@@ -108,11 +244,6 @@ async def trigger_run(
         raise HTTPException(status_code=404, detail="Workflow not found")
 
     workspace_directory = (workflow.workspace_directory or "").strip()
-    if not workspace_directory:
-        raise HTTPException(status_code=400, detail="请先设置工作目录后再启动工作流")
-    workspace_path = Path(workspace_directory).expanduser()
-    if not workspace_path.exists() or not workspace_path.is_dir():
-        raise HTTPException(status_code=400, detail=f"工作目录不存在或不可用: {workspace_directory}")
 
     payload = body or TriggerRunRequest()
     global_config = payload.config or {}
@@ -138,6 +269,7 @@ async def trigger_run(
             from app.api.planner_chat import _extract_dag_from_text
             from app.models.db import ChatMessage as ChatMessageORM
 
+            saw_unparsed_plan = False
             chat_result = await db.execute(
                 select(ChatMessageORM)
                 .where(
@@ -148,6 +280,8 @@ async def trigger_run(
                 .order_by(ChatMessageORM.created_at.desc())
             )
             for msg in chat_result.scalars().all():
+                if "```plan" in (msg.content or ""):
+                    saw_unparsed_plan = True
                 recovered_dag = _extract_dag_from_text(msg.content or "")
                 recovered_nodes = [
                     node for node in (recovered_dag or {}).get("nodes", [])
@@ -164,6 +298,36 @@ async def trigger_run(
                         workflow_id, len(saved_nodes),
                     )
                     break
+            if not saved_nodes and saw_unparsed_plan:
+                workflow.lifecycle_phase = "blocked"
+                workflow.blockers_json = [{
+                    "code": "planner_dag_parse_failed",
+                    "message": "Planner 曾输出结构化计划，但 JSON 不完整或无效，系统无法恢复画布节点。请让 Planner 重新生成更简洁的 DAG。",
+                }]
+                await db.commit()
+                logger.warning(
+                    "Run blocked by unrecoverable planner DAG: workflow=%s",
+                    workflow_id,
+                )
+                raise HTTPException(status_code=400, detail=workflow.blockers_json[0])
+
+        blockers = _validate_run_request(workflow, saved_dag)
+        if blockers:
+            workflow.lifecycle_phase = "blocked"
+            workflow.blockers_json = blockers
+            await db.commit()
+            raise HTTPException(status_code=400, detail=blockers[0]["message"])
+        if saved_nodes:
+            try:
+                compile_dag(saved_dag)
+            except ValueError as exc:
+                workflow.lifecycle_phase = "blocked"
+                workflow.blockers_json = [{
+                    "code": "dag_invalid",
+                    "message": str(exc),
+                }]
+                await db.commit()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         if saved_nodes:
             # Planner chat already produced a concrete DAG. Execute that
@@ -172,57 +336,25 @@ async def trigger_run(
             start_as_task_dag = True
             global_config["_mode"] = "auto"
             global_config["_goal"] = goal
-        elif not goal:
-            raise HTTPException(
-                status_code=400,
-                detail="Auto mode requires a non-empty goal on the workflow",
-            )
         else:
-            # Backward-compatible path: no saved DAG yet, so run a synthetic
-            # planner node and let its output create dynamic child tasks.
-            planner_node = {
-                "id": "planner",
-                "type": "plan",
-                "agent_type": "plan",
-                "data": {
-                    "label": "Planner",
-                    "agentType": "plan",
-                    "prompt": goal,
-                    "autoChildModelMap": workflow_metadata.get("auto_child_model_map", {}),
-                },
-                "model_provider": "",
-                "model_id": "",
-                "prompt": goal,
-            }
-            layers_data = [[planner_node]]
-            global_config["_mode"] = "auto"
-            global_config["_goal"] = goal
-
-            # Save planner node to dag_json so frontend can render it on canvas
-            workflow.dag_json = {
-                "nodes": [
-                    {
-                        "id": "planner",
-                        "type": "plan",
-                        "position": {"x": 400, "y": 200},
-                        "data": {
-                            "label": "Planner",
-                            "agentType": "plan",
-                            "prompt": goal,
-                            "autoChildModelMap": workflow_metadata.get("auto_child_model_map", {}),
-                        },
-                    }
-                ],
-                "edges": [],
-                "metadata": workflow_metadata,
-            }
-            db.add(workflow)
-            await db.flush()
+            workflow.lifecycle_phase = "blocked"
+            workflow.blockers_json = [{
+                "code": "dag_empty",
+                "message": "当前只有 Planner 规划，没有形成可执行 DAG。请先在 Planner 中完成方案并进入 Ready。",
+            }]
+            await db.commit()
+            raise HTTPException(status_code=400, detail=workflow.blockers_json[0]["message"])
     else:
         # Manual mode (default): compile the user-drawn DAG
         dag_json = payload.dag if payload.dag else (workflow.dag_json or {})
         if not dag_json:
             raise HTTPException(status_code=400, detail="No DAG definition found")
+        blockers = _validate_run_request(workflow, dag_json)
+        if blockers:
+            workflow.lifecycle_phase = "blocked"
+            workflow.blockers_json = blockers
+            await db.commit()
+            raise HTTPException(status_code=400, detail=blockers[0]["message"])
 
         # 3. Compile DAG into layers
         try:
@@ -270,6 +402,8 @@ async def trigger_run(
 
     # 5. Persist run record before starting background execution. Dynamic
     # tasks are inserted from a separate DB session and need this FK visible.
+    workflow.lifecycle_phase = "running"
+    workflow.blockers_json = []
     run = Run(
         id=run_id,
         workflow_id=workflow_id,

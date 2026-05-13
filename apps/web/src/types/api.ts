@@ -1,4 +1,11 @@
-import type { WorkflowNode, WorkflowEdge, RunStatus, AutoChildModelMap } from "./workflow";
+import type {
+  WorkflowNode,
+  WorkflowEdge,
+  RunStatus,
+  AutoChildModelMap,
+  WorkflowLifecyclePhase,
+  WorkflowBlocker,
+} from "./workflow";
 
 // ---------------------------------------------------------------------------
 // Model types
@@ -38,6 +45,7 @@ export interface WorkflowSummary {
   description: string;
   /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
   mode?: string;
+  lifecycle_phase?: WorkflowLifecyclePhase;
   /** ISO timestamp of last modification */
   updated_at: string;
   /** ISO timestamp of creation */
@@ -54,8 +62,13 @@ export interface WorkflowDetail {
   mode?: string;
   /** Natural-language goal for auto-mode workflows */
   goal?: string;
+  lifecycle_phase?: WorkflowLifecyclePhase;
+  blockers?: WorkflowBlocker[];
+  project_summary?: Record<string, unknown>;
+  project_summary_artifact_id?: string | null;
   metadata?: {
     auto_child_model_map?: AutoChildModelMap;
+    planner_ui_state?: PlannerUiState;
   };
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
@@ -74,6 +87,7 @@ export interface CreateWorkflowRequest {
   goal?: string;
   metadata?: {
     auto_child_model_map?: AutoChildModelMap;
+    planner_ui_state?: PlannerUiState;
   };
 }
 
@@ -84,11 +98,55 @@ export interface UpdateWorkflowRequest {
   workspace_directory?: string;
   mode?: "auto" | "manual";
   goal?: string;
+  lifecycle_phase?: WorkflowLifecyclePhase;
+  blockers?: WorkflowBlocker[];
+  project_summary?: Record<string, unknown>;
   metadata?: {
     auto_child_model_map?: AutoChildModelMap;
+    planner_ui_state?: PlannerUiState;
   };
   nodes?: WorkflowNode[];
   edges?: WorkflowEdge[];
+}
+
+export interface PlannerUiTaskObject {
+  title?: string;
+  objective?: string;
+  background?: string;
+  constraints?: string[];
+  success_criteria?: string[];
+  assumptions?: string[];
+  open_questions?: string[];
+}
+
+export interface PlannerUiTaskItem {
+  id: string;
+  title: string;
+  description?: string;
+  node_id?: string;
+  status?: "planned" | "blocked" | "ready";
+  depends_on?: string[];
+}
+
+export interface PlannerUiState {
+  task_object?: PlannerUiTaskObject;
+  task_board?: PlannerUiTaskItem[];
+  updated_at?: string;
+}
+
+export interface PlannerStructuredAction {
+  action: "clarify" | "assess" | "update_dag" | "set_ready" | "report_blocker";
+  message?: string;
+  ui_state?: PlannerUiState;
+  dag?: {
+    nodes: Array<Record<string, unknown>>;
+    edges: Array<Record<string, unknown>>;
+  };
+  blockers?: WorkflowBlocker[];
+  assess_request?: {
+    scope?: "project" | "current_module" | "selected_path";
+    paths?: string[];
+  };
 }
 
 // ---------------------------------------------------------------------------

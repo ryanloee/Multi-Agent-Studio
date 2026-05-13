@@ -17,8 +17,10 @@ import type {
   WorkerAgentType,
   NodeData,
   AutoChildModelMap,
+  WorkflowLifecyclePhase,
+  WorkflowBlocker,
 } from "@/types/workflow";
-import type { WorkflowDetail } from "@/types/api";
+import type { PlannerStructuredAction, PlannerUiState, WorkflowDetail } from "@/types/api";
 import { NODE_META, VALID_CONNECTIONS } from "@/lib/constants";
 import { translations } from "@/lib/i18n";
 import { useLocaleStore } from "./localeStore";
@@ -41,6 +43,11 @@ interface WorkflowState {
   mode: "auto" | "manual";
   goal: string;
   autoChildModelMap: AutoChildModelMap;
+  lifecyclePhase: WorkflowLifecyclePhase;
+  blockers: WorkflowBlocker[];
+  projectSummary: Record<string, unknown>;
+  plannerUiState: PlannerUiState;
+  plannerActionState: PlannerStructuredAction | null;
 
   // React Flow change handlers
   onNodesChange: OnNodesChange<WorkflowNode>;
@@ -82,6 +89,11 @@ interface WorkflowState {
 
   // Workspace directory
   updateWorkspaceDirectory: (dir: string) => Promise<void>;
+  setLifecyclePhase: (phase: WorkflowLifecyclePhase) => void;
+  setBlockers: (blockers: WorkflowBlocker[]) => void;
+  setProjectSummary: (summary: Record<string, unknown>) => void;
+  setPlannerUiState: (state: PlannerUiState) => void;
+  setPlannerActionState: (action: PlannerStructuredAction | null) => void;
 
   // Mode & goal
   updateMode: (mode: "auto" | "manual") => Promise<void>;
@@ -241,6 +253,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   mode: "auto" as const,
   goal: "",
   autoChildModelMap: {},
+  lifecyclePhase: "draft",
+  blockers: [],
+  projectSummary: {},
+  plannerUiState: {},
+  plannerActionState: null,
 
   // ---- React Flow change handlers ----
   onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
@@ -476,6 +493,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       mode: "auto",
       goal: workflow.goal ?? "",
       autoChildModelMap: workflow.metadata?.auto_child_model_map ?? {},
+      lifecyclePhase: workflow.lifecycle_phase ?? "draft",
+      blockers: workflow.blockers ?? [],
+      projectSummary: workflow.project_summary ?? {},
+      plannerUiState: workflow.metadata?.planner_ui_state ?? {},
+      plannerActionState: null,
     });
   },
 
@@ -488,6 +510,11 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       mode: "auto",
       goal: "",
       autoChildModelMap: {},
+      lifecyclePhase: "draft",
+      blockers: [],
+      projectSummary: {},
+      plannerUiState: {},
+      plannerActionState: null,
     });
   },
 
@@ -507,15 +534,25 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
   // ---- Workspace directory ----
   updateWorkspaceDirectory: async (dir: string) => {
-    const { currentWorkflowId } = get();
+    const { currentWorkflowId, workspaceDirectory, lifecyclePhase } = get();
     if (!currentWorkflowId) return;
     set({ workspaceDirectory: dir });
     try {
       await api.updateWorkflow(currentWorkflowId, { workspace_directory: dir });
+      if (!workspaceDirectory.trim() && dir.trim() && (lifecyclePhase === "draft" || lifecyclePhase === "blocked")) {
+        const assessed = await api.assessWorkflow(currentWorkflowId);
+        get().loadWorkflow(assessed);
+      }
     } catch (err) {
       console.error("Failed to update workspace directory:", err);
     }
   },
+
+  setLifecyclePhase: (phase) => set({ lifecyclePhase: phase }),
+  setBlockers: (blockers) => set({ blockers }),
+  setProjectSummary: (projectSummary) => set({ projectSummary }),
+  setPlannerUiState: (plannerUiState) => set({ plannerUiState }),
+  setPlannerActionState: (plannerActionState) => set({ plannerActionState }),
 
   // ---- Mode & goal ----
   updateMode: async (_mode: "auto" | "manual") => {
@@ -543,7 +580,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   updateAutoChildModelMap: async (agentType, model) => {
-    const { currentWorkflowId, autoChildModelMap } = get();
+    const { currentWorkflowId, autoChildModelMap, plannerUiState } = get();
     const nextMap = {
       ...autoChildModelMap,
       [agentType]: model,
@@ -554,6 +591,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       await api.updateWorkflow(currentWorkflowId, {
         metadata: {
           auto_child_model_map: nextMap,
+          planner_ui_state: plannerUiState,
         },
       });
     } catch (err) {

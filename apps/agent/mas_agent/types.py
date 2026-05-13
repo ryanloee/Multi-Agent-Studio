@@ -17,6 +17,7 @@ class LoopConfig:
     max_turns: int = 50
     max_tokens: int = 4096
     context_window: int = 128000
+    thinking_level: str = "high"
     workspace: str = "/workspace"
     stream_dir: str = "/workspace/.agent"
 

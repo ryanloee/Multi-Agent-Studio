@@ -203,6 +203,7 @@ export default function PlannerChat() {
           body: JSON.stringify({
             workflow_id: currentWorkflowId,
             message: text,
+            thinking_level: "medium",
             history,
           }),
           signal: abortRef.current?.signal,

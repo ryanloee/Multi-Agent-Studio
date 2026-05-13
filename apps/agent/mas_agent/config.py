@@ -16,6 +16,7 @@ PROJECT_CONFIG_FILENAME = "mas.json"
 DEFAULTS: dict[str, Any] = {
     "max_turns": 50,
     "max_tokens": 4096,
+    "thinking_level": "high",
     "shell_timeout": 120,
     "permissions": [],
     "agents": {},

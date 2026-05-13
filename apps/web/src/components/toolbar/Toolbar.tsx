@@ -9,13 +9,14 @@ import {
   Globe,
   Check,
   Target,
+  AlertTriangle,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { api } from "@/lib/api";
 import { STATUS_COLORS } from "@/lib/constants";
-import type { RunStatus } from "@/types/workflow";
+import type { RunStatus, WorkflowLifecyclePhase } from "@/types/workflow";
 
 interface ToolbarProps {
   workflowId: string;
@@ -33,7 +34,12 @@ export default function Toolbar({
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
+  const plannerUiState = useWorkflowStore((s) => s.plannerUiState);
   const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
+  const lifecyclePhase = useWorkflowStore((s) => s.lifecyclePhase);
+  const blockers = useWorkflowStore((s) => s.blockers);
+  const setLifecyclePhase = useWorkflowStore((s) => s.setLifecyclePhase);
+  const setBlockers = useWorkflowStore((s) => s.setBlockers);
 
   const runId = useRunStore((s) => s.runId);
   const status = useRunStore((s) => s.status);
@@ -52,6 +58,15 @@ export default function Toolbar({
   const isRunning = status === "running";
   const isPaused = status === "paused";
   const hasWorkspaceDirectory = workspaceDirectory.trim().length > 0;
+  const phaseLabels: Record<WorkflowLifecyclePhase, string> = {
+    draft: "Draft",
+    assessing: "Assessing",
+    planning: "Planning",
+    ready: "Ready",
+    running: "Running",
+    blocked: "Blocked",
+    review: "Review",
+  };
 
   const STATUS_LABELS: Record<RunStatus, string> = {
     idle: t("toolbar.status.idle"),
@@ -72,7 +87,10 @@ export default function Toolbar({
         name: workflowName,
         nodes,
         edges,
-        metadata: { auto_child_model_map: autoChildModelMap },
+        metadata: {
+          auto_child_model_map: autoChildModelMap,
+          planner_ui_state: plannerUiState,
+        },
       });
       setSaved(true);
       onSave?.();
@@ -82,32 +100,63 @@ export default function Toolbar({
     } finally {
       setSaving(false);
     }
-  }, [workflowId, workflowName, nodes, edges, autoChildModelMap, onSave]);
+  }, [workflowId, workflowName, nodes, edges, autoChildModelMap, plannerUiState, onSave]);
 
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
 
   const handleRun = useCallback(async () => {
-    if (!hasWorkspaceDirectory) {
-      window.alert("请先设置工作目录后再启动工作流。");
-      return;
-    }
     setTriggering(true);
     try {
+      console.groupCollapsed("[MAS Run] trigger");
+      console.info("workflow", workflowId);
+      console.info("phase", lifecyclePhase);
+      console.info("workspace", workspaceDirectory || "<missing>");
+      console.info("nodes", nodes.map((node) => ({
+        id: node.id,
+        type: node.type,
+        agentType: node.data?.agentType,
+        modelProvider: node.data?.modelProvider,
+        modelId: node.data?.modelId,
+      })));
+      console.info("edges", edges.map((edge) => ({ id: edge.id, source: edge.source, target: edge.target })));
+      console.info("autoChildModelMap", autoChildModelMap);
+      console.groupEnd();
       clearEvents();
       const result = await api.triggerRun(workflowId);
       setRunId(result.id);
       setStatus("running");
+      setLifecyclePhase("running");
+      setBlockers([]);
       // Reload workflow so auto-mode planner node (saved to dag_json by backend) appears on canvas
       const updated = await api.getWorkflow(workflowId);
       loadWorkflow(updated);
     } catch (err) {
       console.error("Run trigger failed:", err);
+      try {
+        const updated = await api.getWorkflow(workflowId);
+        loadWorkflow(updated);
+      } catch {
+        // ignore secondary fetch failure
+      }
       window.alert(err instanceof Error ? err.message : "启动工作流失败");
       setStatus("idle");
     } finally {
       setTriggering(false);
     }
-  }, [workflowId, clearEvents, setRunId, setStatus, loadWorkflow, hasWorkspaceDirectory]);
+  }, [
+    workflowId,
+    lifecyclePhase,
+    workspaceDirectory,
+    nodes,
+    edges,
+    autoChildModelMap,
+    clearEvents,
+    setRunId,
+    setStatus,
+    loadWorkflow,
+    setLifecyclePhase,
+    setBlockers,
+  ]);
 
   const handleCancel = useCallback(async () => {
     if (!runId) return;
@@ -192,6 +241,20 @@ export default function Toolbar({
           <Target size={12} />
           {t("workflow.modeAuto")}
         </div>
+        <div
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none ${
+            lifecyclePhase === "ready"
+              ? "bg-emerald-100 text-emerald-700"
+              : lifecyclePhase === "blocked"
+                ? "bg-red-100 text-red-700"
+                : lifecyclePhase === "running"
+                  ? "bg-blue-100 text-blue-700"
+                  : "bg-gray-100 text-gray-700"
+          }`}
+        >
+          {lifecyclePhase === "blocked" ? <AlertTriangle size={12} /> : <Target size={12} />}
+          {phaseLabels[lifecyclePhase]}
+        </div>
       </div>
 
       {/* Right: Actions */}
@@ -248,6 +311,16 @@ export default function Toolbar({
         >
           {STATUS_LABELS[status]}
         </span>
+
+        {blockers.length > 0 && (
+          <div
+            className="hidden xl:flex items-center gap-1.5 max-w-[280px] px-2.5 py-1 rounded-full text-xs font-medium bg-red-50 text-red-700 border border-red-200 truncate"
+            title={blockers.map((item) => item.message).join("\n")}
+          >
+            <AlertTriangle size={12} />
+            <span className="truncate">{blockers[0].message}</span>
+          </div>
+        )}
 
         {/* Language toggle */}
         <button

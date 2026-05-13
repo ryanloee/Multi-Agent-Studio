@@ -112,11 +112,17 @@ async function handleHttpError(response: Response): Promise<never> {
     // Body is not JSON — ignore
   }
 
-  const serverMessage = body?.message ?? (typeof (body as { detail?: unknown } | null)?.detail === "string"
-    ? (body as { detail?: string }).detail
-    : undefined);
+  const detail = (body as { detail?: unknown } | null)?.detail;
+  const serverMessage = body?.message
+    ?? (typeof detail === "string"
+      ? detail
+      : Array.isArray(detail) && detail[0] && typeof detail[0] === "object" && "message" in detail[0]
+        ? String((detail[0] as { message?: unknown }).message ?? "")
+        : detail && typeof detail === "object" && "message" in detail
+          ? String((detail as { message?: unknown }).message ?? "")
+          : undefined);
   const serverCode = body?.code;
-  const serverDetails = body?.details;
+  const serverDetails = body?.details ?? (detail && typeof detail === "object" ? { detail } : undefined);
 
   switch (status) {
     case 400:
@@ -221,6 +227,12 @@ export const api = {
     request<WorkflowDetail>(`/workflows/${id}`, {
       method: "PUT",
       body: JSON.stringify(data),
+    }),
+
+  /** Run lightweight project assessment for an existing workspace */
+  assessWorkflow: (id: string): Promise<WorkflowDetail> =>
+    request<WorkflowDetail>(`/workflows/${id}/assess`, {
+      method: "POST",
     }),
 
   /** Delete a workflow */

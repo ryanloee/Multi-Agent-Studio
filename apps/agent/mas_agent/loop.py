@@ -66,6 +66,7 @@ class AgentLoop:
             system=system,
             tools=tools if tools else None,
             max_tokens=self.config.max_tokens,
+            thinking_level=self.config.thinking_level,
         ):
             if chunk.type == "text":
                 assistant_text += chunk.text

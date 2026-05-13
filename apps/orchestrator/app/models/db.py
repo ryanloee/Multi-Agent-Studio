@@ -29,6 +29,12 @@ class Workflow(Base):
     workspace_directory: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     mode: Mapped[str] = mapped_column(String(20), nullable=False, default="manual", server_default="manual")
     goal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lifecycle_phase: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="draft", server_default="draft",
+    )
+    blockers_json: Mapped[Optional[list[dict]]] = mapped_column(JSON, nullable=True)
+    project_summary_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    project_summary_artifact_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         server_default=func.now(),

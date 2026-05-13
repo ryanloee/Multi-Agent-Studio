@@ -1432,6 +1432,7 @@ class LocalDAGExecutor:
                         upstream_context=self._build_upstream_context(
                             node_id, edges, layer_results,
                         ) + merge_context,
+                        destroy_owned_sandbox=False,
                     )
                     return node_id, result
 
@@ -1458,6 +1459,7 @@ class LocalDAGExecutor:
                         node_id, edges, layer_results,
                     ) + merge_context,
                     sandbox_id=assigned_sid,
+                    destroy_owned_sandbox=False,
                 )
                 if result.get("state") == "completed":
                     await self._create_artifact_for_task(
@@ -1480,9 +1482,24 @@ class LocalDAGExecutor:
                 *[_run_one(node) for node in runnable_nodes],
                 return_exceptions=True,
             )
-            for item in results:
+            for node, item in zip(runnable_nodes, results):
+                node_id = str(node.get("id", node.get("node_id", "")))
                 if isinstance(item, Exception):
-                    logger.warning("Task-aware layer execution failed: %s", item)
+                    logger.warning("Task-aware layer execution failed for %s: %s", node_id, item, exc_info=True)
+                    result = {
+                        "state": "failed",
+                        "node_id": node_id,
+                        "error": str(item),
+                        "result_summary": str(item),
+                    }
+                    layer_results[node_id] = result
+                    await self._emit("node_failed", run_id, node_id, content=str(item))
+                    await self._emit("status", run_id, node_id, content="failed")
+                    await self._emit(
+                        "child_completed", run_id, parent_node_id,
+                        child_node_id=node_id,
+                        content="state=failed",
+                    )
                     continue
                 node_id, result = item
                 layer_results[node_id] = result
@@ -1545,6 +1562,7 @@ class LocalDAGExecutor:
         try:
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel
+            from app.models.db import Workflow as WorkflowModel
             from uuid import UUID as _UUID
             async with async_session_factory() as session:
                 from sqlalchemy import select
@@ -1557,6 +1575,24 @@ class LocalDAGExecutor:
                     if status in ("completed", "failed", "cancelled"):
                         from datetime import datetime as _datetime
                         run_row.completed_at = _datetime.utcnow()
+                    wf_result = await session.execute(
+                        select(WorkflowModel).where(WorkflowModel.id == run_row.workflow_id)
+                    )
+                    workflow_row = wf_result.scalar_one_or_none()
+                    if workflow_row is not None:
+                        if status == "running":
+                            workflow_row.lifecycle_phase = "running"
+                            workflow_row.blockers_json = []
+                        elif status in ("completed", "failed", "cancelled"):
+                            workflow_row.lifecycle_phase = "review"
+                        elif status == "paused":
+                            workflow_row.lifecycle_phase = "blocked"
+                            blockers = workflow_row.blockers_json or []
+                            if not blockers:
+                                workflow_row.blockers_json = [{
+                                    "code": "human_approval_required",
+                                    "message": "当前运行暂停，等待人工审批或继续处理。",
+                                }]
                     await session.commit()
             run_state = self._runs.get(run_id, {})
             await self._write_mas_run_manifest(
@@ -2397,6 +2433,7 @@ class LocalDAGExecutor:
                 f"--stream-dir /workspace/.agent "
                 f"--max-tokens {max_output_tokens} "
                 f"--context-window {context_window} "
+                f"--thinking-level high "
             )
             if provider_url:
                 cmd += f"--provider-url {shlex.quote(provider_url)} "

@@ -140,6 +140,7 @@ class TaskScheduler:
         workspace_directory: str | None = None,
         upstream_context: str = "",
         sandbox_id: str | None = None,
+        destroy_owned_sandbox: bool = True,
     ) -> dict:
         """Execute a worker node for a given task, handling escalations.
 
@@ -182,6 +183,7 @@ class TaskScheduler:
                 workspace_directory=workspace_directory,
                 upstream_context="",
                 sandbox_id=sandbox_id,
+                destroy_owned_sandbox=destroy_owned_sandbox,
             )
 
             state = result.get("state", "failed")

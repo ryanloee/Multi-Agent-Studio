@@ -40,6 +40,12 @@ class UpdateWorkflowRequest(BaseModel):
     mode: Optional[str] = Field(None, pattern="^(auto|manual)$")
     goal: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
+    lifecycle_phase: Optional[str] = Field(
+        None,
+        pattern="^(draft|assessing|planning|ready|running|blocked|review)$",
+    )
+    blockers: Optional[list[dict[str, Any]]] = None
+    project_summary: Optional[dict[str, Any]] = None
     nodes: Optional[list[dict[str, Any]]] = None
     edges: Optional[list[dict[str, Any]]] = None
 
@@ -64,6 +70,10 @@ class WorkflowResponse(BaseModel):
     workspace_directory: Optional[str] = None
     mode: str = "manual"
     goal: Optional[str] = None
+    lifecycle_phase: str = "draft"
+    blockers_json: Optional[list[dict[str, Any]]] = None
+    project_summary_json: Optional[dict[str, Any]] = None
+    project_summary_artifact_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -86,6 +96,16 @@ class WorkflowResponse(BaseModel):
     @property
     def metadata(self) -> dict[str, Any]:
         return self.dag_json.get("metadata", {}) if self.dag_json else {}
+
+    @computed_field
+    @property
+    def blockers(self) -> list[dict[str, Any]]:
+        return self.blockers_json or []
+
+    @computed_field
+    @property
+    def project_summary(self) -> dict[str, Any]:
+        return self.project_summary_json or {}
 
     model_config = {"from_attributes": True}
 
@@ -252,7 +272,7 @@ class ArtifactCreate(BaseModel):
     node_id: Optional[str] = None
     type: str = Field(
         ...,
-        pattern="^(file_change|research_note|test_result|review_report|merge_report|decision|final_output)$",
+        pattern="^(file_change|research_note|test_result|review_report|merge_report|decision|final_output|project_summary)$",
     )
     title: str = Field(..., min_length=1, max_length=512)
     content: str = ""
@@ -263,7 +283,7 @@ class ArtifactCreate(BaseModel):
 class ArtifactUpdate(BaseModel):
     type: Optional[str] = Field(
         None,
-        pattern="^(file_change|research_note|test_result|review_report|merge_report|decision|final_output)$",
+        pattern="^(file_change|research_note|test_result|review_report|merge_report|decision|final_output|project_summary)$",
     )
     title: Optional[str] = Field(None, min_length=1, max_length=512)
     content: Optional[str] = None

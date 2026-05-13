@@ -14,6 +14,8 @@ import {
   FolderOpen,
   ArrowRight,
   Target,
+  AlertTriangle,
+  CheckCircle2,
   type LucideProps,
 } from "lucide-react";
 import type { AgentNodeType, EdgeData, WorkflowNode, WorkflowEdge, WorkerAgentType } from "@/types/workflow";
@@ -79,6 +81,8 @@ export default function ConfigPanel() {
   const updateGoal = useWorkflowStore((s) => s.updateGoal);
   const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
   const updateAutoChildModelMap = useWorkflowStore((s) => s.updateAutoChildModelMap);
+  const lifecyclePhase = useWorkflowStore((s) => s.lifecyclePhase);
+  const blockers = useWorkflowStore((s) => s.blockers);
   const t = useLocaleStore((s) => s.t);
   const defaultModel = useSettingsStore((s) => {
     const models = s.settings.models;
@@ -301,6 +305,44 @@ export default function ConfigPanel() {
             placeholder={t("config.workspaceDirectoryPlaceholder")}
             label={t("config.workspaceDirectory")}
           />
+
+          <div className="space-y-3 rounded-xl border border-gray-200 bg-gray-50/70 p-3">
+            <div>
+              <label className="block text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                Execution Readiness
+              </label>
+              <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
+                当前工作流的执行阶段、阻塞项和基础可运行性提示。
+              </p>
+            </div>
+            <div className="flex items-center gap-2 text-sm font-medium text-gray-700">
+              <CheckCircle2 size={14} className="text-emerald-500" />
+              <span>阶段: {lifecyclePhase}</span>
+            </div>
+            <div className="text-[11px] text-gray-500">
+              DAG 校验状态: {nodes.length > 1 ? "已形成可编辑结构" : "仍需补充可执行节点"}
+            </div>
+            <div className="text-[11px] text-gray-500">
+              工作目录: {workspaceDirectory.trim() ? "已设置" : "未设置"}
+            </div>
+            {blockers.length > 0 ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
+                <div className="mb-1 flex items-center gap-1 font-medium">
+                  <AlertTriangle size={12} />
+                  阻塞项
+                </div>
+                <div className="space-y-1">
+                  {blockers.map((item) => (
+                    <div key={`${item.code}-${item.message}`}>- {item.message}</div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-[11px] text-emerald-700">
+                当前没有已知阻塞项。
+              </div>
+            )}
+          </div>
 
           {/* Workflow Mode */}
           <div className="space-y-1.5">

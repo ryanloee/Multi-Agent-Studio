@@ -23,7 +23,8 @@ export type ArtifactType =
   | "review_report"
   | "merge_report"
   | "decision"
-  | "final_output";
+  | "final_output"
+  | "project_summary";
 
 export interface Artifact {
   id: string;

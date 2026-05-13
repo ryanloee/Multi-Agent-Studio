@@ -1,28 +1,22 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { Send, Loader2, MessageCircle, Brain } from "lucide-react";
+import { Send, Loader2, MessageCircle, Brain, Square } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
-import { useRunStore } from "@/stores/runStore";
-import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
+import { usePlannerChatStore } from "@/stores/plannerChatStore";
 import { api } from "@/lib/api";
 import { authHeaders } from "@/lib/auth";
 import { parsePlannerObservableContent } from "@/lib/plannerObservable";
 import MarkdownMessage from "@/components/common/MarkdownMessage";
 import type { ChatHistoryItem } from "@/types/settings";
 
-// ---------------------------------------------------------------------------
-// Chat message type (local state)
-// ---------------------------------------------------------------------------
-
-interface ChatMsg {
-  role: "user" | "assistant";
-  content: string;
-}
-
-function isExecutionRequest(text: string): boolean {
-  return /(^|\s|，|。|,)(开始执行|开始工作|开始做|执行工作流|开始|执行|运行|开跑|run|start)(\s|，|。|,|$)/i.test(text);
+function plannerChatUrl(): string {
+  const configured = process.env.NEXT_PUBLIC_API_URL;
+  if (configured) return `${configured}/planner/chat`;
+  if (typeof window === "undefined") return "/api/planner/chat";
+  const { protocol, hostname } = window.location;
+  return `${protocol}//${hostname}:8000/api/planner/chat`;
 }
 
 // ---------------------------------------------------------------------------
@@ -36,52 +30,54 @@ function isExecutionRequest(text: string): boolean {
 export default function PlannerChatTab() {
   const t = useLocaleStore((s) => s.t);
   const currentWorkflowId = useWorkflowStore((s) => s.currentWorkflowId);
-  const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
   const nodes = useWorkflowStore((s) => s.nodes);
+  const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
+  const setLifecyclePhase = useWorkflowStore((s) => s.setLifecyclePhase);
+  const setBlockers = useWorkflowStore((s) => s.setBlockers);
+  const setProjectSummary = useWorkflowStore((s) => s.setProjectSummary);
+  const setPlannerUiState = useWorkflowStore((s) => s.setPlannerUiState);
+  const setPlannerActionState = useWorkflowStore((s) => s.setPlannerActionState);
 
-  // Node selector — default to "planner"
-  const [selectedNodeId, setSelectedNodeId] = useState("planner");
-
-  // Messages loaded from server + new local ones
-  const [messages, setMessages] = useState<ChatMsg[]>([]);
-  const [input, setInput] = useState("");
-  const [streaming, setStreaming] = useState(false);
+  const selectedNodeId = usePlannerChatStore((s) => s.selectedNodeId);
+  const conversationKey = usePlannerChatStore((s) => s.conversationKey);
+  const setSelectedNodeId = usePlannerChatStore((s) => s.setSelectedNodeId);
+  const setConversationKey = usePlannerChatStore((s) => s.setConversationKey);
+  const messages = usePlannerChatStore((s) => s.messages);
+  const setMessages = usePlannerChatStore((s) => s.setMessages);
+  const input = usePlannerChatStore((s) => s.input);
+  const setInput = usePlannerChatStore((s) => s.setInput);
+  const streaming = usePlannerChatStore((s) => s.streaming);
+  const streamStartedAt = usePlannerChatStore((s) => s.streamStartedAt);
+  const beginStream = usePlannerChatStore((s) => s.beginStream);
+  const stopStream = usePlannerChatStore((s) => s.stopStream);
+  const finishStream = usePlannerChatStore((s) => s.finishStream);
+  const setStreamingChars = usePlannerChatStore((s) => s.setStreamingChars);
+  const setDagUpdateCount = usePlannerChatStore((s) => s.setDagUpdateCount);
+  const setObservableTrace = usePlannerChatStore((s) => s.setObservableTrace);
+  const appendRawText = usePlannerChatStore((s) => s.appendRawText);
+  const appendThinking = usePlannerChatStore((s) => s.appendThinking);
+  const recordStreamEvent = usePlannerChatStore((s) => s.recordStreamEvent);
+  const recordPlannerToolCall = usePlannerChatStore((s) => s.recordPlannerToolCall);
+  const streamEventCount = usePlannerChatStore((s) => s.streamEventCount);
+  const lastStreamEventType = usePlannerChatStore((s) => s.lastStreamEventType);
+  const lastStreamEventPreview = usePlannerChatStore((s) => s.lastStreamEventPreview);
+  const plannerToolCallCount = usePlannerChatStore((s) => s.plannerToolCallCount);
+  const lastPlannerToolName = usePlannerChatStore((s) => s.lastPlannerToolName);
+  const lastPlannerToolInputKeys = usePlannerChatStore((s) => s.lastPlannerToolInputKeys);
+  const loadingHistory = usePlannerChatStore((s) => s.loadingHistory);
+  const setLoadingHistory = usePlannerChatStore((s) => s.setLoadingHistory);
+  const thinkingLevel = usePlannerChatStore((s) => s.thinkingLevel);
+  const setThinkingLevel = usePlannerChatStore((s) => s.setThinkingLevel);
   const [waitingSeconds, setWaitingSeconds] = useState(0);
-  const [streamingChars, setStreamingChars] = useState(0);
-  const [dagUpdateCount, setDagUpdateCount] = useState(0);
-  const [observableTrace, setObservableTrace] = useState<string[]>([]);
-  const [loadingHistory, setLoadingHistory] = useState(false);
+  const streamingChars = usePlannerChatStore((s) => s.streamingChars);
+  const dagUpdateCount = usePlannerChatStore((s) => s.dagUpdateCount);
+  const observableTrace = usePlannerChatStore((s) => s.observableTrace);
+  const thinkingContent = usePlannerChatStore((s) => s.thinkingContent);
+  const thinkingEventCount = usePlannerChatStore((s) => s.thinkingEventCount);
+  const rawTextContent = usePlannerChatStore((s) => s.rawTextContent);
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  const triggerRun = useCallback(async (): Promise<boolean> => {
-    if (!currentWorkflowId) return false;
-    if (!workspaceDirectory.trim()) {
-      setMessages((prev) => [
-        ...prev,
-        { role: "assistant", content: "未设置工作目录，不能开始执行。请先在工作流配置里设置项目目录。" },
-      ]);
-      return false;
-    }
-
-    const runStore = useRunStore.getState();
-    const taskStore = useTaskStore.getState();
-
-    runStore.clearEvents();
-    taskStore.clearTasks();
-
-    const store = useWorkflowStore.getState();
-    const result = await api.triggerRun(currentWorkflowId, {
-      nodes: store.nodes,
-      edges: store.edges,
-    });
-    runStore.setRunId(result.id);
-    runStore.setStatus("running");
-    taskStore.setCurrentRunId(result.id);
-
-    const updated = await api.getWorkflow(currentWorkflowId);
-    useWorkflowStore.getState().loadWorkflow(updated);
-    return true;
-  }, [currentWorkflowId, workspaceDirectory]);
+  const liveThinkingRef = useRef<HTMLDivElement>(null);
+  const liveReplyRef = useRef<HTMLDivElement>(null);
 
   // Build node options for the selector
   const nodeOptions = (() => {
@@ -105,7 +101,10 @@ export default function PlannerChatTab() {
   // Load chat history when workflow/node changes
   useEffect(() => {
     if (!currentWorkflowId) return;
+    if (streaming) return;
     const wfId = currentWorkflowId;
+    const key = `${wfId}:${selectedNodeId}`;
+    if (conversationKey === key && messages.length > 0) return;
     let cancelled = false;
 
     async function loadHistory() {
@@ -113,6 +112,7 @@ export default function PlannerChatTab() {
       try {
         const history = await api.getChatHistory(wfId, selectedNodeId);
         if (cancelled) return;
+        setConversationKey(key);
         setMessages(
           history.map((h: ChatHistoryItem) => ({
             role: h.role as "user" | "assistant",
@@ -128,7 +128,16 @@ export default function PlannerChatTab() {
 
     loadHistory();
     return () => { cancelled = true; };
-  }, [currentWorkflowId, selectedNodeId]);
+  }, [
+    currentWorkflowId,
+    selectedNodeId,
+    streaming,
+    conversationKey,
+    messages.length,
+    setConversationKey,
+    setLoadingHistory,
+    setMessages,
+  ]);
 
   // Auto-scroll
   useEffect(() => {
@@ -138,31 +147,40 @@ export default function PlannerChatTab() {
   }, [messages]);
 
   useEffect(() => {
+    if (liveThinkingRef.current) {
+      liveThinkingRef.current.scrollTop = liveThinkingRef.current.scrollHeight;
+    }
+  }, [thinkingContent]);
+
+  useEffect(() => {
+    if (liveReplyRef.current) {
+      liveReplyRef.current.scrollTop = liveReplyRef.current.scrollHeight;
+    }
+  }, [rawTextContent]);
+
+  useEffect(() => {
     if (!streaming) {
       setWaitingSeconds(0);
       return;
     }
-    const started = Date.now();
     const timer = setInterval(() => {
-      setWaitingSeconds(Math.floor((Date.now() - started) / 1000));
+      setWaitingSeconds(Math.floor((Date.now() - (streamStartedAt ?? Date.now())) / 1000));
     }, 1000);
     return () => clearInterval(timer);
-  }, [streaming]);
+  }, [streaming, streamStartedAt]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
     if (!text || !currentWorkflowId || streaming) return;
 
+    const controller = new AbortController();
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
-    setStreaming(true);
-    setStreamingChars(0);
-    setDagUpdateCount(0);
-    setObservableTrace([]);
+    beginStream(controller);
 
     try {
       const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || "/api"}/planner/chat`,
+        plannerChatUrl(),
         {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders() },
@@ -170,23 +188,27 @@ export default function PlannerChatTab() {
             workflow_id: currentWorkflowId,
             message: text,
             node_id: selectedNodeId,
+            thinking_level: thinkingLevel,
             history: [],  // Backend loads from DB, no need to send history
           }),
+          signal: controller.signal,
         }
       );
 
       if (!response.ok) {
         const err = await response.text();
         setMessages((prev) => [...prev, { role: "assistant", content: `请求失败: ${err}` }]);
-        setStreaming(false);
+        finishStream();
         return;
       }
 
       const reader = response.body?.getReader();
-      if (!reader) { setStreaming(false); return; }
+      if (!reader) { finishStream(); return; }
 
       const decoder = new TextDecoder();
       let assistantContent = "";
+      let plannerActionMessage = "";
+      let sseBuffer = "";
 
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
 
@@ -194,17 +216,28 @@ export default function PlannerChatTab() {
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split("\n");
+        sseBuffer += decoder.decode(value, { stream: true });
+        const rawEvents = sseBuffer.split(/\r?\n\r?\n/);
+        sseBuffer = rawEvents.pop() ?? "";
 
-        for (const line of lines) {
-          if (!line.startsWith("data: ")) continue;
-          const data = line.slice(6);
+        for (const rawEvent of rawEvents) {
+          const data = rawEvent
+            .split(/\r?\n/)
+            .map((line) => line.trimEnd())
+            .filter((line) => line.startsWith("data: "))
+            .map((line) => line.slice(6).trimStart())
+            .join("\n");
+          if (!data) continue;
           if (data === "[DONE]") continue;
 
           try {
             const event = JSON.parse(data);
+            recordStreamEvent(
+              event.type || "unknown",
+              event.content || event.message || event.name || (event.input_keys ? event.input_keys.join(", ") : "")
+            );
             if (event.type === "text") {
+              appendRawText(event.content || "");
               assistantContent += event.content;
               setStreamingChars(assistantContent.length);
               const parsed = parsePlannerObservableContent(assistantContent);
@@ -216,37 +249,124 @@ export default function PlannerChatTab() {
                 }
                 return updated;
               });
+            } else if (event.type === "thinking_delta") {
+              const delta = event.content || "";
+              appendThinking(delta);
+            } else if (event.type === "planner_tool_call") {
+              recordPlannerToolCall(
+                event.name || "unknown_tool",
+                Array.isArray(event.input_keys) ? event.input_keys : []
+              );
+            } else if (event.type === "planner_action") {
+              const action = event.action;
+              plannerActionMessage = action?.message || plannerActionMessage;
+              if (plannerActionMessage) {
+                setMessages((prev) => {
+                  const updated = [...prev];
+                  const last = updated[updated.length - 1];
+                  if (last?.role === "assistant" && !last.content.trim()) {
+                    updated[updated.length - 1] = { ...last, content: plannerActionMessage };
+                  }
+                  return updated;
+                });
+              }
+              setPlannerActionState(action);
+              if (action?.ui_state) setPlannerUiState(action.ui_state);
+              if (action?.blockers) setBlockers(action.blockers);
+              if (action?.action === "assess" && currentWorkflowId) {
+                setLifecyclePhase("assessing");
+                try {
+                  const assessed = await api.assessWorkflow(currentWorkflowId);
+                  loadWorkflow(assessed);
+                  setProjectSummary(assessed.project_summary ?? {});
+                } catch (err) {
+                  setMessages((prev) => [
+                    ...prev,
+                    { role: "assistant", content: `项目评估失败: ${err instanceof Error ? err.message : String(err)}` },
+                  ]);
+                }
+              } else if (action?.action === "set_ready") {
+                setLifecyclePhase("ready");
+                setBlockers([]);
+              } else if (action?.action === "report_blocker") {
+                setLifecyclePhase("blocked");
+              } else if (action?.action === "update_dag") {
+                setLifecyclePhase("planning");
+                setBlockers([]);
+              }
             } else if (event.type === "dag_update") {
               setDagUpdateCount((count) => count + 1);
-              const updated = await api.getWorkflow(currentWorkflowId);
-              useWorkflowStore.getState().loadWorkflow(updated);
+              setMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                if (last?.role === "assistant" && !last.content.trim()) {
+                  updated[updated.length - 1] = { ...last, content: "已更新工作流画布，请在左侧任务对象和中间画布查看规划结果。" };
+                }
+                return updated;
+              });
+              if (currentWorkflowId) {
+                const updated = await api.getWorkflow(currentWorkflowId);
+                loadWorkflow(updated);
+              }
+            } else if (event.type === "planner_ui_update") {
+              if (event.ui_state) setPlannerUiState(event.ui_state);
+              if (currentWorkflowId) {
+                const updated = await api.getWorkflow(currentWorkflowId);
+                loadWorkflow(updated);
+              }
             }
           } catch { /* skip */ }
         }
       }
 
-      if (isExecutionRequest(text)) {
-        try {
-          const started = await triggerRun();
-          if (started) {
-            setMessages((prev) => [
-              ...prev,
-              { role: "assistant", content: "已开始执行工作流，任务面板会显示各节点任务。" },
-            ]);
-          }
-        } catch (err) {
-          setMessages((prev) => [
-            ...prev,
-            { role: "assistant", content: `启动工作流失败: ${err}` },
-          ]);
-        }
+      if (currentWorkflowId) {
+        const refreshed = await api.getWorkflow(currentWorkflowId);
+        loadWorkflow(refreshed);
       }
+      setMessages((prev) => {
+        const updated = [...prev];
+        const last = updated[updated.length - 1];
+        if (last?.role === "assistant" && !last.content.trim()) {
+          const parsed = parsePlannerObservableContent(assistantContent);
+          updated[updated.length - 1] = {
+            ...last,
+            content: parsed.visibleContent || plannerActionMessage || "本轮 Planner 已完成，但没有收到可展示正文；如果画布没有变化，请让 Planner 重新生成更简洁的 DAG。",
+          };
+        }
+        return updated;
+      });
     } catch (err) {
-      setMessages((prev) => [...prev, { role: "assistant", content: `连接失败: ${err}` }]);
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setMessages((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.role === "assistant" && last.content === "已停止本轮 Planner 输出。") return prev;
+          return [...prev, { role: "assistant", content: "已停止本轮 Planner 输出。" }];
+        });
+      } else {
+        setMessages((prev) => [...prev, { role: "assistant", content: `连接失败: ${err}` }]);
+      }
     } finally {
-      setStreaming(false);
+      finishStream();
     }
-  }, [input, currentWorkflowId, streaming, selectedNodeId, triggerRun]);
+  }, [
+    input,
+    currentWorkflowId,
+    streaming,
+    selectedNodeId,
+    thinkingLevel,
+    beginStream,
+    finishStream,
+    appendThinking,
+    appendRawText,
+    recordStreamEvent,
+    recordPlannerToolCall,
+    loadWorkflow,
+    setLifecyclePhase,
+    setBlockers,
+    setProjectSummary,
+    setPlannerUiState,
+    setPlannerActionState,
+  ]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
@@ -280,6 +400,28 @@ export default function PlannerChatTab() {
         <span className="text-[10px] text-gray-400 truncate">
           {messages.length > 0 ? `${messages.length} messages` : t("planner.inputHint")}
         </span>
+        <select
+          value={thinkingLevel}
+          onChange={(e) => setThinkingLevel(e.target.value as "off" | "low" | "medium" | "high")}
+          disabled={streaming}
+          className="ml-auto text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400"
+          title="思考等级"
+        >
+          <option value="off">不思考</option>
+          <option value="low">轻思考</option>
+          <option value="medium">中度思考</option>
+          <option value="high">高度思考</option>
+        </select>
+        {streaming && (
+          <button
+            onClick={stopStream}
+            className="inline-flex items-center gap-1 rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-100"
+            title="停止本轮 Planner 输出"
+          >
+            <Square size={9} />
+            停止
+          </button>
+        )}
         {loadingHistory && <Loader2 size={10} className="animate-spin text-gray-400" />}
       </div>
 
@@ -310,10 +452,20 @@ export default function PlannerChatTab() {
                 compact
                 inverted={msg.role === "user"}
               />
+              {msg.role === "assistant" && msg.thinking?.trim() && (
+                <details className="mt-2 rounded border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] text-slate-700">
+                  <summary className="cursor-pointer select-none font-medium text-slate-700">
+                    本轮思考内容
+                  </summary>
+                  <div className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap rounded bg-white px-2 py-1 font-mono leading-relaxed">
+                    {msg.thinking.trim()}
+                  </div>
+                </details>
+              )}
             </div>
           </div>
         ))}
-        {streaming && messages[messages.length - 1]?.content === "" && (
+        {streaming && (
           <div className="flex justify-start">
             <div className="max-w-[78%] rounded-xl border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-700">
               <div className="flex items-center gap-1.5">
@@ -331,8 +483,41 @@ export default function PlannerChatTab() {
                   ) : (
                     <div>正在等待模型输出本轮规划轨迹。</div>
                   )}
-                  <div>已接收模型可见输出：{streamingChars} 字。</div>
+                  <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-2 py-1.5 text-slate-700">
+                    <details open={thinkingContent.length > 0}>
+                      <summary className="cursor-pointer select-none font-medium text-slate-700">
+                        实时思考内容
+                      </summary>
+                      <div
+                        ref={liveThinkingRef}
+                        className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap rounded bg-white px-2 py-1 font-mono text-[10px] leading-relaxed text-slate-700"
+                      >
+                        {thinkingContent.trim() ? thinkingContent : "正在等待模型思考内容。"}
+                      </div>
+                    </details>
+                    {rawTextContent.trim() && (
+                      <div className="mt-2 rounded bg-white px-2 py-1">
+                        <div className="mb-1 font-medium text-slate-700">实时回复内容</div>
+                        <div
+                          ref={liveReplyRef}
+                          className="max-h-24 overflow-y-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-slate-700"
+                        >
+                          {rawTextContent}
+                        </div>
+                      </div>
+                    )}
+                  </div>
                   <div>DAG 更新事件：{dagUpdateCount} 次。</div>
+                  <div>
+                    工具调用：{plannerToolCallCount} 次
+                    {lastPlannerToolName
+                      ? `，最近调用 ${lastPlannerToolName}(${lastPlannerToolInputKeys.join(", ") || "无参数"})`
+                      : "，正在等待 planner_submit_turn。"}
+                  </div>
+                  <div>
+                    流事件：{streamEventCount} 次，最近：{lastStreamEventType || "无"}
+                    {lastStreamEventPreview ? ` / ${lastStreamEventPreview}` : ""}
+                  </div>
                 </div>
               </div>
             </div>

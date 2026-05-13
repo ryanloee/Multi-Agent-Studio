@@ -17,6 +17,7 @@ import FlowCanvas from "@/components/canvas/FlowCanvas";
 import ConfigPanel from "@/components/panels/ConfigPanel";
 import OutputPanel from "@/components/panels/OutputPanel";
 import ApprovalModal from "@/components/panels/ApprovalModal";
+import DirectoryPicker from "@/components/common/DirectoryPicker";
 
 // ---------------------------------------------------------------------------
 // WorkflowEditor — three-column layout with toolbar
@@ -41,13 +42,16 @@ export default function WorkflowEditor() {
   const [workflowName, setWorkflowName] = useState(t("wfEditor.untitled"));
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [workspaceDraft, setWorkspaceDraft] = useState("");
 
   // ---- Stores ----
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
-  const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
+  const plannerUiState = useWorkflowStore((s) => s.plannerUiState);
+  const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
+  const updateWorkspaceDirectory = useWorkflowStore((s) => s.updateWorkspaceDirectory);
 
   const runId = useRunStore((s) => s.runId);
   const runStatus = useRunStore((s) => s.status);
@@ -71,6 +75,7 @@ export default function WorkflowEditor() {
         const data: WorkflowDetail = await api.getWorkflow(workflowId);
         if (cancelled) return;
         setWorkflowName(data.name);
+        setWorkspaceDraft(data.workspace_directory ?? "");
         loadWorkflow(data);
 
         const runs = await api.listRuns(workflowId);
@@ -109,6 +114,10 @@ export default function WorkflowEditor() {
     void loadSettings();
   }, [loadSettings]);
 
+  useEffect(() => {
+    setWorkspaceDraft(workspaceDirectory ?? "");
+  }, [workspaceDirectory]);
+
   // ---- Debounced auto-save (2 seconds) ----
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const latestNameRef = useRef(workflowName);
@@ -124,13 +133,16 @@ export default function WorkflowEditor() {
           name: latestNameRef.current,
           nodes,
           edges,
-          metadata: { auto_child_model_map: autoChildModelMap },
+          metadata: {
+            auto_child_model_map: autoChildModelMap,
+            planner_ui_state: plannerUiState,
+          },
         });
       } catch (err) {
         console.error("Auto-save failed:", err);
       }
     }, 2000);
-  }, [workflowId, nodes, edges, autoChildModelMap]);
+  }, [workflowId, nodes, edges, autoChildModelMap, plannerUiState]);
 
   // Auto-save when nodes or edges change (debounced 2s)
   useEffect(() => {
@@ -159,12 +171,15 @@ export default function WorkflowEditor() {
         name: workflowName,
         nodes,
         edges,
-        metadata: { auto_child_model_map: autoChildModelMap },
+        metadata: {
+          auto_child_model_map: autoChildModelMap,
+          planner_ui_state: plannerUiState,
+        },
       });
     } catch (err) {
       console.error("Save failed:", err);
     }
-  }, [workflowId, workflowName, nodes, edges, autoChildModelMap]);
+  }, [workflowId, workflowName, nodes, edges, autoChildModelMap, plannerUiState]);
 
   // ---- Cleanup on unmount ----
   useEffect(() => {
@@ -243,6 +258,40 @@ export default function WorkflowEditor() {
       {/* Human-in-the-Loop Approval Modal */}
       {runStatus === "paused" && runId && (
         <ApprovalModal runId={runId} />
+      )}
+
+      {!workspaceDirectory.trim() && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-gray-950/45 backdrop-blur-[2px] p-6">
+          <div className="w-full max-w-xl rounded-2xl border border-gray-200 bg-white p-6 shadow-2xl">
+            <div className="mb-4">
+              <h2 className="text-lg font-semibold text-gray-900">先设置工作目录</h2>
+              <p className="mt-1 text-sm leading-relaxed text-gray-500">
+                进入任何工作流都先绑定项目目录。这样 Planner 的评估、节点执行和产物同步才有明确上下文。
+              </p>
+            </div>
+            <DirectoryPicker
+              value={workspaceDraft}
+              onChange={setWorkspaceDraft}
+              placeholder="输入或浏览项目目录"
+              label="工作目录"
+            />
+            <div className="mt-5 flex items-center justify-end gap-3">
+              <button
+                onClick={() => window.history.back()}
+                className="px-4 py-2 text-sm font-medium text-gray-500 hover:text-gray-700"
+              >
+                返回
+              </button>
+              <button
+                onClick={() => void updateWorkspaceDirectory(workspaceDraft.trim())}
+                disabled={!workspaceDraft.trim()}
+                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                保存并继续
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

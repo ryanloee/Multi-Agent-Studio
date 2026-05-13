@@ -79,6 +79,20 @@ export type RunStatus =
   | "completed"
   | "failed";
 
+export type WorkflowLifecyclePhase =
+  | "draft"
+  | "assessing"
+  | "planning"
+  | "ready"
+  | "running"
+  | "blocked"
+  | "review";
+
+export interface WorkflowBlocker {
+  code: string;
+  message: string;
+}
+
 // ---------------------------------------------------------------------------
 // Connection Rule — describes which source node types may connect to which
 // target node types. Used by VALID_CONNECTIONS in constants.ts.

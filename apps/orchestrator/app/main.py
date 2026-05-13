@@ -106,6 +106,17 @@ async def lifespan(app: FastAPI):
                     "will recreate database"
                 )
                 needs_reset = True
+            if (
+                "lifecycle_phase" not in columns
+                or "blockers_json" not in columns
+                or "project_summary_json" not in columns
+                or "project_summary_artifact_id" not in columns
+            ):
+                logger.info(
+                    "Schema migration: workflows table missing lifecycle/project summary columns, "
+                    "will recreate database"
+                )
+                needs_reset = True
             # Check for chat_messages table (new table for context persistence)
             result2 = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' AND name='chat_messages'"))
             if not result2.fetchone():

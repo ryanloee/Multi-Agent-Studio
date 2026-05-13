@@ -88,6 +88,12 @@ class LocalSandbox:
         self._sandboxes: dict[str, _SandboxState] = {}
         logger.info("LocalSandbox initialized: root=%s", self.root)
 
+    @staticmethod
+    def _workspace_copy_ignore(_src: str, names: list[str]) -> set[str]:
+        """Skip runtime state directories when copying workspaces."""
+        ignored = {".mas", ".agent", ".workflow"}
+        return {name for name in names if name in ignored}
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -188,7 +194,11 @@ class LocalSandbox:
         if template_dir is not None and Path(template_dir).is_dir():
             logger.info("Copying template dir %s into sandbox %s", template_dir, sandbox_id)
             await asyncio.to_thread(
-                shutil.copytree, template_dir, str(root / "workspace"), **{"dirs_exist_ok": True},
+                shutil.copytree,
+                template_dir,
+                str(root / "workspace"),
+                dirs_exist_ok=True,
+                ignore=self._workspace_copy_ignore,
             )
             # Initialise git and create an initial commit so we can diff later
             await self._git_init_with_commit(root / "workspace")
@@ -226,6 +236,7 @@ class LocalSandbox:
             str(source_state.workspace_dir),
             str(root / "workspace"),
             dirs_exist_ok=True,
+            ignore=self._workspace_copy_ignore,
         )
 
         # Copy sandbox-meta directory (preserves git history / checkpoints)

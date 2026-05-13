@@ -17,6 +17,12 @@ _MAX_RETRIES = 3
 _RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 _BACKOFF_BASE = 1  # seconds
 
+_THINKING_BUDGETS = {
+    "low": 256,
+    "medium": 1024,
+    "high": 4096,
+}
+
 
 class AnthropicProvider(BaseLLMProvider):
     """Streams chat completions via Anthropic-compatible /messages endpoint."""
@@ -34,6 +40,7 @@ class AnthropicProvider(BaseLLMProvider):
         system: str = "",
         tools: list[dict] | None = None,
         max_tokens: int = 4096,
+        thinking_level: str = "off",
     ) -> AsyncIterator[StreamChunk]:
         url = f"{self.base_url.rstrip('/')}/v1/messages"
 
@@ -47,6 +54,11 @@ class AnthropicProvider(BaseLLMProvider):
             body["system"] = system
         if tools:
             body["tools"] = tools
+        if thinking_level in _THINKING_BUDGETS:
+            body["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": _THINKING_BUDGETS[thinking_level],
+            }
 
         headers = {
             "Content-Type": "application/json",

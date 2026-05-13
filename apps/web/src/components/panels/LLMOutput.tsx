@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useMemo } from "react";
+import { useMemo } from "react";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
+import MarkdownMessage from "@/components/common/MarkdownMessage";
 import type { LLMTokenEvent, LLMChunkEvent, ToolCallEvent, ToolResultEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
@@ -13,78 +14,24 @@ interface LLMOutputProps {
   nodeId?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Simple Markdown-ish renderer
-// ---------------------------------------------------------------------------
-function renderSimpleMarkdown(text: string): string {
-  let html = "";
-  const parts = text.split(/(```[\s\S]*?```)/g);
-
-  for (const part of parts) {
-    if (part.startsWith("```") && part.endsWith("```")) {
-      const inner = part.slice(3, -3);
-      const firstNewline = inner.indexOf("\n");
-      const body = firstNewline >= 0 ? inner.slice(firstNewline + 1) : inner;
-      html += `<pre class="bg-gray-800 text-gray-100 rounded px-3 py-2 my-2 text-xs overflow-x-auto font-mono whitespace-pre">${escapeHtml(body)}</pre>`;
-    } else {
-      const lines = part.split("\n");
-      for (const line of lines) {
-        if (line.trim() === "") {
-          html += '<div class="h-2"></div>';
-          continue;
-        }
-
-        // Thinking block quote lines
-        if (line.startsWith("> ")) {
-          const thinkingContent = escapeHtml(line.slice(2));
-          const rendered = thinkingContent
-            .replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold">$1</strong>');
-          html += `<div class="text-sm leading-6 text-purple-700 bg-purple-50 border-l-2 border-purple-300 pl-3 italic">${rendered}</div>`;
-          continue;
-        }
-
-        // Tool action lines (wrench prefix)
-        if (line.includes("\u{1f527}")) {
-          html += `<div class="text-sm leading-6 text-blue-600 font-medium">${escapeHtml(line)}</div>`;
-          continue;
-        }
-
-        // Thinking/step completion lines
-        if (line.startsWith("思考完成") || line.startsWith("Step complete")) {
-          html += `<div class="text-xs leading-5 text-gray-400 italic">${escapeHtml(line)}</div>`;
-          continue;
-        }
-
-        let rendered = escapeHtml(line);
-        rendered = rendered.replace(
-          /`([^`]+)`/g,
-          '<code class="bg-gray-100 text-pink-600 px-1 py-0.5 rounded text-xs font-mono">$1</code>'
-        );
-        rendered = rendered.replace(/\*\*([^*]+)\*\*/g, '<strong class="font-semibold">$1</strong>');
-        rendered = rendered.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-        html += `<div class="text-sm leading-6 text-gray-700">${rendered}</div>`;
-      }
-    }
+function normalizeToolPayload(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed) return "(empty)";
+  try {
+    return JSON.stringify(JSON.parse(trimmed), null, 2);
+  } catch {
+    return trimmed;
   }
-
-  return html;
 }
 
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+function escapeFence(content: string): string {
+  return content.replace(/```/g, "``\\`");
 }
 
 // ---------------------------------------------------------------------------
 // LLMOutput — typewriter-effect display of llm_token / llm_chunk / tool events
 // ---------------------------------------------------------------------------
 export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const rafIdRef = useRef<number>(0);
-
   const t = useLocaleStore((s) => s.t);
 
   const allEvents = useRunStore((s) => s.events);
@@ -102,67 +49,79 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
     [allEvents, nodeId]
   );
 
-  // Build full text from all events whenever the list changes
-  const fullText = useMemo(() => {
-    let text = "";
+  // Convert event stream into normalized Markdown for readable rendering.
+  const markdown = useMemo(() => {
+    const blocks: string[] = [];
+    let assistantBuffer = "";
+    let thinkingBuffer = "";
     let inThinking = false;
+
+    const flushAssistant = () => {
+      const trimmed = assistantBuffer.trim();
+      if (!trimmed) return;
+      blocks.push(trimmed);
+      assistantBuffer = "";
+    };
+
+    const flushThinking = () => {
+      const trimmed = thinkingBuffer.trim();
+      if (!trimmed) return;
+      blocks.push(`> 思考片段\n\n\`\`\`text\n${escapeFence(trimmed)}\n\`\`\``);
+      thinkingBuffer = "";
+    };
 
     for (const ev of events) {
       if (ev.type === "llm_token") {
         if (inThinking) {
-          text += "\n```\n";
+          flushThinking();
           inThinking = false;
         }
-        text += ev.content;
+        assistantBuffer += ev.content;
       } else if (ev.type === "llm_chunk") {
         const isThinking = (ev as LLMChunkEvent).metadata?.thinking === true;
         if (isThinking) {
+          flushAssistant();
           if (!inThinking) {
-            text += "\n> \u{1F4AD} **Thinking...**\n```\n";
             inThinking = true;
           }
-          text += ev.content;
+          thinkingBuffer += ev.content;
         } else {
           if (inThinking) {
-            text += "\n```\n";
+            flushThinking();
             inThinking = false;
           }
-          text += ev.content;
+          assistantBuffer += ev.content;
         }
       } else if (ev.type === "tool_call") {
+        flushAssistant();
+        if (inThinking) {
+          flushThinking();
+          inThinking = false;
+        }
         const tc = ev as ToolCallEvent;
-        let label = tc.tool_name || "tool";
-        try {
-          const parsed = JSON.parse(tc.content);
-          if (parsed.name) label = parsed.name;
-        } catch {}
-        text += `\n\u{1F527} ${label}\n`;
+        const label = tc.tool_name || "tool";
+        const payload = normalizeToolPayload(tc.content);
+        blocks.push(`### 工具调用 \`${label}\`\n\n\`\`\`json\n${escapeFence(payload)}\n\`\`\``);
       } else if (ev.type === "tool_result") {
+        flushAssistant();
+        if (inThinking) {
+          flushThinking();
+          inThinking = false;
+        }
         const tr = ev as ToolResultEvent;
-        const content = tr.content || "";
-        const preview = content.length > 200 ? content.slice(0, 200) + "..." : content;
-        text += `${preview}\n`;
+        const label = tr.tool_name || "tool";
+        const payload = normalizeToolPayload(tr.content || "");
+        blocks.push(`### 工具结果 \`${label}\`\n\n\`\`\`text\n${escapeFence(payload)}\n\`\`\``);
       }
     }
 
-    return text;
+    flushAssistant();
+    if (inThinking) {
+      flushThinking();
+    }
+
+    return blocks.join("\n\n");
   }, [events]);
-
-  // Render markdown into the container whenever fullText changes
-  useEffect(() => {
-    if (fullText === "") return;
-
-    cancelAnimationFrame(rafIdRef.current);
-    rafIdRef.current = requestAnimationFrame(() => {
-      const el = containerRef.current;
-      if (el) {
-        el.innerHTML = renderSimpleMarkdown(fullText);
-        el.scrollTop = el.scrollHeight;
-      }
-    });
-
-    return () => cancelAnimationFrame(rafIdRef.current);
-  }, [fullText]);
 
   if (events.length === 0) {
     return (
@@ -173,9 +132,10 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
   }
 
   return (
-    <div
-      ref={containerRef}
-      className="w-full h-full overflow-y-auto px-4 py-3 bg-white font-mono"
-    />
+    <div className="w-full h-full overflow-y-auto bg-white">
+      <div className="mx-auto max-w-5xl px-4 py-3">
+        <MarkdownMessage content={markdown} />
+      </div>
+    </div>
   );
 }

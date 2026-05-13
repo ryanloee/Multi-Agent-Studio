@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # Fields where argparse defaults overlap with config-file defaults.
 # We track these so we know which CLI values were explicitly provided vs.
 # just the argparse default.
-_CONFIG_OVERRIDABLE = {"max_turns", "max_tokens", "context_window"}
+_CONFIG_OVERRIDABLE = {"max_turns", "max_tokens", "context_window", "thinking_level"}
 
 
 def parse_args() -> tuple[argparse.Namespace, set[str]]:
@@ -41,6 +41,12 @@ def parse_args() -> tuple[argparse.Namespace, set[str]]:
     parser.add_argument("--max-turns", type=int, default=50, help="Max LLM turns")
     parser.add_argument("--max-tokens", type=int, default=4096, help="Max output tokens per LLM call")
     parser.add_argument("--context-window", type=int, default=128000, help="Model context window in tokens")
+    parser.add_argument(
+        "--thinking-level",
+        default="high",
+        choices=["off", "low", "medium", "high"],
+        help="Reasoning/thinking level for compatible models",
+    )
 
     args = parser.parse_args()
 
@@ -88,6 +94,8 @@ async def main() -> int:
         cli_overrides["max_tokens"] = args.max_tokens
     if "context_window" in explicitly_set:
         cli_overrides["context_window"] = args.context_window
+    if "thinking_level" in explicitly_set:
+        cli_overrides["thinking_level"] = args.thinking_level
 
     # Load merged configuration (defaults → user config → project config → env → CLI)
     merged = load_config(cli_overrides=cli_overrides or None)
@@ -106,6 +114,7 @@ async def main() -> int:
         max_turns=merged.get("max_turns", args.max_turns),
         max_tokens=merged.get("max_tokens", args.max_tokens),
         context_window=merged.get("context_window", args.context_window),
+        thinking_level=merged.get("thinking_level", args.thinking_level),
         workspace=args.workspace,
         stream_dir=args.stream_dir,
     )

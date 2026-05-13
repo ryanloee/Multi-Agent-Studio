@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
+import { usePlannerChatStore } from "@/stores/plannerChatStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { NODE_META, STATUS_COLORS } from "@/lib/constants";
 import type { RunStatus, NodeData } from "@/types/workflow";
@@ -99,6 +100,8 @@ export default function OutputPanel() {
 
   // Run state
   const runStatus = useRunStore((s) => s.status);
+  const plannerStreaming = usePlannerChatStore((s) => s.streaming);
+  const plannerThinkingEventCount = usePlannerChatStore((s) => s.thinkingEventCount);
   const selectedRunNodeId = useRunStore((s) => s.selectedRunNodeId);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const nodeStatuses = useRunStore((s) => s.nodeStatuses);
@@ -241,6 +244,14 @@ export default function OutputPanel() {
               >
                 <Icon size={13} />
                 {t(tab.labelKey)}
+                {tab.key === "chat" && plannerStreaming && (
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${
+                      plannerThinkingEventCount > 0 ? "bg-blue-300" : "bg-amber-300"
+                    } animate-pulse`}
+                    title={plannerThinkingEventCount > 0 ? "Planner 正在输出思考流" : "Planner 正在等待模型首包"}
+                  />
+                )}
               </button>
             );
           })}
