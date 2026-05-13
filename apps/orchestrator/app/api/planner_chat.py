@@ -345,6 +345,7 @@ def _state_summary_payload(
         "lifecycle_phase": lifecycle_phase,
         "task_object": draft_state.get("task_object"),
         "project_summary": draft_state.get("project_summary"),
+        "shared_doc": _summarize_text(draft_state.get("shared_doc"), 1600),
         "shared_doc_summary": _summarize_text(draft_state.get("shared_doc")),
         "dag_summary": _summarize_dag(draft_state.get("dag")),
         "task_board_count": len(draft_state.get("task_board") or []),
@@ -384,7 +385,10 @@ def _build_stage_prompt(
             " 不要重复长篇解释，不要生成 DAG 或 task_board。"
         ),
         "fill_dag": (
-            "请基于已确认的 task_object 和 project_summary，只生成 dag 和 action。"
+            "请基于已确认的 task_object、project_summary、shared_doc 和最新用户需求，只生成 dag 和 action。"
+            " DAG 必须是完整工作流，不要退化成 2-3 个泛化节点。"
+            " 优先拆成 8-20 个文件/模块级节点；只有非常小的任务才允许低于 6 个节点。"
+            " 能并行的 explore/coder 必须并行；两个及以上并行 coder 之后必须加 merge。"
             " action 只能是 update_dag、assess 或 report_blocker。不要输出额外正文。"
         ),
         "fill_task_board": (
@@ -1310,6 +1314,8 @@ def _validate_stage_submit(submit: dict | None, stage: str) -> list[dict]:
         action = patch.get("action")
         if not isinstance(dag, dict) or not isinstance(dag.get("nodes"), list) or not dag.get("nodes"):
             blockers.append({"code": "dag_missing", "message": "fill_dag 缺少可用 dag.nodes。"})
+        elif len(dag.get("nodes") or []) < 6:
+            blockers.append({"code": "dag_too_small", "message": "fill_dag 生成的 DAG 节点过少，疑似退化成最小草案。"})
         if not isinstance(action, dict) or str(action.get("action") or "") not in {"update_dag", "assess", "report_blocker"}:
             blockers.append({"code": "action_invalid", "message": "fill_dag 缺少有效 action。"})
     elif stage == "fill_task_board":
@@ -1374,6 +1380,58 @@ def _draft_state_ui_payload(draft_state: dict) -> dict:
         "action": draft_state.get("action"),
         "system_generated_dag": bool(draft_state.get("system_generated_dag")),
         "updated_at": draft_state.get("updated_at"),
+    }
+
+
+def _salvage_stage_submit_from_text(
+    *,
+    stage: str,
+    raw_response: str,
+    fallback_goal: str,
+    draft_state: dict,
+) -> dict | None:
+    if not raw_response.strip():
+        return None
+
+    patch: dict = {}
+    if stage == "fill_dag":
+        dag = _extract_dag_from_text(raw_response)
+        action = _extract_action_from_text(raw_response)
+        if dag:
+            patch["dag"] = dag
+        if action:
+            patch["action"] = _normalize_action(action, "", "update_dag")
+    elif stage == "plan_outline":
+        parsed = parse_reply = ""
+        import re
+        reply_matches = re.findall(r"```reply\s*\n(.*?)\n```", raw_response, re.DOTALL)
+        if reply_matches:
+            parsed = str(reply_matches[-1]).strip()
+        parse_reply = parsed
+        trace_matches = re.findall(r"```observe\s*\n(.*?)\n```", raw_response, re.DOTALL)
+        observable_trace = []
+        if trace_matches:
+            observable_trace = [
+                line.strip().removeprefix("-").strip()
+                for line in trace_matches[-1].splitlines()
+                if line.strip()
+            ]
+        return {
+            "stage": stage,
+            "stage_complete": bool(parse_reply or observable_trace),
+            "reply": parse_reply,
+            "observable_trace": observable_trace,
+            "patch": {},
+        }
+
+    if not patch:
+        return None
+    return {
+        "stage": stage,
+        "stage_complete": True,
+        "reply": "",
+        "observable_trace": [],
+        "patch": patch,
     }
 
 
@@ -1935,7 +1993,8 @@ async def planner_chat(
                 "draft_state": _draft_state_ui_payload(draft_state),
             })
 
-            for attempt_index in range(2):
+            max_stage_attempts = 3 if stage == "fill_dag" else 2
+            for attempt_index in range(max_stage_attempts):
                 stage_messages = _build_stage_messages(
                     stage=stage,
                     latest_user_message=body.message,
@@ -1988,6 +2047,13 @@ async def planner_chat(
                     fallback_goal=workflow_goal,
                     draft_state=draft_state,
                 )
+                if submit is None:
+                    submit = _salvage_stage_submit_from_text(
+                        stage=stage,
+                        raw_response=raw_response,
+                        fallback_goal=workflow_goal,
+                        draft_state=draft_state,
+                    )
                 blockers = _validate_stage_submit(submit, stage)
                 if not blockers and submit is not None:
                     draft_state = _merge_stage_patch(draft_state, submit)
@@ -2037,9 +2103,10 @@ async def planner_chat(
                     break
 
                 stage_retry_feedback = _build_planner_retry_message(blockers)
+                retry_status = "retrying" if attempt_index < max_stage_attempts - 1 else "failed"
                 stage_history.append({
                     "stage": stage,
-                    "status": "retrying" if attempt_index == 0 else "failed",
+                    "status": retry_status,
                     "attempt": attempt_index + 1,
                     "summary": "；".join(item.get("message", "") for item in blockers),
                     "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -2047,7 +2114,7 @@ async def planner_chat(
                 yield _sse({
                     "type": "planner_observable_progress",
                     "stage": stage,
-                    "status": "retrying" if attempt_index == 0 else "failed",
+                    "status": retry_status,
                     "attempt": attempt_index + 1,
                     "received_fields": sorted(((submit or {}).get("patch") or {}).keys()) if isinstance(submit, dict) else [],
                     "missing_fields": [item.get("code") for item in blockers],
@@ -2094,7 +2161,7 @@ async def planner_chat(
                     "type": "planner_stage_result",
                     "stage": stage,
                     "status": "fallback",
-                    "attempt": 2,
+                    "attempt": max_stage_attempts,
                     "applied_fields": ["dag", "action"],
                     "summary": "DAG 阶段失败，系统已补最小草案 DAG。",
                     "draft_state": _draft_state_ui_payload(draft_state),
@@ -2108,7 +2175,7 @@ async def planner_chat(
                     "type": "planner_stage_result",
                     "stage": stage,
                     "status": "fallback",
-                    "attempt": 2,
+                    "attempt": max_stage_attempts,
                     "applied_fields": ["task_board"],
                     "summary": "任务面板阶段失败，系统已从 DAG 自动派生任务卡。",
                     "draft_state": _draft_state_ui_payload(draft_state),
