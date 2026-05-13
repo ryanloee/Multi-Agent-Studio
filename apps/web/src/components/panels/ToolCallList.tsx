@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useMemo, useCallback } from "react";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import {
   ChevronRight,
   ChevronDown,
@@ -159,6 +159,7 @@ function ToolCallItem({ pair }: { pair: PairedToolCall }) {
 // ---------------------------------------------------------------------------
 export default function ToolCallList({ nodeId = "" }: ToolCallListProps) {
   const t = useLocaleStore((s) => s.t);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const allEvents = useRunStore((s) => s.events);
   const events = useMemo(
     () =>
@@ -209,6 +210,12 @@ export default function ToolCallList({ nodeId = "" }: ToolCallListProps) {
     return result;
   }, [events]);
 
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [pairs.length, events.length]);
+
   if (pairs.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-sm text-gray-400">
@@ -218,7 +225,7 @@ export default function ToolCallList({ nodeId = "" }: ToolCallListProps) {
   }
 
   return (
-    <div className="w-full h-full overflow-y-auto divide-y divide-gray-50">
+    <div ref={scrollRef} className="w-full h-full overflow-y-auto divide-y divide-gray-50">
       {pairs.map((pair, idx) => (
         <ToolCallItem key={`${pair.call.timestamp}-${idx}`} pair={pair} />
       ))}

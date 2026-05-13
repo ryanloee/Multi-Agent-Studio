@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import MarkdownMessage from "@/components/common/MarkdownMessage";
@@ -33,6 +33,7 @@ function escapeFence(content: string): string {
 // ---------------------------------------------------------------------------
 export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
   const t = useLocaleStore((s) => s.t);
+  const scrollRef = useRef<HTMLDivElement>(null);
 
   const allEvents = useRunStore((s) => s.events);
 
@@ -123,6 +124,12 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
     return blocks.join("\n\n");
   }, [events]);
 
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [markdown, events.length]);
+
   if (events.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-sm text-gray-400">
@@ -132,7 +139,7 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
   }
 
   return (
-    <div className="w-full h-full overflow-y-auto bg-white">
+    <div ref={scrollRef} className="w-full h-full overflow-y-auto bg-white">
       <div className="mx-auto max-w-5xl px-4 py-3">
         <MarkdownMessage content={markdown} />
       </div>

@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { FileText, MessageSquare, Terminal, Wrench, Brain, Activity } from "lucide-react";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
@@ -31,6 +31,7 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 export default function TimelinePanel({ nodeId }: { nodeId?: string }) {
   const [filter, setFilter] = useState<TimelineKind>("all");
+  const scrollRef = useRef<HTMLDivElement>(null);
   const events = useRunStore((s) => s.events);
   const artifacts = useTaskStore((s) => s.artifacts);
   const taskMessages = useTaskStore((s) => s.taskMessages);
@@ -76,6 +77,12 @@ export default function TimelinePanel({ nodeId }: { nodeId?: string }) {
 
   const filters: TimelineKind[] = ["all", "llm", "tool", "shell", "comm", "artifact", "status"];
 
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [items.length, filter]);
+
   return (
     <div className="h-full flex flex-col bg-white">
       <div className="flex items-center gap-1 border-b border-gray-100 px-2 py-1.5 shrink-0">
@@ -91,7 +98,7 @@ export default function TimelinePanel({ nodeId }: { nodeId?: string }) {
           </button>
         ))}
       </div>
-      <div className="flex-1 overflow-y-auto px-3 py-2">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-3 py-2">
         {items.length === 0 ? (
           <div className="py-8 text-center text-xs text-gray-400">No timeline events</div>
         ) : (

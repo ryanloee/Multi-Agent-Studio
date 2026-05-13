@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { ArrowDown, ArrowUp } from "lucide-react";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
@@ -21,6 +21,7 @@ interface CommRecord {
 
 export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
   const t = useLocaleStore((s) => s.t);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
   const allEvents = useRunStore((s) => s.events);
@@ -144,6 +145,12 @@ export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
     return result;
   }, [allEvents, effectiveNodeId, upstreamNodeIds, nodes, t, childIds, tasks, taskMessages]);
 
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [records.length]);
+
   // Format timestamp
   function formatTime(ts: number): string {
     // Handle both seconds and milliseconds
@@ -169,7 +176,7 @@ export default function CommunicationPanel({ nodeId }: { nodeId: string }) {
   }
 
   return (
-    <div className="h-full overflow-auto p-2 space-y-1">
+    <div ref={scrollRef} className="h-full overflow-auto p-2 space-y-1">
       {records.map((rec, i) => (
         <div
           key={i}

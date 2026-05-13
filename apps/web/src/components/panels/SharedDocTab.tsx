@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { BookOpen, Save, Eye, Pencil, Maximize2, Minimize2, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLocaleStore } from "@/stores/localeStore";
+import MarkdownMessage from "@/components/common/MarkdownMessage";
 
 export default function SharedDocTab({ workflowId }: { workflowId?: string }) {
   const t = useLocaleStore((s) => s.t);
@@ -84,11 +85,11 @@ export default function SharedDocTab({ workflowId }: { workflowId?: string }) {
       return (
         <div
           className={[
-            "whitespace-pre-wrap text-gray-700",
+            "text-gray-700",
             fullscreen ? "h-full overflow-y-auto p-6 text-sm leading-7" : "text-[11px] leading-relaxed",
           ].join(" ")}
         >
-          {content}
+          <MarkdownMessage content={content} compact={!fullscreen} />
         </div>
       );
     }
