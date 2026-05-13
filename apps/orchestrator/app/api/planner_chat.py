@@ -343,6 +343,8 @@ def _state_summary_payload(
         "workflow_goal": workflow_goal,
         "stage": stage,
         "lifecycle_phase": lifecycle_phase,
+        "outline_reply": draft_state.get("outline_reply"),
+        "observable_trace": draft_state.get("observable_trace") or [],
         "task_object": draft_state.get("task_object"),
         "project_summary": draft_state.get("project_summary"),
         "shared_doc": _summarize_text(draft_state.get("shared_doc"), 1600),
@@ -381,11 +383,11 @@ def _build_stage_prompt(
             " task_object 只允许给粗粒度草案；不要生成 DAG、task_board 或最终 ready 判定。"
         ),
         "fill_task_context": (
-            "请基于你刚才已经给出的规划说明，只填写 task_object、project_summary、shared_doc。"
+            "请严格基于你刚才已经给出的规划说明 reply，只填写 task_object、project_summary、shared_doc。"
             " 不要重复长篇解释，不要生成 DAG 或 task_board。"
         ),
         "fill_dag": (
-            "请基于已确认的 task_object、project_summary、shared_doc 和最新用户需求，只生成 dag 和 action。"
+            "请严格基于 plan_outline 阶段已经给出的规划说明 reply，以及已确认的 task_object、project_summary、shared_doc 和最新用户需求，只生成 dag 和 action。"
             " DAG 必须是完整工作流，不要退化成 2-3 个泛化节点。"
             " 优先拆成 8-20 个文件/模块级节点；只有非常小的任务才允许低于 6 个节点。"
             " 能并行的 explore/coder 必须并行；两个及以上并行 coder 之后必须加 merge。"
@@ -498,10 +500,11 @@ async def get_chat_history(
 # ---------------------------------------------------------------------------
 
 async def _call_llm_stream(
-    messages: list[dict[str, str]],
+    messages: list[dict],
     system: str,
     thinking_level: str = "medium",
     tools: list[dict] | None = None,
+    tool_choice_mode: str = "force_first",
 ):
     """Call the configured LLM and yield stream events.
 
@@ -582,8 +585,13 @@ async def _call_llm_stream(
                 }
                 for tool in tools
             ]
-            forced_tool = tools[0]["name"]
-            body["tool_choice"] = {"type": "function", "function": {"name": forced_tool}}
+            if tool_choice_mode == "force_first":
+                forced_tool = tools[0]["name"]
+                body["tool_choice"] = {"type": "function", "function": {"name": forced_tool}}
+            elif tool_choice_mode == "required":
+                body["tool_choice"] = "required"
+            elif tool_choice_mode == "auto":
+                body["tool_choice"] = "auto"
     else:
         # Anthropic format
         url = f"{provider_url}/v1/messages"
@@ -606,7 +614,10 @@ async def _call_llm_stream(
             }
         if tools:
             body["tools"] = tools
-            body["tool_choice"] = {"type": "tool", "name": tools[0]["name"]}
+            if tool_choice_mode == "force_first":
+                body["tool_choice"] = {"type": "tool", "name": tools[0]["name"]}
+            elif tool_choice_mode == "auto":
+                body["tool_choice"] = {"type": "auto"}
 
     timeout = httpx.Timeout(connect=15, read=120, write=30, pool=15)
 
@@ -885,11 +896,326 @@ def _planner_tools(stage: str) -> list[dict]:
     ]
 
 
+def _planner_plan_tools() -> list[dict]:
+    return [
+        {
+            "name": "planner_submit_plan",
+            "description": "一次性提交完整 Planner 方案：给用户看的说明、完整 DAG 和最终 action。面板和文档由系统派生。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "observable_trace": {"type": "array", "items": {"type": "string"}},
+                    "reply": {"type": "string"},
+                    "dag": {
+                        "type": "object",
+                        "properties": {
+                            "nodes": {"type": "array", "items": {"type": "object"}},
+                            "edges": {"type": "array", "items": {"type": "object"}},
+                            "metadata": {"type": "object"},
+                        },
+                        "required": ["nodes"],
+                    },
+                    "action": _action_schema(),
+                },
+                "required": ["reply", "dag", "action"],
+            },
+        },
+    ]
+
+
+SINGLE_TURN_PLANNER_SYSTEM = PLANNER_CHAT_SYSTEM + """
+
+## 当前实现策略覆盖
+本轮不要使用分阶段 patch 协议。你只需要一次性调用 `planner_submit_plan`，提交完整方案。
+
+输出要求：
+- `reply`：给用户看的可讨论规划说明，必须保留阶段和节点数量说明。
+- `dag.nodes`：完整 DAG，不要缩水。复杂功能通常 15-30 个节点。
+- `dag.edges`：显式边；每个节点也应有 `depends_on`。
+- `action`：只能规划、ready 或 blocker，不允许运行。
+
+硬性编排规则：
+- 不要把“前端”“后端”“支付”“测试”合成粗任务，必须拆成文件/模块级 Worker 节点。
+- 两个及以上并行 coder 后必须增加 merge 节点。
+- coder/merge 的关键成果后必须有 review 节点。
+- DAG 末尾必须有 shell/test 节点。
+- 支付渠道、第三方服务、产品取舍不确定时，添加 human 或 plan 决策节点，不要因此把整个方案 blocked。
+- 面板、项目文档、任务卡由系统派生；你不要单独填写这些字段。
+"""
+
+
+PLANNER_AGENT_LOOP_SYSTEM = """你是白盒多 Agent 编排系统的 Planner。当前系统使用 opencode 风格的 agent tool loop。
+
+你不要一次性提交巨大 JSON。你必须通过小工具逐步更新规划状态：
+- 先调用 `planner_set_outline` 写给用户看的规划说明。
+- 然后多次调用 `planner_add_node` 创建完整 DAG 节点。
+- 需要时调用 `planner_add_edge` 补依赖。
+- 调用 `planner_update_doc` 写 Markdown 项目文档。
+- 最后调用 `planner_finalize` 结束本轮。
+
+硬性规则：
+- 复杂项目必须拆成 12-30 个模块级节点，不要缩水成 2-3 个泛化节点。
+- 节点类型只用 explore / plan / coder / merge / review / shell / human。
+- 两个及以上并行 coder 后必须有 merge。
+- 关键实现或 merge 后必须有 review。
+- 末尾必须有 shell/test 验证节点。
+- 支付渠道、第三方服务、产品决策不确定时，用 human 或 plan 节点表达，不要把整个工作流 blocked。
+- 每次工具调用只做一件小事；工具结果会返回给你，然后你继续下一步。
+- 普通文本可以简短说明，但结构化状态必须通过工具更新。
+"""
+
+
+def _planner_agent_tools() -> list[dict]:
+    node_type_enum = ["explore", "plan", "coder", "merge", "review", "shell", "human"]
+    return [
+        {
+            "name": "planner_set_outline",
+            "description": "设置本轮给用户看的规划说明和可观察轨迹。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "reply": {"type": "string"},
+                    "observable_trace": {"type": "array", "items": {"type": "string"}},
+                    "task_title": {"type": "string"},
+                    "task_objective": {"type": "string"},
+                },
+                "required": ["reply"],
+            },
+        },
+        {
+            "name": "planner_add_node",
+            "description": "新增或替换一个 DAG 节点。用多次小工具调用逐步构建完整 DAG。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "type": {"type": "string", "enum": node_type_enum},
+                    "label": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "depends_on": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["id", "type", "label", "prompt"],
+            },
+        },
+        {
+            "name": "planner_add_edge",
+            "description": "补充一条 DAG 依赖边。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string"},
+                    "target": {"type": "string"},
+                },
+                "required": ["source", "target"],
+            },
+        },
+        {
+            "name": "planner_update_doc",
+            "description": "更新 Markdown 项目文档。内容会按 Markdown 渲染。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "markdown": {"type": "string"},
+                },
+                "required": ["markdown"],
+            },
+        },
+        {
+            "name": "planner_finalize",
+            "description": "结束本轮 Planner。只有在 outline、节点、文档都已更新后调用。",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["update_dag", "set_ready", "report_blocker", "assess"]},
+                    "message": {"type": "string"},
+                    "blockers": {"type": "array", "items": {"type": "object"}},
+                },
+                "required": ["action", "message"],
+            },
+        },
+    ]
+
+
 def _tool_input(tool_calls: list[dict], name: str) -> dict | None:
     for call in reversed(tool_calls):
         if call.get("name") == name and isinstance(call.get("input"), dict):
             return call["input"]
     return None
+
+
+def _planner_model_format() -> str:
+    settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
+    try:
+        settings_data = json.loads(settings_path.read_text(encoding="utf-8"))
+        settings_models = settings_data.get("models", [])
+        if isinstance(settings_models, list) and settings_models:
+            first = settings_models[0]
+            if isinstance(first, dict):
+                return str(first.get("format") or "openai")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+    return "anthropic"
+
+
+def _append_tool_followup_messages(
+    messages: list[dict],
+    *,
+    fmt: str,
+    assistant_text: str,
+    tool_calls: list[dict],
+    tool_results: list[dict],
+) -> None:
+    if fmt == "openai":
+        openai_tool_calls = []
+        for call in tool_calls:
+            call_id = str(call.get("id") or f"call_{uuid.uuid4().hex}")
+            call["id"] = call_id
+            openai_tool_calls.append({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": str(call.get("name") or ""),
+                    "arguments": json.dumps(call.get("input") or {}, ensure_ascii=False),
+                },
+            })
+        messages.append({
+            "role": "assistant",
+            "content": assistant_text or None,
+            "tool_calls": openai_tool_calls,
+        })
+        for result in tool_results:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": result["id"],
+                "name": result["name"],
+                "content": json.dumps(result["result"], ensure_ascii=False),
+            })
+        return
+
+    content: list[dict] = []
+    if assistant_text.strip():
+        content.append({"type": "text", "text": assistant_text})
+    for call in tool_calls:
+        call_id = str(call.get("id") or f"toolu_{uuid.uuid4().hex}")
+        call["id"] = call_id
+        content.append({
+            "type": "tool_use",
+            "id": call_id,
+            "name": str(call.get("name") or ""),
+            "input": call.get("input") or {},
+        })
+    messages.append({"role": "assistant", "content": content})
+    messages.append({
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": result["id"],
+                "content": json.dumps(result["result"], ensure_ascii=False),
+                "is_error": bool(result["result"].get("error")) if isinstance(result.get("result"), dict) else False,
+            }
+            for result in tool_results
+        ],
+    })
+
+
+def _execute_planner_agent_tool(name: str, args: dict, draft_state: dict, workflow_goal: str) -> dict:
+    draft_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if name == "planner_set_outline":
+        reply = str(args.get("reply") or "").strip()
+        trace = args.get("observable_trace") if isinstance(args.get("observable_trace"), list) else []
+        draft_state["current_stage"] = "plan_outline"
+        if reply:
+            draft_state["outline_reply"] = reply
+        if trace:
+            draft_state["observable_trace"] = [str(item).strip() for item in trace if str(item).strip()]
+        title = str(args.get("task_title") or "").strip()
+        objective = str(args.get("task_objective") or "").strip()
+        if title or objective:
+            task_object = dict(draft_state.get("task_object") or {})
+            if title:
+                task_object["title"] = title
+            if objective:
+                task_object["objective"] = objective
+            draft_state["task_object"] = _normalize_task_object(task_object, workflow_goal, reply)
+        return {"ok": True, "applied": ["outline_reply", "observable_trace", "task_object"], "node_count": len((draft_state.get("dag") or {}).get("nodes") or [])}
+
+    if name == "planner_add_node":
+        node_id = str(args.get("id") or "").strip()
+        if not node_id:
+            return {"ok": False, "error": "node id is required"}
+        node_type = str(args.get("type") or "coder").strip()
+        if node_type not in {"explore", "plan", "coder", "merge", "review", "shell", "human"}:
+            node_type = "coder"
+        dag = draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else {"nodes": [], "edges": []}
+        nodes = dag.setdefault("nodes", [])
+        depends_on = _coerce_string_list(args.get("depends_on"), [])
+        node = {
+            "id": node_id,
+            "type": node_type,
+            "label": str(args.get("label") or node_id).strip(),
+            "prompt": str(args.get("prompt") or "").strip(),
+            "depends_on": depends_on,
+        }
+        replaced = False
+        for index, existing in enumerate(nodes):
+            if isinstance(existing, dict) and str(existing.get("id")) == node_id:
+                nodes[index] = node
+                replaced = True
+                break
+        if not replaced:
+            nodes.append(node)
+        edges = dag.setdefault("edges", [])
+        existing_edges = {(str(edge.get("source")), str(edge.get("target"))) for edge in edges if isinstance(edge, dict)}
+        for dep in depends_on:
+            key = (dep, node_id)
+            if key not in existing_edges:
+                edges.append({"source": dep, "target": node_id})
+                existing_edges.add(key)
+        draft_state["current_stage"] = "fill_dag"
+        draft_state["dag"] = _normalize_dag(dag)
+        draft_state["task_board"] = _build_task_board_from_dag(draft_state["dag"])
+        return {"ok": True, "applied": ["dag", "task_board"], "node_id": node_id, "node_count": len(draft_state["dag"].get("nodes") or [])}
+
+    if name == "planner_add_edge":
+        source = str(args.get("source") or "").strip()
+        target = str(args.get("target") or "").strip()
+        if not source or not target:
+            return {"ok": False, "error": "source and target are required"}
+        dag = draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else {"nodes": [], "edges": []}
+        edges = dag.setdefault("edges", [])
+        if not any(isinstance(edge, dict) and str(edge.get("source")) == source and str(edge.get("target")) == target for edge in edges):
+            edges.append({"source": source, "target": target})
+        for node in dag.get("nodes", []):
+            if isinstance(node, dict) and str(node.get("id")) == target:
+                depends_on = node.setdefault("depends_on", [])
+                if isinstance(depends_on, list) and source not in depends_on:
+                    depends_on.append(source)
+        draft_state["current_stage"] = "fill_dag"
+        draft_state["dag"] = _normalize_dag(dag)
+        draft_state["task_board"] = _build_task_board_from_dag(draft_state["dag"])
+        return {"ok": True, "applied": ["dag", "task_board"], "edge": {"source": source, "target": target}}
+
+    if name == "planner_update_doc":
+        markdown = str(args.get("markdown") or "").strip()
+        if not markdown:
+            return {"ok": False, "error": "markdown is required"}
+        draft_state["current_stage"] = "fill_task_context"
+        draft_state["shared_doc"] = markdown
+        return {"ok": True, "applied": ["shared_doc"], "length": len(markdown)}
+
+    if name == "planner_finalize":
+        action = _normalize_action({
+            "action": args.get("action") or "update_dag",
+            "message": args.get("message") or "规划已更新。",
+            "blockers": args.get("blockers") if isinstance(args.get("blockers"), list) else [],
+        }, default_action="update_dag")
+        draft_state["current_stage"] = "finalize_ready"
+        draft_state["action"] = action
+        draft_state["blockers"] = action.get("blockers") or []
+        return {"ok": True, "applied": ["action"], "action": action.get("action")}
+
+    return {"ok": False, "error": f"unknown tool: {name}"}
 
 
 def _has_text(value: object) -> bool:
@@ -1078,6 +1404,129 @@ def _build_minimal_planner_dag(title: str, objective: str) -> dict:
             {"source": coder_id, "target": review_id},
         ],
     }
+
+
+def _infer_node_type_from_label(label: str, phase_title: str = "") -> str:
+    label_text = label.lower()
+    phase_text = phase_title.lower()
+    if any(token in label_text for token in ("merge", "合并", "集成改动")):
+        return "merge"
+    if any(token in label_text for token in ("审查", "review", "安全")):
+        return "review"
+    if any(token in label_text for token in ("测试", "验证", "运行", "shell")):
+        return "shell"
+    if any(token in label_text for token in ("人工", "审批", "确认")):
+        return "human"
+    text = f"{phase_text} {label_text}"
+    if any(token in text for token in ("探索", "调研", "梳理", "需求", "分析")):
+        return "explore"
+    return "coder"
+
+
+def _slugify_node_id(text: str, fallback: str) -> str:
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in text).strip("_")
+    slug = "_".join(part for part in slug.split("_") if part)
+    return (slug[:42] or fallback).strip("_") or fallback
+
+
+def _split_outline_items(text: str) -> list[str]:
+    items: list[str] = []
+    current: list[str] = []
+    depth = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        next_two = text[index:index + 2]
+        if char in "（(":
+            depth += 1
+        elif char in "）)" and depth > 0:
+            depth -= 1
+        if depth == 0 and (char in "、；;→" or next_two == "->"):
+            item = "".join(current).strip(" ；;，,。")
+            if item:
+                items.append(item)
+            current = []
+            index += 2 if next_two == "->" else 1
+            continue
+        current.append(char)
+        index += 1
+    item = "".join(current).strip(" ；;，,。")
+    if item:
+        items.append(item)
+    return items
+
+
+def _build_outline_based_dag(outline: str, title: str, objective: str) -> dict | None:
+    """Turn a user-visible outline into a usable draft DAG when tool generation fails."""
+    import re
+
+    if not outline.strip():
+        return None
+
+    phase_matches = re.findall(
+        r"([^\n：:（(]{2,24})[（(]\s*(\d+)\s*节点\s*[）)]\s*[：:]\s*([^\n]+)",
+        outline,
+    )
+    if not phase_matches:
+        return None
+
+    nodes: list[dict] = []
+    edges: list[dict] = []
+    previous_phase_terminal_ids: list[str] = []
+
+    for phase_index, (phase_title_raw, expected_count_raw, body_raw) in enumerate(phase_matches, start=1):
+        phase_title = phase_title_raw.strip(" -，,。")
+        expected_count = max(1, min(int(expected_count_raw), 20))
+        body = body_raw.strip()
+        parts = _split_outline_items(body)
+        expanded_parts: list[str] = []
+        for part in parts:
+            # Keep parenthesized domain details in the prompt, but split obvious parallel lists.
+            if "并行" in part and "：" in part:
+                _, detail = part.split("：", 1)
+                expanded_parts.extend([item.strip() for item in re.split(r"[、,，]", detail) if item.strip()])
+            else:
+                expanded_parts.append(part)
+        parts = expanded_parts[:expected_count] if expanded_parts else [phase_title]
+        while len(parts) < expected_count:
+            parts.append(f"{phase_title}子任务 {len(parts) + 1}")
+
+        phase_node_ids: list[str] = []
+        for item_index, label_raw in enumerate(parts[:expected_count], start=1):
+            label = label_raw.strip() or f"{phase_title}子任务 {item_index}"
+            node_type = _infer_node_type_from_label(label, phase_title)
+            node_id = _slugify_node_id(f"{phase_title}_{label}", f"node_{phase_index}_{item_index}")
+            # Avoid duplicate ids after slug truncation.
+            existing_ids = {str(node.get("id")) for node in nodes}
+            base_id = node_id
+            suffix = 2
+            while node_id in existing_ids:
+                node_id = f"{base_id}_{suffix}"
+                suffix += 1
+            depends_on = previous_phase_terminal_ids[:] if item_index == 1 else [phase_node_ids[-1]]
+            if "并行" in body and item_index > 1 and previous_phase_terminal_ids:
+                depends_on = previous_phase_terminal_ids[:]
+            nodes.append({
+                "id": node_id,
+                "type": node_type,
+                "label": label[:80],
+                "prompt": (
+                    f"目标：完成“{label}”。\n"
+                    f"上下文：这是“{title}”规划中“{phase_title}”阶段的子任务；整体目标是“{objective}”。\n"
+                    "具体要求：按当前项目结构定位相关文件或模块，完成该子任务所需的实现、配置或验证，并记录关键产物。\n"
+                    "产出格式：给出变更摘要、涉及文件、验证方式和阻塞项。\n"
+                    "验收标准：该子任务可被下游节点继续使用，且不越权修改无关范围。"
+                ),
+                "depends_on": depends_on,
+            })
+            for dep in depends_on:
+                edges.append({"source": dep, "target": node_id})
+            phase_node_ids.append(node_id)
+        previous_phase_terminal_ids = [phase_node_ids[-1]] if phase_node_ids else previous_phase_terminal_ids
+
+    if len(nodes) < 4:
+        return None
+    return {"nodes": nodes, "edges": edges, "metadata": {"fallback_source": "outline_reply"}}
 
 
 def _canonicalize_planner_submit(submit: dict | None, fallback_goal: str) -> dict | None:
@@ -1277,6 +1726,189 @@ def _canonicalize_stage_submit(
     }
 
 
+def _canonicalize_plan_submit(submit: dict | None, fallback_goal: str) -> dict | None:
+    if not isinstance(submit, dict):
+        return None
+    normalized = dict(submit)
+    action = normalized.get("action") if isinstance(normalized.get("action"), dict) else {}
+    reply = str(normalized.get("reply") or action.get("message") or fallback_goal or "").strip()
+    dag = normalized.get("dag") if isinstance(normalized.get("dag"), dict) else None
+    trace = normalized.get("observable_trace") if isinstance(normalized.get("observable_trace"), list) else []
+    if isinstance(dag, dict):
+        dag = _normalize_dag(dag)
+    return {
+        "reply": reply,
+        "observable_trace": [str(item).strip() for item in trace if str(item).strip()],
+        "dag": dag,
+        "action": _normalize_action(action, reply, "update_dag"),
+    }
+
+
+def _extract_dag_from_any_text(text: str) -> dict | None:
+    dag = _extract_dag_from_text(text)
+    if dag:
+        return dag
+    try:
+        from app.workflows.plan_parser import parse_plan_to_dag
+    except Exception:
+        return None
+    parsed = parse_plan_to_dag(text)
+    if not parsed:
+        return None
+    nodes, edges = parsed
+    fixed_nodes = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        data = node.get("data") if isinstance(node.get("data"), dict) else {}
+        fixed_nodes.append({
+            "id": node.get("id"),
+            "type": node.get("type") or data.get("agent_type") or data.get("agentType") or "coder",
+            "label": data.get("label") or node.get("label") or node.get("id"),
+            "prompt": data.get("prompt") or node.get("prompt") or "",
+            "depends_on": [],
+        })
+    for edge in edges:
+        if not isinstance(edge, dict):
+            continue
+        source = edge.get("source")
+        target = edge.get("target")
+        for node in fixed_nodes:
+            if node.get("id") == target and source:
+                node.setdefault("depends_on", []).append(str(source))
+    return _normalize_dag({"nodes": fixed_nodes, "edges": edges})
+
+
+def _declared_outline_node_count(outline: str) -> int:
+    import re
+    return sum(int(match) for match in re.findall(r"[（(]\s*(\d+)\s*节点\s*[）)]", outline or ""))
+
+
+def _ensure_node_id(dag: dict, node_type: str, label: str, prompt: str, depends_on: list[str]) -> str:
+    nodes = dag.setdefault("nodes", [])
+    node_id = _slugify_node_id(label, f"{node_type}_{len(nodes) + 1}")
+    existing = {str(node.get("id")) for node in nodes if isinstance(node, dict)}
+    base = node_id
+    suffix = 2
+    while node_id in existing:
+        node_id = f"{base}_{suffix}"
+        suffix += 1
+    nodes.append({
+        "id": node_id,
+        "type": node_type,
+        "label": label,
+        "prompt": prompt,
+        "depends_on": depends_on,
+    })
+    edges = dag.setdefault("edges", [])
+    for dep in depends_on:
+        edges.append({"source": dep, "target": node_id})
+    return node_id
+
+
+def _repair_planner_dag(dag: dict, outline: str, title: str, objective: str) -> tuple[dict, list[dict]]:
+    blockers: list[dict] = []
+    if not isinstance(dag, dict):
+        dag = {"nodes": [], "edges": []}
+    dag = _normalize_dag(dag)
+    nodes = dag.get("nodes") if isinstance(dag.get("nodes"), list) else []
+    declared_count = _declared_outline_node_count(outline)
+    if declared_count and len(nodes) < max(6, int(declared_count * 0.7)):
+        outline_dag = _build_outline_based_dag(outline, title, objective)
+        if outline_dag:
+            dag = _normalize_dag(outline_dag)
+            nodes = dag.get("nodes") or []
+
+    coder_nodes = [
+        node for node in nodes
+        if isinstance(node, dict) and str(node.get("type") or (node.get("data") or {}).get("agentType") or "") == "coder"
+    ]
+    merge_nodes = [
+        node for node in nodes
+        if isinstance(node, dict) and str(node.get("type") or (node.get("data") or {}).get("agentType") or "") == "merge"
+    ]
+    if len(coder_nodes) >= 2 and not merge_nodes:
+        deps = [str(node.get("id")) for node in coder_nodes if node.get("id")]
+        merge_id = _ensure_node_id(
+            dag,
+            "merge",
+            "合并并行实现改动",
+            "目标：合并所有并行 coder 节点的改动。\n具体要求：读取上游 diff/report/commit 信息，处理冲突，形成集成工作区。\n产出格式：merge_report。\n验收标准：所有上游改动已集成或明确列出阻塞冲突。",
+            deps,
+        )
+        merge_nodes = [node for node in dag.get("nodes", []) if node.get("id") == merge_id]
+
+    nodes = dag.get("nodes") or []
+    review_nodes = [
+        node for node in nodes
+        if isinstance(node, dict) and str(node.get("type") or (node.get("data") or {}).get("agentType") or "") == "review"
+    ]
+    if not review_nodes:
+        deps = [str(node.get("id")) for node in (merge_nodes or coder_nodes[-3:]) if isinstance(node, dict) and node.get("id")]
+        if deps:
+            _ensure_node_id(
+                dag,
+                "review",
+                "审查实现质量与风险",
+                "目标：审查本轮实现的正确性、安全性、边界条件和回归风险。\n产出格式：review_report。\n验收标准：列出高风险问题或确认可以进入测试。",
+                deps,
+            )
+
+    nodes = dag.get("nodes") or []
+    shell_nodes = [
+        node for node in nodes
+        if isinstance(node, dict) and str(node.get("type") or (node.get("data") or {}).get("agentType") or "") == "shell"
+    ]
+    if not shell_nodes:
+        review_or_merge = [
+            node for node in nodes
+            if isinstance(node, dict) and str(node.get("type") or (node.get("data") or {}).get("agentType") or "") in {"review", "merge"}
+        ]
+        deps = [str(review_or_merge[-1].get("id"))] if review_or_merge and review_or_merge[-1].get("id") else []
+        _ensure_node_id(
+            dag,
+            "shell",
+            "运行集成验证",
+            "目标：运行项目可用的构建、lint、测试或启动验证命令。\n产出格式：test_result。\n验收标准：报告命令、通过/失败数量和失败原因。",
+            deps,
+        )
+
+    if "支付" in outline and not any(
+        isinstance(node, dict) and str(node.get("type") or (node.get("data") or {}).get("agentType") or "") in {"human", "plan"}
+        and "支付" in str(node.get("label") or (node.get("data") or {}).get("label") or node.get("prompt") or "")
+        for node in dag.get("nodes", [])
+    ):
+        roots = [
+            str(node.get("id")) for node in dag.get("nodes", [])
+            if isinstance(node, dict) and not node.get("depends_on") and node.get("id")
+        ][:1]
+        decision_id = _ensure_node_id(
+            dag,
+            "human",
+            "确认支付渠道与结算约束",
+            "目标：确认支付渠道（如支付宝、微信、Stripe 或模拟支付）、回调方式、密钥配置和结算约束。\n产出格式：decision。\n验收标准：下游支付实现节点可以据此继续。",
+            roots,
+        )
+        for node in dag.get("nodes", []):
+            if not isinstance(node, dict) or not node.get("id") or node.get("id") == decision_id:
+                continue
+            label_or_prompt = str(node.get("label") or (node.get("data") or {}).get("label") or node.get("prompt") or "")
+            if "支付" not in label_or_prompt:
+                continue
+            depends_on = node.setdefault("depends_on", [])
+            if isinstance(depends_on, list) and decision_id not in depends_on:
+                depends_on.append(decision_id)
+                dag.setdefault("edges", []).append({"source": decision_id, "target": str(node["id"])})
+
+    repaired = _normalize_dag(dag)
+    if len(repaired.get("nodes") or []) < 6:
+        blockers.append({
+            "code": "dag_too_small",
+            "message": "DAG 节点仍少于 6 个，需要重新生成更完整的规划。",
+        })
+    return repaired, blockers
+
+
 def _validate_stage_submit(submit: dict | None, stage: str) -> list[dict]:
     blockers: list[dict] = []
     if not isinstance(submit, dict):
@@ -1335,6 +1967,13 @@ def _merge_stage_patch(draft_state: dict, stage_submit: dict) -> dict:
     for key in ("task_object", "project_summary", "shared_doc", "dag", "task_board", "action"):
         if key in patch and patch.get(key) is not None:
             merged[key] = patch.get(key)
+    if stage_submit.get("stage") == "plan_outline":
+        reply = str(stage_submit.get("reply") or "").strip()
+        trace = stage_submit.get("observable_trace") if isinstance(stage_submit.get("observable_trace"), list) else []
+        if reply:
+            merged["outline_reply"] = reply
+        if trace:
+            merged["observable_trace"] = [str(item).strip() for item in trace if str(item).strip()]
     merged["current_stage"] = stage_submit.get("stage")
     merged["updated_at"] = datetime.now(timezone.utc).isoformat()
     if isinstance(merged.get("action"), dict):
@@ -1371,6 +2010,8 @@ def _draft_state_ui_payload(draft_state: dict) -> dict:
     return {
         "current_stage": draft_state.get("current_stage"),
         "lifecycle_phase": draft_state.get("lifecycle_phase"),
+        "outline_reply": draft_state.get("outline_reply"),
+        "observable_trace": draft_state.get("observable_trace") or [],
         "task_object": draft_state.get("task_object"),
         "project_summary": draft_state.get("project_summary"),
         "shared_doc": draft_state.get("shared_doc"),
@@ -1407,6 +2048,9 @@ def _salvage_stage_submit_from_text(
         reply_matches = re.findall(r"```reply\s*\n(.*?)\n```", raw_response, re.DOTALL)
         if reply_matches:
             parsed = str(reply_matches[-1]).strip()
+        else:
+            parsed = re.sub(r"```observe\s*\n.*?\n```", "", raw_response, flags=re.DOTALL).strip()
+            parsed = re.sub(r"```[a-zA-Z0-9_-]*\s*\n?", "", parsed).replace("```", "").strip()
         parse_reply = parsed
         trace_matches = re.findall(r"```observe\s*\n(.*?)\n```", raw_response, re.DOTALL)
         observable_trace = []
@@ -1416,6 +2060,8 @@ def _salvage_stage_submit_from_text(
                 for line in trace_matches[-1].splitlines()
                 if line.strip()
             ]
+        elif parse_reply:
+            observable_trace = ["接收用户需求", "形成可讨论规划说明", "准备继续填充结构化状态"]
         return {
             "stage": stage,
             "stage_complete": bool(parse_reply or observable_trace),
@@ -1825,6 +2471,14 @@ async def _persist_planner_ui_state(
     if isinstance(task_board, list):
         normalized["task_board"] = [item for item in task_board if isinstance(item, dict)]
 
+    if isinstance(draft_state, dict):
+        if isinstance(draft_state.get("outline_reply"), str) and draft_state.get("outline_reply").strip():
+            normalized["outline_reply"] = draft_state.get("outline_reply").strip()
+        if isinstance(draft_state.get("observable_trace"), list):
+            normalized["observable_trace"] = [
+                str(item).strip() for item in draft_state.get("observable_trace") if str(item).strip()
+            ]
+
     normalized["updated_at"] = datetime.now(timezone.utc).isoformat()
 
     dag_json = workflow.dag_json if isinstance(workflow.dag_json, dict) else {"nodes": [], "edges": []}
@@ -1958,6 +2612,8 @@ async def planner_chat(
         draft_state = {
             "current_stage": "plan_outline",
             "lifecycle_phase": workflow.lifecycle_phase,
+            "outline_reply": existing_draft_state.get("outline_reply"),
+            "observable_trace": existing_draft_state.get("observable_trace") or [],
             "task_object": existing_ui_state.get("task_object") or existing_draft_state.get("task_object"),
             "project_summary": workflow.project_summary_json or existing_draft_state.get("project_summary"),
             "shared_doc": shared_doc.content.strip() if shared_doc and shared_doc.content else existing_draft_state.get("shared_doc"),
@@ -1972,239 +2628,191 @@ async def planner_chat(
         stage_history: list[dict] = []
         final_action = _normalize_action(draft_state.get("action"), "", "update_dag")
 
-        yield _sse({"type": "planner_status", "message": "Planner 请求已发送，开始分阶段规划。"})
+        yield _sse({"type": "planner_status", "message": "Planner 请求已发送，采用 agent tool loop 逐步更新规划。"})
+        draft_state["current_stage"] = "plan_outline"
+        yield _sse({"type": "planner_stage_status", "stage": "plan_outline", "message": "正在等待 Planner 调用规划工具"})
+        yield _sse({
+            "type": "planner_observable_progress",
+            "stage": "plan_outline",
+            "status": "started",
+            "attempt": 1,
+            "received_fields": [],
+            "missing_fields": ["outline", "nodes", "final_action"],
+            "next_action": "模型将通过小工具逐步写入 outline、DAG 节点、项目文档和最终 action。",
+            "draft_state": _draft_state_ui_payload(draft_state),
+        })
 
-        for stage in PLANNER_STAGE_SEQUENCE:
-            stage_label = PLANNER_STAGE_LABELS[stage]
-            stage_retry_feedback = ""
-            stage_success = False
-            draft_state["current_stage"] = stage
-            draft_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        fmt = _planner_model_format()
+        agent_messages: list[dict] = _recent_messages(messages, limit=4)
+        agent_messages.append({
+            "role": "user",
+            "content": (
+                "请用 Planner 小工具逐步更新当前工作流，不要一次性提交大 JSON。\n"
+                "必须先 planner_set_outline，再多次 planner_add_node 构建完整 DAG，必要时 planner_add_edge，"
+                "然后 planner_update_doc，最后 planner_finalize。\n\n"
+                f"用户最新需求：\n{body.message}"
+            ),
+        })
+        raw_response_parts: list[str] = []
+        finalized_by_tool = False
+        max_steps = 12
 
-            yield _sse({"type": "planner_stage_status", "stage": stage, "message": stage_label})
+        for step_index in range(max_steps):
+            tool_calls: list[dict] = []
+            step_text = ""
             yield _sse({
                 "type": "planner_observable_progress",
-                "stage": stage,
-                "status": "started",
-                "attempt": 1,
-                "received_fields": [field for field in PLANNER_STAGE_FIELDS.get(stage, []) if field not in _missing_stage_fields(stage, draft_state)],
-                "missing_fields": _missing_stage_fields(stage, draft_state),
-                "next_action": PLANNER_STAGE_TIMELINE_MESSAGES[stage],
+                "stage": draft_state.get("current_stage") or "planning",
+                "status": "running",
+                "attempt": step_index + 1,
+                "received_fields": [],
+                "missing_fields": [],
+                "next_action": f"Agent loop 第 {step_index + 1} 步：等待模型输出文本或工具调用。",
                 "draft_state": _draft_state_ui_payload(draft_state),
             })
-
-            max_stage_attempts = 3 if stage == "fill_dag" else 2
-            for attempt_index in range(max_stage_attempts):
-                stage_messages = _build_stage_messages(
-                    stage=stage,
-                    latest_user_message=body.message,
-                    workflow_goal=workflow_goal,
-                    lifecycle_phase=workflow.lifecycle_phase,
-                    draft_state=draft_state,
-                    blockers=draft_state.get("blockers") or [],
-                    recent_messages=messages,
-                    retry_feedback=stage_retry_feedback,
-                )
-                tool_calls: list[dict] = []
-                raw_response = ""
-                if attempt_index > 0:
+            async for event in _call_llm_stream(
+                agent_messages,
+                PLANNER_AGENT_LOOP_SYSTEM,
+                body.thinking_level,
+                tools=_planner_agent_tools(),
+                tool_choice_mode="auto",
+            ):
+                event_type = event.get("type")
+                chunk = str(event.get("content") or "")
+                if event_type == "status":
+                    yield _sse({"type": "planner_status", "message": chunk})
+                    continue
+                if event_type == "thinking":
+                    yield _sse({"type": "thinking_delta", "content": chunk})
+                    continue
+                if event_type == "tool_call":
+                    tool_calls.append(event)
                     yield _sse({
-                        "type": "planner_stage_status",
-                        "stage": stage,
-                        "message": f"{stage_label}（重试第 {attempt_index + 1} 次）",
+                        "type": "planner_tool_call",
+                        "name": event.get("name"),
+                        "id": event.get("id", ""),
+                        "input_keys": sorted((event.get("input") or {}).keys()) if isinstance(event.get("input"), dict) else [],
                     })
+                    continue
+                step_text += chunk
+                raw_response_parts.append(chunk)
+                yield _sse({"type": "text", "content": chunk})
 
-                async for event in _call_llm_stream(
-                    stage_messages,
-                    PLANNER_CHAT_SYSTEM,
-                    body.thinking_level,
-                    tools=_planner_tools(stage),
-                ):
-                    event_type = event.get("type")
-                    chunk = str(event.get("content") or "")
-                    if event_type == "status":
-                        yield _sse({"type": "planner_status", "message": chunk})
-                        continue
-                    if event_type == "thinking":
-                        yield _sse({"type": "thinking_delta", "content": chunk})
-                        continue
-                    if event_type == "tool_call":
-                        tool_calls.append(event)
-                        yield _sse({
-                            "type": "planner_tool_call",
-                            "name": event.get("name"),
-                            "id": event.get("id", ""),
-                            "input_keys": sorted((event.get("input") or {}).keys()) if isinstance(event.get("input"), dict) else [],
-                        })
-                        continue
-                    raw_response += chunk
-                    if stage == "plan_outline":
-                        yield _sse({"type": "text", "content": chunk})
+            if not tool_calls:
+                break
 
-                submit = _canonicalize_stage_submit(
-                    _tool_input(tool_calls, "planner_submit_turn"),
-                    expected_stage=stage,
-                    fallback_goal=workflow_goal,
-                    draft_state=draft_state,
-                )
-                if submit is None:
-                    submit = _salvage_stage_submit_from_text(
-                        stage=stage,
-                        raw_response=raw_response,
-                        fallback_goal=workflow_goal,
-                        draft_state=draft_state,
-                    )
-                blockers = _validate_stage_submit(submit, stage)
-                if not blockers and submit is not None:
-                    draft_state = _merge_stage_patch(draft_state, submit)
-                    if stage == "plan_outline":
-                        trace = submit.get("observable_trace") if isinstance(submit.get("observable_trace"), list) else []
-                        reply = str(submit.get("reply") or "").strip()
-                        synthetic_response = ""
-                        if trace:
-                            synthetic_response += "```observe\n" + "\n".join(f"- {line}" for line in trace if line) + "\n```\n"
-                        if reply:
-                            synthetic_response += f"```reply\n{reply}\n```"
-                        assistant_visible_response = synthetic_response or raw_response
-                        if synthetic_response and synthetic_response.strip() != raw_response.strip():
-                            yield _sse({"type": "text", "content": synthetic_response})
-                    if stage == "fill_dag" and isinstance(draft_state.get("dag"), dict):
-                        yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
-                    yield _sse({
-                        "type": "planner_stage_result",
-                        "stage": stage,
-                        "status": "completed",
-                        "attempt": attempt_index + 1,
-                        "applied_fields": sorted((submit.get("patch") or {}).keys()),
-                        "summary": stage_label,
-                        "draft_state": _draft_state_ui_payload(draft_state),
-                    })
-                    yield _sse({
-                        "type": "planner_observable_progress",
-                        "stage": stage,
-                        "status": "completed",
-                        "attempt": attempt_index + 1,
-                        "received_fields": sorted((submit.get("patch") or {}).keys()),
-                        "missing_fields": _missing_stage_fields(stage, draft_state),
-                        "next_action": PLANNER_STAGE_TIMELINE_MESSAGES.get(
-                            PLANNER_STAGE_SEQUENCE[PLANNER_STAGE_SEQUENCE.index(stage) + 1],
-                            "准备结束本轮规划。",
-                        ) if stage != "finalize_ready" else "本轮规划已完成。",
-                        "draft_state": _draft_state_ui_payload(draft_state),
-                    })
-                    stage_history.append({
-                        "stage": stage,
-                        "status": "completed",
-                        "attempt": attempt_index + 1,
-                        "summary": stage_label,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    })
-                    stage_success = True
-                    break
-
-                stage_retry_feedback = _build_planner_retry_message(blockers)
-                retry_status = "retrying" if attempt_index < max_stage_attempts - 1 else "failed"
+            tool_results: list[dict] = []
+            for call in tool_calls:
+                tool_name = str(call.get("name") or "")
+                tool_args = call.get("input") if isinstance(call.get("input"), dict) else {}
+                call_id = str(call.get("id") or f"call_{uuid.uuid4().hex}")
+                call["id"] = call_id
+                result = _execute_planner_agent_tool(tool_name, tool_args, draft_state, workflow_goal)
+                tool_results.append({"id": call_id, "name": tool_name, "result": result})
+                applied = result.get("applied") if isinstance(result, dict) else []
                 stage_history.append({
-                    "stage": stage,
-                    "status": retry_status,
-                    "attempt": attempt_index + 1,
-                    "summary": "；".join(item.get("message", "") for item in blockers),
+                    "stage": draft_state.get("current_stage") or "planning",
+                    "status": "completed" if result.get("ok") else "failed",
+                    "attempt": step_index + 1,
+                    "summary": tool_name,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 })
                 yield _sse({
+                    "type": "planner_stage_result",
+                    "stage": draft_state.get("current_stage") or "planning",
+                    "status": "completed" if result.get("ok") else "failed",
+                    "attempt": step_index + 1,
+                    "applied_fields": applied if isinstance(applied, list) else [],
+                    "summary": f"{tool_name}: {'ok' if result.get('ok') else result.get('error')}",
+                    "draft_state": _draft_state_ui_payload(draft_state),
+                })
+                yield _sse({
                     "type": "planner_observable_progress",
-                    "stage": stage,
-                    "status": retry_status,
-                    "attempt": attempt_index + 1,
-                    "received_fields": sorted(((submit or {}).get("patch") or {}).keys()) if isinstance(submit, dict) else [],
-                    "missing_fields": [item.get("code") for item in blockers],
-                    "next_action": "只重试当前阶段，不回退整轮。",
+                    "stage": draft_state.get("current_stage") or "planning",
+                    "status": "completed" if result.get("ok") else "failed",
+                    "attempt": step_index + 1,
+                    "received_fields": applied if isinstance(applied, list) else [],
+                    "missing_fields": [],
+                    "next_action": "工具结果已回传给模型，继续下一步。" if tool_name != "planner_finalize" else "Planner 已完成最终判定。",
                     "draft_state": _draft_state_ui_payload(draft_state),
                 })
+                if isinstance(draft_state.get("dag"), dict):
+                    yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
+                if draft_state.get("outline_reply") or draft_state.get("shared_doc"):
+                    preview_ui = {
+                        "task_object": draft_state.get("task_object"),
+                        "project_summary": draft_state.get("project_summary"),
+                        "shared_doc": draft_state.get("shared_doc"),
+                        "task_board": draft_state.get("task_board"),
+                    }
+                    yield _sse({"type": "planner_ui_update", "ui_state": preview_ui, "draft": True})
+                if tool_name == "planner_finalize" and result.get("ok"):
+                    finalized_by_tool = True
 
-            if stage_success:
-                continue
+            _append_tool_followup_messages(
+                agent_messages,
+                fmt=fmt,
+                assistant_text=step_text,
+                tool_calls=tool_calls,
+                tool_results=tool_results,
+            )
+            if finalized_by_tool:
+                break
 
-            if stage == "fill_task_context":
-                draft_state["task_object"] = _normalize_task_object(
-                    draft_state.get("task_object"),
-                    workflow_goal,
-                    assistant_visible_response,
-                )
-                draft_state["project_summary"] = _normalize_project_summary(draft_state.get("project_summary"))
-                draft_state["shared_doc"] = draft_state.get("shared_doc") or _default_shared_doc(
-                    draft_state.get("task_object"),
-                    assistant_visible_response,
-                )
-                yield _sse({
-                    "type": "planner_stage_result",
-                    "stage": stage,
-                    "status": "fallback",
-                    "attempt": 2,
-                    "applied_fields": ["task_object", "project_summary", "shared_doc"],
-                    "summary": "当前阶段由系统补默认摘要继续推进。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-                continue
-
-            if stage == "fill_dag":
-                draft_state["dag"] = _build_minimal_planner_dag(
-                    str((draft_state.get("task_object") or {}).get("title") or workflow_goal),
-                    str((draft_state.get("task_object") or {}).get("objective") or workflow_goal),
-                )
+        raw_response = "".join(raw_response_parts)
+        reply = str(draft_state.get("outline_reply") or raw_response or workflow_goal).strip()
+        if not isinstance(draft_state.get("dag"), dict) or not (draft_state.get("dag") or {}).get("nodes"):
+            parsed_dag = _extract_dag_from_any_text(raw_response) or _build_outline_based_dag(reply, workflow_goal, workflow_goal)
+            if parsed_dag:
+                draft_state["dag"] = parsed_dag
                 draft_state["system_generated_dag"] = True
-                draft_state["action"] = _normalize_action({
-                    "action": "update_dag",
-                    "message": "Planner 的 DAG 阶段连续失败，系统已补一个最小草案 DAG 以继续推进。",
-                })
-                yield _sse({
-                    "type": "planner_stage_result",
-                    "stage": stage,
-                    "status": "fallback",
-                    "attempt": max_stage_attempts,
-                    "applied_fields": ["dag", "action"],
-                    "summary": "DAG 阶段失败，系统已补最小草案 DAG。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-                yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
-                continue
+            else:
+                draft_state["dag"] = _build_minimal_planner_dag(workflow_goal, workflow_goal)
+                draft_state["system_generated_dag"] = True
 
-            if stage == "fill_task_board":
-                draft_state["task_board"] = _build_task_board_from_dag(draft_state.get("dag"))
-                yield _sse({
-                    "type": "planner_stage_result",
-                    "stage": stage,
-                    "status": "fallback",
-                    "attempt": max_stage_attempts,
-                    "applied_fields": ["task_board"],
-                    "summary": "任务面板阶段失败，系统已从 DAG 自动派生任务卡。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-                continue
+        assistant_visible_response = ""
+        trace = draft_state.get("observable_trace") if isinstance(draft_state.get("observable_trace"), list) else []
+        if trace:
+            assistant_visible_response += "```observe\n" + "\n".join(f"- {line}" for line in trace if line) + "\n```\n"
+        if reply:
+            assistant_visible_response += f"```reply\n{reply}\n```"
+            if not raw_response.strip():
+                yield _sse({"type": "text", "content": assistant_visible_response})
 
-            if stage == "finalize_ready":
-                requested_run = any(token in body.message for token in ("运行", "执行", "开始", "run", "start"))
-                if requested_run and isinstance(draft_state.get("dag"), dict) and (draft_state["dag"].get("nodes") or []):
-                    draft_state["action"] = _normalize_action({
-                        "action": "set_ready",
-                        "message": "方案已就绪，请点击顶部运行按钮开始执行。",
-                    })
-                else:
-                    draft_state["action"] = _normalize_action({
-                        "action": "update_dag",
-                        "message": "当前方案已进入 planning，可继续调整或直接准备运行。",
-                    })
-                continue
+        yield _sse({"type": "planner_stage_status", "stage": "fill_task_board", "message": "正在校验并修复 DAG"})
+        title = str((draft_state.get("task_object") or {}).get("title") or workflow_goal)
+        objective = str((draft_state.get("task_object") or {}).get("objective") or workflow_goal)
+        repaired_dag, repair_blockers = _repair_planner_dag(draft_state["dag"], reply or raw_response, title, objective)
+        draft_state["dag"] = repaired_dag
+        draft_state["blockers"] = repair_blockers
+        draft_state["task_object"] = _normalize_task_object(draft_state.get("task_object"), workflow_goal, reply)
+        draft_state["project_summary"] = _normalize_project_summary(draft_state.get("project_summary"))
+        draft_state["shared_doc"] = draft_state.get("shared_doc") or _default_shared_doc(draft_state.get("task_object"), reply)
+        draft_state["current_stage"] = "fill_task_board"
+        draft_state["task_board"] = _build_task_board_from_dag(repaired_dag)
+        yield _sse({"type": "dag_update", "dag": repaired_dag, "draft": True})
+        yield _sse({
+            "type": "planner_stage_result",
+            "stage": "fill_task_board",
+            "status": "completed",
+            "attempt": 1,
+            "applied_fields": ["task_board", "task_object", "project_summary", "shared_doc"],
+            "summary": "已从 DAG 派生面板与项目文档。",
+            "draft_state": _draft_state_ui_payload(draft_state),
+        })
 
+        requested_run = any(token in body.message for token in ("运行", "执行", "开始", "run", "start"))
+        if repair_blockers:
             draft_state["action"] = _normalize_action({
                 "action": "report_blocker",
-                "message": f"{stage_label}失败，且系统无法安全补全。",
-                "blockers": [{
-                    "code": f"{stage}_failed",
-                    "message": f"{stage_label}失败，且系统无法安全补全。",
-                }],
+                "message": "系统无法把当前规划修复为可执行 DAG。",
+                "blockers": repair_blockers,
             }, default_action="report_blocker")
-            break
+        elif not isinstance(draft_state.get("action"), dict):
+            draft_state["action"] = _normalize_action({
+                "action": "set_ready" if requested_run else "update_dag",
+                "message": "方案已就绪，请点击顶部运行按钮开始执行。" if requested_run else "已生成完整工作流 DAG，可继续调整或准备运行。",
+            })
 
         ui_state = {
             "task_object": draft_state.get("task_object"),

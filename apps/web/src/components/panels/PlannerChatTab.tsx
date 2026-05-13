@@ -330,8 +330,8 @@ export default function PlannerChatTab() {
                 const updated = [...prev];
                 const last = updated[updated.length - 1];
                 const message = blockers.length > 0
-                  ? `Planner 工具提交不完整，已拒绝更新画布：${blockers.map((item: { message?: string }) => item.message).filter(Boolean).join("；")}`
-                  : "Planner 工具提交不完整，已拒绝更新画布。";
+                  ? `Planner 返回了旧版整轮协议错误：${blockers.map((item: { message?: string }) => item.message).filter(Boolean).join("；")}`
+                  : "Planner 返回了旧版整轮协议错误，请确认后端服务已重启到最新代码。";
                 if (last?.role === "assistant") {
                   updated[updated.length - 1] = { ...last, content: message };
                 }
