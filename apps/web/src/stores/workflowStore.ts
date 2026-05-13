@@ -20,7 +20,13 @@ import type {
   WorkflowLifecyclePhase,
   WorkflowBlocker,
 } from "@/types/workflow";
-import type { PlannerStructuredAction, PlannerUiState, WorkflowDetail } from "@/types/api";
+import type {
+  PlannerDraftStructuredState,
+  PlannerStructuredAction,
+  PlannerUiState,
+  PlannerStage,
+  WorkflowDetail,
+} from "@/types/api";
 import { NODE_META, VALID_CONNECTIONS } from "@/lib/constants";
 import { translations } from "@/lib/i18n";
 import { useLocaleStore } from "./localeStore";
@@ -47,7 +53,9 @@ interface WorkflowState {
   blockers: WorkflowBlocker[];
   projectSummary: Record<string, unknown>;
   plannerUiState: PlannerUiState;
+  plannerDraftState: PlannerDraftStructuredState | null;
   plannerActionState: PlannerStructuredAction | null;
+  plannerSubStage: PlannerStage | null;
 
   // React Flow change handlers
   onNodesChange: OnNodesChange<WorkflowNode>;
@@ -93,7 +101,11 @@ interface WorkflowState {
   setBlockers: (blockers: WorkflowBlocker[]) => void;
   setProjectSummary: (summary: Record<string, unknown>) => void;
   setPlannerUiState: (state: PlannerUiState) => void;
+  setPlannerDraftState: (state: PlannerDraftStructuredState | null) => void;
   setPlannerActionState: (action: PlannerStructuredAction | null) => void;
+  setPlannerSubStage: (stage: PlannerStage | null) => void;
+  applyPlannerDagPreview: (dag: { nodes: Array<Record<string, unknown>>; edges: Array<Record<string, unknown>> }) => void;
+  clearPlannerDraftState: () => void;
 
   // Mode & goal
   updateMode: (mode: "auto" | "manual") => Promise<void>;
@@ -257,7 +269,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   blockers: [],
   projectSummary: {},
   plannerUiState: {},
+  plannerDraftState: null,
   plannerActionState: null,
+  plannerSubStage: null,
 
   // ---- React Flow change handlers ----
   onNodesChange: (changes: NodeChange<WorkflowNode>[]) => {
@@ -497,7 +511,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       blockers: workflow.blockers ?? [],
       projectSummary: workflow.project_summary ?? {},
       plannerUiState: workflow.metadata?.planner_ui_state ?? {},
+      plannerDraftState: workflow.metadata?.planner_draft_state ?? null,
       plannerActionState: null,
+      plannerSubStage: workflow.metadata?.planner_draft_state?.current_stage ?? null,
     });
   },
 
@@ -514,7 +530,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       blockers: [],
       projectSummary: {},
       plannerUiState: {},
+      plannerDraftState: null,
       plannerActionState: null,
+      plannerSubStage: null,
     });
   },
 
@@ -552,7 +570,23 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   setBlockers: (blockers) => set({ blockers }),
   setProjectSummary: (projectSummary) => set({ projectSummary }),
   setPlannerUiState: (plannerUiState) => set({ plannerUiState }),
+  setPlannerDraftState: (plannerDraftState) => set({ plannerDraftState }),
   setPlannerActionState: (plannerActionState) => set({ plannerActionState }),
+  setPlannerSubStage: (plannerSubStage) => set({ plannerSubStage }),
+  applyPlannerDagPreview: (dag) => {
+    const normalizedNodes = (dag.nodes ?? []).map(normalizeWorkflowNode);
+    const normalizedEdges = (dag.edges ?? [])
+      .map(normalizeWorkflowEdge)
+      .filter((edge): edge is WorkflowEdge => edge !== null);
+    set({
+      nodes: layoutDagNodes(normalizedNodes, normalizedEdges),
+      edges: normalizedEdges,
+    });
+  },
+  clearPlannerDraftState: () => set({
+    plannerDraftState: null,
+    plannerSubStage: null,
+  }),
 
   // ---- Mode & goal ----
   updateMode: async (_mode: "auto" | "manual") => {
@@ -580,7 +614,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
 
   updateAutoChildModelMap: async (agentType, model) => {
-    const { currentWorkflowId, autoChildModelMap, plannerUiState } = get();
+    const { currentWorkflowId, autoChildModelMap, plannerUiState, plannerDraftState } = get();
     const nextMap = {
       ...autoChildModelMap,
       [agentType]: model,
@@ -592,6 +626,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         metadata: {
           auto_child_model_map: nextMap,
           planner_ui_state: plannerUiState,
+          planner_draft_state: plannerDraftState ?? undefined,
         },
       });
     } catch (err) {

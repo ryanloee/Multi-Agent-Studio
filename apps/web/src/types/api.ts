@@ -69,6 +69,7 @@ export interface WorkflowDetail {
   metadata?: {
     auto_child_model_map?: AutoChildModelMap;
     planner_ui_state?: PlannerUiState;
+    planner_draft_state?: PlannerDraftStructuredState;
   };
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
@@ -88,6 +89,7 @@ export interface CreateWorkflowRequest {
   metadata?: {
     auto_child_model_map?: AutoChildModelMap;
     planner_ui_state?: PlannerUiState;
+    planner_draft_state?: PlannerDraftStructuredState;
   };
 }
 
@@ -104,6 +106,7 @@ export interface UpdateWorkflowRequest {
   metadata?: {
     auto_child_model_map?: AutoChildModelMap;
     planner_ui_state?: PlannerUiState;
+    planner_draft_state?: PlannerDraftStructuredState;
   };
   nodes?: WorkflowNode[];
   edges?: WorkflowEdge[];
@@ -131,6 +134,39 @@ export interface PlannerUiTaskItem {
 export interface PlannerUiState {
   task_object?: PlannerUiTaskObject;
   task_board?: PlannerUiTaskItem[];
+  updated_at?: string;
+}
+
+export type PlannerStage =
+  | "plan_outline"
+  | "fill_task_context"
+  | "fill_dag"
+  | "fill_task_board"
+  | "finalize_ready";
+
+export interface PlannerStageHistoryItem {
+  stage: PlannerStage;
+  status: "started" | "completed" | "retrying" | "fallback" | "failed";
+  attempt: number;
+  summary?: string;
+  timestamp?: string;
+}
+
+export interface PlannerDraftStructuredState {
+  current_stage?: PlannerStage;
+  lifecycle_phase?: string;
+  task_object?: PlannerUiTaskObject;
+  project_summary?: Record<string, unknown>;
+  shared_doc?: string;
+  task_board?: PlannerUiTaskItem[];
+  dag?: {
+    nodes: Array<Record<string, unknown>>;
+    edges: Array<Record<string, unknown>>;
+    metadata?: Record<string, unknown>;
+  };
+  blockers?: WorkflowBlocker[];
+  action?: PlannerStructuredAction | null;
+  system_generated_dag?: boolean;
   updated_at?: string;
 }
 

@@ -23,7 +23,9 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
   const blockers = useWorkflowStore((s) => s.blockers);
   const projectSummary = useWorkflowStore((s) => s.projectSummary);
   const plannerUiState = useWorkflowStore((s) => s.plannerUiState);
+  const plannerDraftState = useWorkflowStore((s) => s.plannerDraftState);
   const plannerActionState = useWorkflowStore((s) => s.plannerActionState);
+  const plannerSubStage = useWorkflowStore((s) => s.plannerSubStage);
 
   const runStatus = useRunStore((s) => s.status);
   const taskCount = useTaskStore((s) => s.tasks.length);
@@ -55,8 +57,16 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
   }, [plannerActionState, projectSummary, lifecyclePhase]);
 
   const plannedNodes = nodes.filter((node) => node.id !== "planner");
-  const taskObject = plannerUiState.task_object;
-  const plannedTaskItems = plannerUiState.task_board ?? [];
+  const draftTaskObject = plannerDraftState?.task_object;
+  const taskObject = plannerUiState.task_object ?? draftTaskObject;
+  const plannedTaskItems = plannerUiState.task_board ?? plannerDraftState?.task_board ?? [];
+  const effectiveProjectSummary = Object.keys(projectSummary ?? {}).length > 0
+    ? projectSummary
+    : plannerDraftState?.project_summary ?? {};
+  const draftDag = plannerDraftState?.dag;
+  const plannedNodeCount = plannedNodes.length > 0
+    ? plannedNodes.length
+    : Array.isArray(draftDag?.nodes) ? draftDag.nodes.length : 0;
   const nodeTypeCounts = plannedNodes.reduce<Record<string, number>>((acc, node) => {
     acc[node.type] = (acc[node.type] || 0) + 1;
     return acc;
@@ -99,7 +109,10 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
           <div className="h-full overflow-y-auto p-3 space-y-3 text-xs text-gray-700">
             <div className="rounded-lg border border-gray-200 bg-gray-50 p-3">
               <div className="text-[11px] font-semibold text-gray-500">当前阶段</div>
-              <div className="mt-1 text-sm font-medium text-gray-800">{lifecyclePhase}</div>
+              <div className="mt-1 text-sm font-medium text-gray-800">
+                {lifecyclePhase}
+                {plannerSubStage ? ` · ${plannerSubStage}` : ""}
+              </div>
             </div>
             <div className="rounded-lg border border-gray-200 bg-white p-3">
               <div className="text-[11px] font-semibold text-gray-500">目标 / 问题</div>
@@ -125,8 +138,13 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
             <div className="rounded-lg border border-gray-200 bg-white p-3">
               <div className="text-[11px] font-semibold text-gray-500">当前规划</div>
               <div className="mt-1 text-gray-800">
-                {plannedNodes.length > 0 ? `已生成 ${plannedNodes.length} 个执行节点` : "还没有形成可执行节点"}
+                {plannedNodeCount > 0 ? `已生成 ${plannedNodeCount} 个执行节点` : "还没有形成可执行节点"}
               </div>
+              {plannerDraftState?.system_generated_dag && (
+                <div className="mt-2 rounded-md bg-amber-50 px-2 py-1.5 text-[11px] text-amber-700">
+                  当前 DAG 草案由系统补全，建议继续让 Planner 精化。
+                </div>
+              )}
               {plannedNodes.length > 0 && (
                 <div className="mt-2 flex flex-wrap gap-1.5">
                   {Object.entries(nodeTypeCounts).map(([type, count]) => (
@@ -209,14 +227,14 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
           </div>
         ) : activeTab === "summary" ? (
           <div className="h-full overflow-y-auto p-3">
-            {Object.keys(projectSummary ?? {}).length === 0 ? (
+            {Object.keys(effectiveProjectSummary ?? {}).length === 0 ? (
               <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs text-gray-500">
                 还没有项目摘要。导入现有项目后，Planner 或系统 Assess 会在这里展示项目类型、技术栈、启动方式和风险点。
               </div>
             ) : (
               <div className="rounded-lg border border-gray-200 bg-white p-3 text-xs text-gray-700">
                 <div className="space-y-2">
-                  {Object.entries(projectSummary).map(([key, value]) => (
+                  {Object.entries(effectiveProjectSummary).map(([key, value]) => (
                     <div key={key}>
                       <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">{key}</div>
                       <div className="mt-0.5 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-gray-700">

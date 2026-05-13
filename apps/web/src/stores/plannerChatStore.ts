@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import type { PlannerDraftStructuredState, PlannerStage, PlannerStageHistoryItem } from "@/types/api";
 
 export interface PlannerChatMessage {
   role: "user" | "assistant";
@@ -28,6 +29,11 @@ interface PlannerChatState {
   loadingHistory: boolean;
   thinkingLevel: "off" | "low" | "medium" | "high";
   abortController: AbortController | null;
+  currentStage: PlannerStage | null;
+  stageAttempt: number;
+  stageProgressItems: string[];
+  stageHistory: PlannerStageHistoryItem[];
+  draftStructuredState: PlannerDraftStructuredState | null;
   setSelectedNodeId: (nodeId: string) => void;
   setConversationKey: (key: string) => void;
   setMessages: (messages: PlannerChatMessage[] | ((prev: PlannerChatMessage[]) => PlannerChatMessage[])) => void;
@@ -44,6 +50,11 @@ interface PlannerChatState {
   recordPlannerToolCall: (toolName: string, inputKeys: string[]) => void;
   setLoadingHistory: (loading: boolean) => void;
   setThinkingLevel: (level: "off" | "low" | "medium" | "high") => void;
+  setCurrentStage: (stage: PlannerStage | null) => void;
+  setStageAttempt: (attempt: number) => void;
+  setStageProgressItems: (items: string[]) => void;
+  pushStageHistory: (item: PlannerStageHistoryItem) => void;
+  setDraftStructuredState: (state: PlannerDraftStructuredState | null) => void;
 }
 
 export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
@@ -68,6 +79,11 @@ export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
   loadingHistory: false,
   thinkingLevel: "medium",
   abortController: null,
+  currentStage: null,
+  stageAttempt: 0,
+  stageProgressItems: [],
+  stageHistory: [],
+  draftStructuredState: null,
 
   setSelectedNodeId: (selectedNodeId) => set({ selectedNodeId }),
   setConversationKey: (conversationKey) => set({ conversationKey }),
@@ -91,6 +107,11 @@ export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
     lastPlannerToolName: "",
     lastPlannerToolInputKeys: [],
     abortController,
+    currentStage: null,
+    stageAttempt: 0,
+    stageProgressItems: [],
+    stageHistory: [],
+    draftStructuredState: null,
   }),
   stopStream: () => {
     get().abortController?.abort();
@@ -140,4 +161,11 @@ export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
   })),
   setLoadingHistory: (loadingHistory) => set({ loadingHistory }),
   setThinkingLevel: (thinkingLevel) => set({ thinkingLevel }),
+  setCurrentStage: (currentStage) => set({ currentStage }),
+  setStageAttempt: (stageAttempt) => set({ stageAttempt }),
+  setStageProgressItems: (stageProgressItems) => set({ stageProgressItems }),
+  pushStageHistory: (item) => set((state) => ({
+    stageHistory: [...state.stageHistory, item],
+  })),
+  setDraftStructuredState: (draftStructuredState) => set({ draftStructuredState }),
 }));

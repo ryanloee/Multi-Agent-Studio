@@ -10,6 +10,15 @@ import { authHeaders } from "@/lib/auth";
 import { parsePlannerObservableContent } from "@/lib/plannerObservable";
 import MarkdownMessage from "@/components/common/MarkdownMessage";
 import type { ChatHistoryItem } from "@/types/settings";
+import type { PlannerDraftStructuredState, PlannerStage } from "@/types/api";
+
+const STAGE_LABELS: Record<PlannerStage, string> = {
+  plan_outline: "Outline",
+  fill_task_context: "Task Context",
+  fill_dag: "DAG",
+  fill_task_board: "Task Board",
+  finalize_ready: "Ready Check",
+};
 
 function plannerChatUrl(): string {
   const configured = process.env.NEXT_PUBLIC_API_URL;
@@ -36,7 +45,11 @@ export default function PlannerChatTab() {
   const setBlockers = useWorkflowStore((s) => s.setBlockers);
   const setProjectSummary = useWorkflowStore((s) => s.setProjectSummary);
   const setPlannerUiState = useWorkflowStore((s) => s.setPlannerUiState);
+  const setPlannerDraftState = useWorkflowStore((s) => s.setPlannerDraftState);
   const setPlannerActionState = useWorkflowStore((s) => s.setPlannerActionState);
+  const setPlannerSubStage = useWorkflowStore((s) => s.setPlannerSubStage);
+  const applyPlannerDagPreview = useWorkflowStore((s) => s.applyPlannerDagPreview);
+  const clearPlannerDraftState = useWorkflowStore((s) => s.clearPlannerDraftState);
 
   const selectedNodeId = usePlannerChatStore((s) => s.selectedNodeId);
   const conversationKey = usePlannerChatStore((s) => s.conversationKey);
@@ -68,6 +81,15 @@ export default function PlannerChatTab() {
   const setLoadingHistory = usePlannerChatStore((s) => s.setLoadingHistory);
   const thinkingLevel = usePlannerChatStore((s) => s.thinkingLevel);
   const setThinkingLevel = usePlannerChatStore((s) => s.setThinkingLevel);
+  const currentStage = usePlannerChatStore((s) => s.currentStage);
+  const stageAttempt = usePlannerChatStore((s) => s.stageAttempt);
+  const stageProgressItems = usePlannerChatStore((s) => s.stageProgressItems);
+  const stageHistory = usePlannerChatStore((s) => s.stageHistory);
+  const setCurrentStage = usePlannerChatStore((s) => s.setCurrentStage);
+  const setStageAttempt = usePlannerChatStore((s) => s.setStageAttempt);
+  const setStageProgressItems = usePlannerChatStore((s) => s.setStageProgressItems);
+  const pushStageHistory = usePlannerChatStore((s) => s.pushStageHistory);
+  const setDraftStructuredState = usePlannerChatStore((s) => s.setDraftStructuredState);
   const [waitingSeconds, setWaitingSeconds] = useState(0);
   const streamingChars = usePlannerChatStore((s) => s.streamingChars);
   const dagUpdateCount = usePlannerChatStore((s) => s.dagUpdateCount);
@@ -177,6 +199,7 @@ export default function PlannerChatTab() {
     setMessages((prev) => [...prev, { role: "user", content: text }]);
     setInput("");
     beginStream(controller);
+    clearPlannerDraftState();
 
     try {
       const response = await fetch(
@@ -252,11 +275,68 @@ export default function PlannerChatTab() {
             } else if (event.type === "thinking_delta") {
               const delta = event.content || "";
               appendThinking(delta);
+            } else if (event.type === "planner_stage_status") {
+              const stage = event.stage as PlannerStage | undefined;
+              if (stage) {
+                setCurrentStage(stage);
+                setPlannerSubStage(stage);
+              }
+            } else if (event.type === "planner_observable_progress") {
+              const stage = event.stage as PlannerStage | undefined;
+              if (stage) {
+                setCurrentStage(stage);
+                setPlannerSubStage(stage);
+              }
+              setStageAttempt(Number(event.attempt) || 0);
+              const progressLines = [
+                event.next_action ? String(event.next_action) : "",
+                Array.isArray(event.received_fields) && event.received_fields.length > 0
+                  ? `已接收字段：${event.received_fields.join(" / ")}`
+                  : "",
+                Array.isArray(event.missing_fields) && event.missing_fields.length > 0
+                  ? `缺失字段：${event.missing_fields.join(" / ")}`
+                  : "",
+              ].filter(Boolean);
+              setStageProgressItems(progressLines);
+              if (event.draft_state && typeof event.draft_state === "object") {
+                const draft = event.draft_state as PlannerDraftStructuredState;
+                setDraftStructuredState(draft);
+                setPlannerDraftState(draft);
+                if (draft.project_summary) setProjectSummary(draft.project_summary);
+              }
+            } else if (event.type === "planner_stage_result") {
+              pushStageHistory({
+                stage: event.stage as PlannerStage,
+                status: event.status || "completed",
+                attempt: Number(event.attempt) || 0,
+                summary: event.summary || "",
+                timestamp: new Date().toISOString(),
+              });
+              if (event.draft_state && typeof event.draft_state === "object") {
+                const draft = event.draft_state as PlannerDraftStructuredState;
+                setDraftStructuredState(draft);
+                setPlannerDraftState(draft);
+              }
             } else if (event.type === "planner_tool_call") {
               recordPlannerToolCall(
                 event.name || "unknown_tool",
                 Array.isArray(event.input_keys) ? event.input_keys : []
               );
+            } else if (event.type === "planner_contract_error") {
+              const blockers = Array.isArray(event.blockers) ? event.blockers : [];
+              setBlockers(blockers);
+              setLifecyclePhase("blocked");
+              setMessages((prev) => {
+                const updated = [...prev];
+                const last = updated[updated.length - 1];
+                const message = blockers.length > 0
+                  ? `Planner 工具提交不完整，已拒绝更新画布：${blockers.map((item: { message?: string }) => item.message).filter(Boolean).join("；")}`
+                  : "Planner 工具提交不完整，已拒绝更新画布。";
+                if (last?.role === "assistant") {
+                  updated[updated.length - 1] = { ...last, content: message };
+                }
+                return updated;
+              });
             } else if (event.type === "planner_action") {
               const action = event.action;
               plannerActionMessage = action?.message || plannerActionMessage;
@@ -272,6 +352,7 @@ export default function PlannerChatTab() {
               }
               setPlannerActionState(action);
               if (action?.ui_state) setPlannerUiState(action.ui_state);
+              if (action?.ui_state) clearPlannerDraftState();
               if (action?.blockers) setBlockers(action.blockers);
               if (action?.action === "assess" && currentWorkflowId) {
                 setLifecyclePhase("assessing");
@@ -304,13 +385,15 @@ export default function PlannerChatTab() {
                 }
                 return updated;
               });
-              if (currentWorkflowId) {
+              if (event.draft) {
+                if (event.dag) applyPlannerDagPreview(event.dag);
+              } else if (currentWorkflowId) {
                 const updated = await api.getWorkflow(currentWorkflowId);
                 loadWorkflow(updated);
               }
             } else if (event.type === "planner_ui_update") {
               if (event.ui_state) setPlannerUiState(event.ui_state);
-              if (currentWorkflowId) {
+              if (!event.draft && currentWorkflowId) {
                 const updated = await api.getWorkflow(currentWorkflowId);
                 loadWorkflow(updated);
               }
@@ -346,6 +429,8 @@ export default function PlannerChatTab() {
         setMessages((prev) => [...prev, { role: "assistant", content: `连接失败: ${err}` }]);
       }
     } finally {
+      setCurrentStage(null);
+      setPlannerSubStage(null);
       finishStream();
     }
   }, [
@@ -365,7 +450,16 @@ export default function PlannerChatTab() {
     setBlockers,
     setProjectSummary,
     setPlannerUiState,
+    setPlannerDraftState,
     setPlannerActionState,
+    setPlannerSubStage,
+    applyPlannerDagPreview,
+    clearPlannerDraftState,
+    setCurrentStage,
+    setStageAttempt,
+    setStageProgressItems,
+    pushStageHistory,
+    setDraftStructuredState,
   ]);
 
   const handleKeyDown = useCallback(
@@ -476,12 +570,26 @@ export default function PlannerChatTab() {
               <div className="mt-2 rounded-lg border border-blue-200 bg-white/70 px-2.5 py-2 text-[10px] leading-relaxed text-blue-800">
                 <div className="font-medium text-blue-700">规划轨迹</div>
                 <div className="mt-1 space-y-0.5">
+                  <div>
+                    当前阶段：
+                    <span className="ml-1 rounded-full bg-white px-1.5 py-0.5 font-medium text-blue-700">
+                      {currentStage ? STAGE_LABELS[currentStage] : "等待中"}
+                    </span>
+                    {stageAttempt > 0 ? ` · 尝试 ${stageAttempt}` : ""}
+                  </div>
                   {observableTrace.length > 0 ? (
                     observableTrace.map((line, index) => (
                       <div key={`${index}-${line}`}>- {line}</div>
                     ))
                   ) : (
                     <div>正在等待模型输出本轮规划轨迹。</div>
+                  )}
+                  {stageProgressItems.length > 0 && (
+                    <div className="mt-2 rounded border border-blue-200 bg-white px-2 py-1.5 text-[10px] text-blue-800">
+                      {stageProgressItems.map((item) => (
+                        <div key={item}>- {item}</div>
+                      ))}
+                    </div>
                   )}
                   <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-2 py-1.5 text-slate-700">
                     <details open={thinkingContent.length > 0}>
@@ -518,6 +626,17 @@ export default function PlannerChatTab() {
                     流事件：{streamEventCount} 次，最近：{lastStreamEventType || "无"}
                     {lastStreamEventPreview ? ` / ${lastStreamEventPreview}` : ""}
                   </div>
+                  {stageHistory.length > 0 && (
+                    <div className="rounded border border-blue-100 bg-white px-2 py-1.5 text-[10px] text-blue-800">
+                      <div className="mb-1 font-medium text-blue-700">规划进度</div>
+                      {stageHistory.slice(-5).map((item, index) => (
+                        <div key={`${item.stage}-${item.attempt}-${index}`}>
+                          {STAGE_LABELS[item.stage]} · {item.status} · 第 {item.attempt} 次
+                          {item.summary ? ` · ${item.summary}` : ""}
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             </div>

@@ -47,7 +47,7 @@ PLANNER_CHAT_SYSTEM = """你是白盒多 Agent 编排系统的高级 Planner / O
 
 你的职责不是生成普通任务列表，而是理解目标、拆解 DAG、分配 Worker、监督执行、处理 Worker 咨询、约束 Worker 间协作，并确保所有关键产物进入 Artifact 管理系统。
 
-重要：当前系统启用强制 Planner 工具接口。你必须调用 `planner_submit_turn` 提交本轮结果，不能把 DAG、面板数据或 action 当作普通文本输出。普通文本只用于简短沟通，最终给用户看的内容也应填写在工具参数 `reply` 中。
+重要：当前系统启用强制 Planner 工具接口。你必须调用 `planner_submit_turn` 分阶段提交结果，不能把 DAG、面板数据或 action 当作普通文本输出。普通文本只用于简短沟通，最终给用户看的内容也应填写在工具参数 `reply` 中。
 
 ## 对话模式
 - 用户会用自然语言描述他们想要实现的目标
@@ -65,15 +65,18 @@ PLANNER_CHAT_SYSTEM = """你是白盒多 Agent 编排系统的高级 Planner / O
 - ` ```observe` 代码块结束后，先输出结构化接口块，再在最后输出 ` ```reply` 代码块，里面写给用户看的可讨论规划说明
 
 ## 框架填充接口
-系统会向你提供 Planner 工具接口。你不能依赖系统从自然语言里猜测，也不要把接口数据展示给用户；每轮必须调用：
-- `planner_submit_turn`：一次性提交左侧“任务对象 / 项目摘要 / 项目文档 / 任务面板”、画布 DAG、本轮 action 和给用户看的 reply
+系统会向你提供 Planner 工具接口。你不能依赖系统从自然语言里猜测，也不要把接口数据展示给用户；每个阶段都必须调用：
+- `planner_submit_turn`：带 `stage`、`stage_complete` 和 `patch` 的分阶段增量提交；`patch` 只提交当前阶段相关字段
 
 接口规则：
-- 生成或修改规划时，必须在工具参数中填写 `task_object / project_summary / shared_doc / task_board`
-- 生成或修改节点时，必须在工具参数中填写 `dag`
-- 每轮必须在工具参数中填写 `action`
+- 先做 `plan_outline`，只给用户可讨论的规划说明与 observable trace
+- 再做 `fill_task_context`，只填写 `task_object / project_summary / shared_doc`
+- 然后做 `fill_dag`，只填写 `dag / action`
+- 接着做 `fill_task_board`，只填写 `task_board`
+- 最后做 `finalize_ready`，只填写最终 `action`
+- 每个阶段都要正确填写 `stage`，并在本阶段字段完整时把 `stage_complete` 设为 true
 - 给用户看的说明只写入工具参数 `reply`；不要在 reply 里粘贴 JSON、节点 prompt 或工具参数
-- 如果不能完整填写面板字段，不要提交 DAG；应将 action 设为 `report_blocker` 并说明缺少什么
+- 如果当前阶段缺字段，就只修正当前阶段，不要回退整个流程
 
 ## DAG 输出格式
 当你需要展示或更新工作流时，在对话中输出以下 JSON 块：
@@ -257,6 +260,200 @@ class ChatMessageResponse(BaseModel):
     role: str
     content: str
     created_at: str | None = None
+
+
+PLANNER_STAGE_SEQUENCE = [
+    "plan_outline",
+    "fill_task_context",
+    "fill_dag",
+    "fill_task_board",
+    "finalize_ready",
+]
+
+PLANNER_STAGE_LABELS = {
+    "plan_outline": "正在生成规划说明",
+    "fill_task_context": "正在填写任务对象与项目摘要",
+    "fill_dag": "正在生成 DAG",
+    "fill_task_board": "正在填充任务面板",
+    "finalize_ready": "正在判断是否可进入 Ready",
+}
+
+PLANNER_STAGE_TIMELINE_MESSAGES = {
+    "plan_outline": "先给出可讨论的规划说明和可观察轨迹，再继续结构化填充。",
+    "fill_task_context": "基于规划说明补任务对象、项目摘要和项目文档。",
+    "fill_dag": "基于已确认的任务对象和项目摘要生成 DAG 节点与依赖。",
+    "fill_task_board": "基于当前 DAG 生成左侧任务面板任务卡。",
+    "finalize_ready": "判断当前工作流进入 planning、ready 还是 blocked。",
+}
+
+PLANNER_STAGE_FIELDS = {
+    "plan_outline": ["reply", "observable_trace"],
+    "fill_task_context": ["task_object", "project_summary", "shared_doc"],
+    "fill_dag": ["dag", "action"],
+    "fill_task_board": ["task_board"],
+    "finalize_ready": ["action"],
+}
+
+
+def _recent_messages(messages: list[dict[str, str]], limit: int = 4) -> list[dict[str, str]]:
+    if not messages:
+        return []
+    return [dict(item) for item in messages[-limit:]]
+
+
+def _summarize_text(value: str | None, limit: int = 280) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def _summarize_dag(dag: dict | None) -> dict:
+    if not isinstance(dag, dict):
+        return {}
+    nodes = dag.get("nodes") if isinstance(dag.get("nodes"), list) else []
+    edges = dag.get("edges") if isinstance(dag.get("edges"), list) else []
+    node_summary = []
+    for node in nodes[:8]:
+        if not isinstance(node, dict):
+            continue
+        node_summary.append({
+            "id": node.get("id"),
+            "type": node.get("type") or (node.get("data") or {}).get("agentType"),
+            "label": node.get("label") or (node.get("data") or {}).get("label"),
+            "depends_on": node.get("depends_on") or [],
+        })
+    return {
+        "node_count": len(nodes),
+        "edge_count": len(edges),
+        "nodes": node_summary,
+    }
+
+
+def _state_summary_payload(
+    latest_user_message: str,
+    workflow_goal: str,
+    stage: str,
+    lifecycle_phase: str,
+    draft_state: dict,
+    blockers: list[dict],
+) -> dict:
+    return {
+        "latest_user_requirement": latest_user_message,
+        "workflow_goal": workflow_goal,
+        "stage": stage,
+        "lifecycle_phase": lifecycle_phase,
+        "task_object": draft_state.get("task_object"),
+        "project_summary": draft_state.get("project_summary"),
+        "shared_doc_summary": _summarize_text(draft_state.get("shared_doc")),
+        "dag_summary": _summarize_dag(draft_state.get("dag")),
+        "task_board_count": len(draft_state.get("task_board") or []),
+        "blockers": blockers,
+    }
+
+
+def _build_stage_prompt(
+    *,
+    stage: str,
+    latest_user_message: str,
+    workflow_goal: str,
+    lifecycle_phase: str,
+    draft_state: dict,
+    blockers: list[dict],
+    retry_feedback: str = "",
+) -> str:
+    summary = json.dumps(
+        _state_summary_payload(
+            latest_user_message,
+            workflow_goal,
+            stage,
+            lifecycle_phase,
+            draft_state,
+            blockers,
+        ),
+        ensure_ascii=False,
+        indent=2,
+    )
+    stage_instructions = {
+        "plan_outline": (
+            "当前是第一阶段。只输出可讨论的规划说明和 observable_trace。"
+            " task_object 只允许给粗粒度草案；不要生成 DAG、task_board 或最终 ready 判定。"
+        ),
+        "fill_task_context": (
+            "请基于你刚才已经给出的规划说明，只填写 task_object、project_summary、shared_doc。"
+            " 不要重复长篇解释，不要生成 DAG 或 task_board。"
+        ),
+        "fill_dag": (
+            "请基于已确认的 task_object 和 project_summary，只生成 dag 和 action。"
+            " action 只能是 update_dag、assess 或 report_blocker。不要输出额外正文。"
+        ),
+        "fill_task_board": (
+            "请基于当前 DAG，为左侧任务面板生成 task_board。不要修改 DAG，不要重复正文。"
+        ),
+        "finalize_ready": (
+            "请判断当前工作流是否可进入 ready；如不可进入，给出 blocker。"
+            " 只填写 action，不要重复前面内容。"
+        ),
+    }[stage]
+    prompt = [
+        f"当前阶段：{stage}",
+        stage_instructions,
+        "上下文策略：优先根据下面的结构化状态摘要继续，不要复读全量历史聊天。",
+        "结构化状态摘要：",
+        summary,
+        "",
+        "本阶段必须调用 planner_submit_turn，并且：",
+        f"- `stage` 必须是 `{stage}`",
+        "- `stage_complete` 只有在本阶段字段已填写完成时才能设为 true",
+        "- `patch` 里只提交本阶段相关字段的增量",
+        "- `reply` 只有 plan_outline 阶段需要给用户看；其他阶段尽量留空",
+        "- `observable_trace` 在 plan_outline 阶段填写 3-7 行，其他阶段可为空或简短阶段说明",
+        "",
+        PLANNER_STAGE_TIMELINE_MESSAGES[stage],
+    ]
+    if retry_feedback:
+        prompt.extend(["", "你上一轮本阶段提交仍有缺项，请只修正当前阶段：", retry_feedback])
+    return "\n".join(prompt)
+
+
+def _build_stage_messages(
+    *,
+    stage: str,
+    latest_user_message: str,
+    workflow_goal: str,
+    lifecycle_phase: str,
+    draft_state: dict,
+    blockers: list[dict],
+    recent_messages: list[dict[str, str]],
+    retry_feedback: str = "",
+) -> list[dict[str, str]]:
+    if stage == "plan_outline":
+        stage_messages = _recent_messages(recent_messages)
+        stage_messages.append({
+            "role": "user",
+            "content": _build_stage_prompt(
+                stage=stage,
+                latest_user_message=latest_user_message,
+                workflow_goal=workflow_goal,
+                lifecycle_phase=lifecycle_phase,
+                draft_state=draft_state,
+                blockers=blockers,
+                retry_feedback=retry_feedback,
+            ),
+        })
+        return stage_messages
+    return [{
+        "role": "user",
+        "content": _build_stage_prompt(
+            stage=stage,
+            latest_user_message=latest_user_message,
+            workflow_goal=workflow_goal,
+            lifecycle_phase=lifecycle_phase,
+            draft_state=draft_state,
+            blockers=blockers,
+            retry_feedback=retry_feedback,
+        ),
+    }]
 
 
 # ---------------------------------------------------------------------------
@@ -544,123 +741,140 @@ async def _call_llm_stream(
 # Extract DAG from assistant message
 # ---------------------------------------------------------------------------
 
-def _planner_tools() -> list[dict]:
+def _task_object_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "objective": {"type": "string"},
+            "background": {"type": "string"},
+            "constraints": {"type": "array", "items": {"type": "string"}},
+            "success_criteria": {"type": "array", "items": {"type": "string"}},
+            "assumptions": {"type": "array", "items": {"type": "string"}},
+            "open_questions": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def _project_summary_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "project_type": {"type": "string"},
+            "tech_stack": {"type": "array", "items": {"type": "string"}},
+            "startup": {"type": "array", "items": {"type": "string"}},
+            "build": {"type": "array", "items": {"type": "string"}},
+            "tests": {"type": "array", "items": {"type": "string"}},
+            "key_directories": {"type": "array", "items": {"type": "string"}},
+            "risk_points": {"type": "array", "items": {"type": "string"}},
+            "suggested_next_steps": {"type": "array", "items": {"type": "string"}},
+        },
+    }
+
+
+def _task_board_schema() -> dict:
+    return {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string"},
+                "title": {"type": "string"},
+                "description": {"type": "string"},
+                "node_id": {"type": "string"},
+                "status": {"type": "string", "enum": ["planned", "blocked", "ready"]},
+                "depends_on": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["id", "title"],
+        },
+    }
+
+
+def _action_schema() -> dict:
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["clarify", "assess", "update_dag", "set_ready", "report_blocker"],
+            },
+            "message": {"type": "string"},
+            "blockers": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string"},
+                        "message": {"type": "string"},
+                    },
+                    "required": ["code", "message"],
+                },
+            },
+            "assess_request": {
+                "type": "object",
+                "properties": {
+                    "scope": {"type": "string", "enum": ["project", "current_module", "selected_path"]},
+                    "paths": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
+    }
+
+
+def _planner_tools(stage: str) -> list[dict]:
     """Tool interfaces the Planner can call to update the MAS framework."""
+    patch_properties: dict[str, dict] = {}
+    if stage == "fill_task_context":
+        patch_properties = {
+            "task_object": _task_object_schema(),
+            "project_summary": _project_summary_schema(),
+            "shared_doc": {"type": "string"},
+        }
+    elif stage == "fill_dag":
+        patch_properties = {
+            "dag": {
+                "type": "object",
+                "properties": {
+                    "nodes": {"type": "array", "items": {"type": "object"}},
+                    "edges": {"type": "array", "items": {"type": "object"}},
+                    "metadata": {"type": "object"},
+                },
+            },
+            "action": _action_schema(),
+        }
+    elif stage == "fill_task_board":
+        patch_properties = {
+            "task_board": _task_board_schema(),
+        }
+    elif stage == "finalize_ready":
+        patch_properties = {
+            "action": _action_schema(),
+        }
+    elif stage == "plan_outline":
+        patch_properties = {
+            "task_object": _task_object_schema(),
+        }
     return [
         {
             "name": "planner_submit_turn",
-            "description": "提交本轮 Planner 结果：左侧面板、DAG、工作流动作和给用户看的回复。聊天不能直接运行，只能规划或设置 ready。",
+            "description": "分阶段提交本轮 Planner 结果。必须带 stage、stage_complete、patch；patch 只提交当前阶段相关字段。",
             "input_schema": {
                 "type": "object",
                 "properties": {
+                    "stage": {"type": "string", "enum": PLANNER_STAGE_SEQUENCE},
+                    "stage_complete": {"type": "boolean"},
                     "observable_trace": {"type": "array", "items": {"type": "string"}},
                     "reply": {"type": "string"},
-                    "task_object": {
+                    "patch": {
                         "type": "object",
-                        "properties": {
-                            "title": {"type": "string"},
-                            "objective": {"type": "string"},
-                            "background": {"type": "string"},
-                            "constraints": {"type": "array", "items": {"type": "string"}},
-                            "success_criteria": {"type": "array", "items": {"type": "string"}},
-                            "assumptions": {"type": "array", "items": {"type": "string"}},
-                            "open_questions": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": [
-                            "title",
-                            "objective",
-                            "background",
-                            "constraints",
-                            "success_criteria",
-                            "assumptions",
-                            "open_questions",
-                        ],
-                    },
-                    "project_summary": {
-                        "type": "object",
-                        "properties": {
-                            "project_type": {"type": "string"},
-                            "tech_stack": {"type": "array", "items": {"type": "string"}},
-                            "startup": {"type": "array", "items": {"type": "string"}},
-                            "build": {"type": "array", "items": {"type": "string"}},
-                            "tests": {"type": "array", "items": {"type": "string"}},
-                            "key_directories": {"type": "array", "items": {"type": "string"}},
-                            "risk_points": {"type": "array", "items": {"type": "string"}},
-                            "suggested_next_steps": {"type": "array", "items": {"type": "string"}},
-                        },
-                        "required": [
-                            "project_type",
-                            "tech_stack",
-                            "startup",
-                            "build",
-                            "tests",
-                            "key_directories",
-                            "risk_points",
-                            "suggested_next_steps",
-                        ],
-                    },
-                    "shared_doc": {"type": "string"},
-                    "task_board": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {"type": "string"},
-                                "title": {"type": "string"},
-                                "description": {"type": "string"},
-                                "node_id": {"type": "string"},
-                                "status": {"type": "string", "enum": ["planned", "blocked", "ready"]},
-                                "depends_on": {"type": "array", "items": {"type": "string"}},
-                            },
-                            "required": ["id", "title"],
-                        },
-                    },
-                    "dag": {
-                        "type": "object",
-                        "properties": {
-                            "nodes": {"type": "array", "items": {"type": "object"}},
-                            "edges": {"type": "array", "items": {"type": "object"}},
-                            "metadata": {"type": "object"},
-                        },
-                    },
-                    "action": {
-                        "type": "object",
-                        "properties": {
-                            "action": {
-                                "type": "string",
-                                "enum": ["clarify", "assess", "update_dag", "set_ready", "report_blocker"],
-                            },
-                            "message": {"type": "string"},
-                            "blockers": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "code": {"type": "string"},
-                                        "message": {"type": "string"},
-                                    },
-                                    "required": ["code", "message"],
-                                },
-                            },
-                            "assess_request": {
-                                "type": "object",
-                                "properties": {
-                                    "scope": {"type": "string", "enum": ["project", "current_module", "selected_path"]},
-                                    "paths": {"type": "array", "items": {"type": "string"}},
-                                },
-                            },
-                        },
-                        "required": ["action", "message"],
+                        "properties": patch_properties,
                     },
                 },
                 "required": [
+                    "stage",
+                    "stage_complete",
                     "reply",
-                    "task_object",
-                    "project_summary",
-                    "shared_doc",
-                    "task_board",
-                    "dag",
-                    "action",
+                    "patch",
                 ],
             },
         },
@@ -672,6 +886,619 @@ def _tool_input(tool_calls: list[dict], name: str) -> dict | None:
         if call.get("name") == name and isinstance(call.get("input"), dict):
             return call["input"]
     return None
+
+
+def _has_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _has_string_list(value: object, *, allow_empty: bool = False) -> bool:
+    if not isinstance(value, list):
+        return False
+    if not value:
+        return allow_empty
+    return all(isinstance(item, str) and bool(item.strip()) for item in value)
+
+
+def _coerce_string_list(value: object, fallback: list[str] | None = None) -> list[str]:
+    if isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+        return items if items else (fallback or [])
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return fallback or []
+
+
+def _first_value(data: dict, *keys: str) -> object:
+    for key in keys:
+        if key in data and data[key] not in (None, ""):
+            return data[key]
+    return None
+
+
+def _normalize_task_object(task_object: dict | None, fallback_goal: str, reply: str = "") -> dict:
+    source = dict(task_object or {})
+    for raw_key in list(source.keys()):
+        canonical_key = raw_key.strip().lower().replace(" ", "_").replace("[", "").replace("]", "")
+        if canonical_key.startswith("assumptions") and "assumptions" not in source:
+            source["assumptions"] = source.get(raw_key)
+        if canonical_key.startswith("open_questions") and "open_questions" not in source:
+            source["open_questions"] = source.get(raw_key)
+    return {
+        "title": str(_first_value(source, "title", "name") or fallback_goal or "未命名任务").strip(),
+        "objective": str(
+            _first_value(source, "objective", "goal", "description") or reply or fallback_goal or "待明确目标"
+        ).strip(),
+        "background": str(
+            _first_value(source, "background", "context") or reply or "由 Planner 生成的任务草案。"
+        ).strip(),
+        "constraints": _coerce_string_list(source.get("constraints"), ["按当前工作目录和画布 DAG 执行"]),
+        "success_criteria": _coerce_string_list(
+            _first_value(source, "success_criteria", "acceptance_criteria"),
+            ["DAG 节点和左侧面板均已正确生成"],
+        ),
+        "assumptions": _coerce_string_list(source.get("assumptions"), []),
+        "open_questions": _coerce_string_list(source.get("open_questions"), []),
+    }
+
+
+def _normalize_project_summary(project_summary: dict | None) -> dict:
+    source = dict(project_summary or {})
+    return {
+        "project_type": str(_first_value(source, "project_type", "type", "项目类型") or "待 Assess").strip(),
+        "tech_stack": _coerce_string_list(_first_value(source, "tech_stack", "stack", "技术栈"), ["待 Assess"]),
+        "startup": _coerce_string_list(_first_value(source, "startup", "start", "启动方式"), ["待 Assess"]),
+        "build": _coerce_string_list(_first_value(source, "build", "build_commands", "构建方式"), ["待 Assess"]),
+        "tests": _coerce_string_list(_first_value(source, "tests", "test", "测试方式"), ["待 Assess"]),
+        "key_directories": _coerce_string_list(
+            _first_value(source, "key_directories", "key_files", "directories", "关键目录"),
+            ["待 Assess"],
+        ),
+        "risk_points": _coerce_string_list(
+            _first_value(source, "risk_points", "risks", "风险点"),
+            ["需要在运行前确认工作目录和依赖"],
+        ),
+        "suggested_next_steps": _coerce_string_list(
+            _first_value(source, "suggested_next_steps", "next_steps", "建议切入点"),
+            ["确认规划后点击运行"],
+        ),
+    }
+
+
+def _normalize_action(action: dict | None, reply: str = "", default_action: str = "update_dag") -> dict:
+    source = dict(action or {})
+    normalized = {
+        "action": str(source.get("action") or default_action).strip() or default_action,
+        "message": str(source.get("message") or reply or "已更新当前规划。").strip(),
+        "blockers": source.get("blockers") if isinstance(source.get("blockers"), list) else [],
+    }
+    if isinstance(source.get("assess_request"), dict):
+        normalized["assess_request"] = source["assess_request"]
+    return normalized
+
+
+def _build_task_board_from_dag(dag: dict | None) -> list[dict]:
+    nodes = dag.get("nodes") if isinstance(dag, dict) and isinstance(dag.get("nodes"), list) else []
+    task_board = []
+    for node in nodes:
+        if not isinstance(node, dict) or str(node.get("id") or "") == "planner":
+            continue
+        node_id = str(node.get("id") or f"node_{len(task_board) + 1}")
+        label = str(node.get("label") or (node.get("data") or {}).get("label") or node_id)
+        task_board.append({
+            "id": f"TB-{len(task_board) + 1:03d}",
+            "title": label,
+            "description": str(node.get("prompt") or (node.get("data") or {}).get("prompt") or label)[:240],
+            "node_id": node_id,
+            "status": "planned",
+            "depends_on": _coerce_string_list(node.get("depends_on"), []),
+        })
+    return task_board
+
+
+def _normalize_task_board(task_board: list | None, dag: dict | None = None) -> list[dict]:
+    if not isinstance(task_board, list) or not task_board:
+        return _build_task_board_from_dag(dag)
+    fixed_board = []
+    for index, item in enumerate(task_board):
+        if not isinstance(item, dict):
+            continue
+        fixed_board.append({
+            "id": str(item.get("id") or f"TB-{index + 1:03d}"),
+            "title": str(item.get("title") or item.get("node_id") or f"任务 {index + 1}"),
+            "description": str(item.get("description") or ""),
+            "node_id": str(item.get("node_id") or ""),
+            "status": str(item.get("status") or "planned"),
+            "depends_on": _coerce_string_list(item.get("depends_on"), []),
+        })
+    return fixed_board
+
+
+def _default_shared_doc(task_object: dict | None, reply: str = "") -> str:
+    objective = (task_object or {}).get("objective") or "待补充"
+    return (
+        f"# 项目规划\n\n## 目标\n{objective}\n\n"
+        f"## 当前说明\n{reply or 'Planner 已提交结构化规划。'}"
+    )
+
+
+def _build_minimal_planner_dag(title: str, objective: str) -> dict:
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in (title or "task")).strip("_") or "task"
+    slug = "_".join(part for part in slug.split("_") if part)[:36] or "task"
+    explore_id = f"explore_{slug}"
+    coder_id = f"coder_{slug}"
+    review_id = f"review_{slug}"
+    return {
+        "nodes": [
+            {
+                "id": explore_id,
+                "type": "explore",
+                "label": "梳理需求与现状",
+                "prompt": (
+                    f"目标：围绕“{title}”梳理需求与当前上下文。\n"
+                    f"上下文：用户当前目标是“{objective}”。\n"
+                    "具体要求：总结关键范围、前置依赖、潜在风险和推荐切入点。\n"
+                    "产出格式：research_note。\n"
+                    "验收标准：给出明确的实施边界和后续编码输入。"
+                ),
+                "depends_on": [],
+            },
+            {
+                "id": coder_id,
+                "type": "coder",
+                "label": "实现核心改动",
+                "prompt": (
+                    f"目标：基于需求梳理结果，完成“{title}”的核心实现。\n"
+                    f"上下文：围绕用户目标“{objective}”落地最小闭环。\n"
+                    "具体要求：优先完成最核心的代码或配置改动，并记录关键变更点。\n"
+                    "产出格式：file_change。\n"
+                    "验收标准：产出可集成、可验证，不越权修改无关模块。"
+                ),
+                "depends_on": [explore_id],
+            },
+            {
+                "id": review_id,
+                "type": "review",
+                "label": "审查结果与风险",
+                "prompt": (
+                    f"目标：审查“{title}”本轮实现结果。\n"
+                    "具体要求：检查功能闭环、明显回归风险、缺失验证项和需要补充的后续工作。\n"
+                    "产出格式：review_report。\n"
+                    "验收标准：指出高风险问题或确认当前草案可继续推进。"
+                ),
+                "depends_on": [coder_id],
+            },
+        ],
+        "edges": [
+            {"source": explore_id, "target": coder_id},
+            {"source": coder_id, "target": review_id},
+        ],
+    }
+
+
+def _canonicalize_planner_submit(submit: dict | None, fallback_goal: str) -> dict | None:
+    """Normalize imperfect tool arguments into the canonical planner contract.
+
+    Some Anthropic-compatible providers occasionally emit slightly malformed
+    property names inside large tool payloads. We still require a tool call, but
+    normalize field aliases and fill safe defaults from other structured fields
+    instead of asking the user to retry.
+    """
+    if not isinstance(submit, dict):
+        return None
+
+    normalized = dict(submit)
+    action = normalized.get("action") if isinstance(normalized.get("action"), dict) else {}
+    dag = normalized.get("dag") if isinstance(normalized.get("dag"), dict) else {}
+    reply = str(normalized.get("reply") or action.get("message") or fallback_goal or "").strip()
+
+    task_object = normalized.get("task_object") if isinstance(normalized.get("task_object"), dict) else {}
+    task_object = dict(task_object)
+    for raw_key in list(task_object.keys()):
+        canonical_key = raw_key.strip().lower().replace(" ", "_").replace("[", "").replace("]", "")
+        if canonical_key.startswith("assumptions") and "assumptions" not in task_object:
+            task_object["assumptions"] = task_object.get(raw_key)
+        if canonical_key.startswith("open_questions") and "open_questions" not in task_object:
+            task_object["open_questions"] = task_object.get(raw_key)
+
+    task_object["title"] = str(
+        _first_value(task_object, "title", "name") or fallback_goal or "未命名任务"
+    ).strip()
+    task_object["objective"] = str(
+        _first_value(task_object, "objective", "goal", "description") or reply or fallback_goal or "待明确目标"
+    ).strip()
+    task_object["background"] = str(
+        _first_value(task_object, "background", "context") or reply or "由 Planner 工具提交的任务规划。"
+    ).strip()
+    task_object["constraints"] = _coerce_string_list(
+        task_object.get("constraints"),
+        ["按当前工作目录和画布 DAG 执行"],
+    )
+    task_object["success_criteria"] = _coerce_string_list(
+        _first_value(task_object, "success_criteria", "acceptance_criteria"),
+        ["DAG 节点和左侧面板均已正确生成"],
+    )
+    task_object["assumptions"] = _coerce_string_list(task_object.get("assumptions"), [])
+    task_object["open_questions"] = _coerce_string_list(task_object.get("open_questions"), [])
+    normalized["task_object"] = task_object
+
+    if not isinstance(dag, dict) or not isinstance(dag.get("nodes"), list) or not dag.get("nodes"):
+        dag = _build_minimal_planner_dag(task_object["title"], task_object["objective"])
+    normalized["dag"] = dag
+
+    if not isinstance(action, dict):
+        action = {}
+    action["action"] = str(action.get("action") or "update_dag").strip() or "update_dag"
+    action["message"] = str(
+        action.get("message") or reply or "已根据当前目标生成初步工作流草案。"
+    ).strip()
+    if not isinstance(action.get("blockers"), list):
+        action["blockers"] = []
+    normalized["action"] = action
+
+    project_summary = normalized.get("project_summary") if isinstance(normalized.get("project_summary"), dict) else {}
+    project_summary = dict(project_summary)
+    project_summary["project_type"] = str(
+        _first_value(project_summary, "project_type", "type", "项目类型") or "待 Assess"
+    ).strip()
+    project_summary["tech_stack"] = _coerce_string_list(
+        _first_value(project_summary, "tech_stack", "stack", "技术栈"),
+        ["待 Assess"],
+    )
+    project_summary["startup"] = _coerce_string_list(
+        _first_value(project_summary, "startup", "start", "启动方式"),
+        ["待 Assess"],
+    )
+    project_summary["build"] = _coerce_string_list(
+        _first_value(project_summary, "build", "build_commands", "构建方式"),
+        ["待 Assess"],
+    )
+    project_summary["tests"] = _coerce_string_list(
+        _first_value(project_summary, "tests", "test", "测试方式"),
+        ["待 Assess"],
+    )
+    project_summary["key_directories"] = _coerce_string_list(
+        _first_value(project_summary, "key_directories", "key_files", "directories", "关键目录"),
+        ["待 Assess"],
+    )
+    project_summary["risk_points"] = _coerce_string_list(
+        _first_value(project_summary, "risk_points", "risks", "风险点"),
+        ["需要在运行前确认工作目录和依赖"],
+    )
+    project_summary["suggested_next_steps"] = _coerce_string_list(
+        _first_value(project_summary, "suggested_next_steps", "next_steps", "建议切入点"),
+        ["确认规划后点击运行"],
+    )
+    normalized["project_summary"] = project_summary
+
+    if not _has_text(normalized.get("shared_doc")):
+        normalized["shared_doc"] = (
+            f"# 项目规划\n\n## 目标\n{task_object['objective']}\n\n"
+            f"## 当前说明\n{reply or action.get('message') or 'Planner 已提交结构化规划。'}"
+        )
+
+    task_board = normalized.get("task_board")
+    if not isinstance(task_board, list) or not task_board:
+        nodes = dag.get("nodes") if isinstance(dag, dict) else []
+        task_board = []
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict) or str(node.get("id") or "") == "planner":
+                    continue
+                node_id = str(node.get("id") or f"node_{len(task_board) + 1}")
+                label = str(node.get("label") or (node.get("data") or {}).get("label") or node_id)
+                task_board.append({
+                    "id": f"TB-{len(task_board) + 1:03d}",
+                    "title": label,
+                    "description": str(node.get("prompt") or (node.get("data") or {}).get("prompt") or label)[:240],
+                    "node_id": node_id,
+                    "status": "planned",
+                    "depends_on": _coerce_string_list(node.get("depends_on"), []),
+                })
+    else:
+        fixed_board = []
+        for index, item in enumerate(task_board):
+            if not isinstance(item, dict):
+                continue
+            fixed_board.append({
+                "id": str(item.get("id") or f"TB-{index + 1:03d}"),
+                "title": str(item.get("title") or item.get("node_id") or f"任务 {index + 1}"),
+                "description": str(item.get("description") or ""),
+                "node_id": str(item.get("node_id") or ""),
+                "status": str(item.get("status") or "planned"),
+                "depends_on": _coerce_string_list(item.get("depends_on"), []),
+            })
+        task_board = fixed_board
+    normalized["task_board"] = task_board
+
+    return normalized
+
+
+def _canonicalize_stage_submit(
+    submit: dict | None,
+    *,
+    expected_stage: str,
+    fallback_goal: str,
+    draft_state: dict,
+) -> dict | None:
+    if not isinstance(submit, dict):
+        return None
+
+    normalized = dict(submit)
+    stage = str(normalized.get("stage") or expected_stage).strip() or expected_stage
+    patch = normalized.get("patch") if isinstance(normalized.get("patch"), dict) else {}
+    patch = dict(patch)
+
+    # Backward-compatible: accept older full-payload fields and fold them into patch.
+    for key in ("task_object", "project_summary", "shared_doc", "dag", "task_board", "action"):
+        if key in normalized and key not in patch:
+            patch[key] = normalized.get(key)
+
+    reply = str(
+        normalized.get("reply")
+        or patch.get("reply")
+        or ((patch.get("action") or {}).get("message") if isinstance(patch.get("action"), dict) else "")
+        or ""
+    ).strip()
+    observable_trace = normalized.get("observable_trace")
+    if not isinstance(observable_trace, list):
+        observable_trace = []
+
+    if "task_object" in patch and isinstance(patch.get("task_object"), dict):
+        patch["task_object"] = _normalize_task_object(patch.get("task_object"), fallback_goal, reply)
+    if "project_summary" in patch and isinstance(patch.get("project_summary"), dict):
+        patch["project_summary"] = _normalize_project_summary(patch.get("project_summary"))
+    if "shared_doc" in patch and not _has_text(patch.get("shared_doc")):
+        patch["shared_doc"] = _default_shared_doc(
+            patch.get("task_object") if isinstance(patch.get("task_object"), dict) else draft_state.get("task_object"),
+            reply,
+        )
+    if "dag" in patch and isinstance(patch.get("dag"), dict):
+        patch["dag"] = _normalize_dag(patch["dag"])
+    if "task_board" in patch:
+        patch["task_board"] = _normalize_task_board(
+            patch.get("task_board"),
+            patch.get("dag") if isinstance(patch.get("dag"), dict) else draft_state.get("dag"),
+        )
+    if "action" in patch and isinstance(patch.get("action"), dict):
+        default_action = "update_dag" if expected_stage == "fill_dag" else "report_blocker"
+        patch["action"] = _normalize_action(patch.get("action"), reply, default_action)
+
+    return {
+        "stage": stage,
+        "stage_complete": bool(normalized.get("stage_complete")),
+        "reply": reply,
+        "observable_trace": [str(item).strip() for item in observable_trace if str(item).strip()],
+        "patch": patch,
+    }
+
+
+def _validate_stage_submit(submit: dict | None, stage: str) -> list[dict]:
+    blockers: list[dict] = []
+    if not isinstance(submit, dict):
+        return [{"code": "planner_tool_missing", "message": "Planner 没有调用 planner_submit_turn。"}]
+
+    if str(submit.get("stage") or "") != stage:
+        blockers.append({
+            "code": "planner_stage_mismatch",
+            "message": f"当前阶段应为 {stage}，但提交成了 {submit.get('stage') or '空'}。",
+        })
+    if not submit.get("stage_complete"):
+        blockers.append({
+            "code": "planner_stage_incomplete",
+            "message": "当前阶段没有标记 stage_complete=true。",
+        })
+
+    patch = submit.get("patch") if isinstance(submit.get("patch"), dict) else {}
+    if stage == "plan_outline":
+        if not _has_text(submit.get("reply")):
+            blockers.append({"code": "reply_missing", "message": "plan_outline 缺少给用户看的规划说明 reply。"})
+        if not isinstance(submit.get("observable_trace"), list) or not submit.get("observable_trace"):
+            blockers.append({"code": "observable_trace_missing", "message": "plan_outline 缺少 observable_trace。"})
+    elif stage == "fill_task_context":
+        task_object = patch.get("task_object")
+        project_summary = patch.get("project_summary")
+        shared_doc = patch.get("shared_doc")
+        if not isinstance(task_object, dict) or not _has_text(task_object.get("title")) or not _has_text(task_object.get("objective")):
+            blockers.append({"code": "task_object_incomplete", "message": "fill_task_context 缺少完整 task_object。"})
+        if not isinstance(project_summary, dict) or not _has_text(project_summary.get("project_type")):
+            blockers.append({"code": "project_summary_incomplete", "message": "fill_task_context 缺少 project_summary。"})
+        if not _has_text(shared_doc):
+            blockers.append({"code": "shared_doc_missing", "message": "fill_task_context 缺少 shared_doc。"})
+    elif stage == "fill_dag":
+        dag = patch.get("dag")
+        action = patch.get("action")
+        if not isinstance(dag, dict) or not isinstance(dag.get("nodes"), list) or not dag.get("nodes"):
+            blockers.append({"code": "dag_missing", "message": "fill_dag 缺少可用 dag.nodes。"})
+        if not isinstance(action, dict) or str(action.get("action") or "") not in {"update_dag", "assess", "report_blocker"}:
+            blockers.append({"code": "action_invalid", "message": "fill_dag 缺少有效 action。"})
+    elif stage == "fill_task_board":
+        board = patch.get("task_board")
+        if not isinstance(board, list) or not board:
+            blockers.append({"code": "task_board_missing", "message": "fill_task_board 缺少 task_board。"})
+    elif stage == "finalize_ready":
+        action = patch.get("action")
+        if not isinstance(action, dict) or str(action.get("action") or "") not in {"update_dag", "set_ready", "report_blocker", "assess"}:
+            blockers.append({"code": "final_action_invalid", "message": "finalize_ready 缺少最终 action。"})
+    return blockers
+
+
+def _merge_stage_patch(draft_state: dict, stage_submit: dict) -> dict:
+    patch = stage_submit.get("patch") if isinstance(stage_submit.get("patch"), dict) else {}
+    merged = dict(draft_state)
+    for key in ("task_object", "project_summary", "shared_doc", "dag", "task_board", "action"):
+        if key in patch and patch.get(key) is not None:
+            merged[key] = patch.get(key)
+    merged["current_stage"] = stage_submit.get("stage")
+    merged["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if isinstance(merged.get("action"), dict):
+        merged["blockers"] = merged["action"].get("blockers") or []
+    return merged
+
+
+def _missing_stage_fields(stage: str, draft_state: dict) -> list[str]:
+    missing = []
+    for field in PLANNER_STAGE_FIELDS.get(stage, []):
+        value = draft_state.get(field)
+        if field == "reply":
+            continue
+        if field == "observable_trace":
+            continue
+        if field == "shared_doc":
+            if not _has_text(value):
+                missing.append(field)
+        elif field == "dag":
+            if not isinstance(value, dict) or not isinstance(value.get("nodes"), list) or not value.get("nodes"):
+                missing.append(field)
+        elif field == "task_board":
+            if not isinstance(value, list) or not value:
+                missing.append(field)
+        elif field == "action":
+            if not isinstance(value, dict) or not _has_text(value.get("action")):
+                missing.append(field)
+        elif not value:
+            missing.append(field)
+    return missing
+
+
+def _draft_state_ui_payload(draft_state: dict) -> dict:
+    return {
+        "current_stage": draft_state.get("current_stage"),
+        "lifecycle_phase": draft_state.get("lifecycle_phase"),
+        "task_object": draft_state.get("task_object"),
+        "project_summary": draft_state.get("project_summary"),
+        "shared_doc": draft_state.get("shared_doc"),
+        "task_board": draft_state.get("task_board"),
+        "dag": draft_state.get("dag"),
+        "blockers": draft_state.get("blockers") or [],
+        "action": draft_state.get("action"),
+        "system_generated_dag": bool(draft_state.get("system_generated_dag")),
+        "updated_at": draft_state.get("updated_at"),
+    }
+
+
+def _validate_planner_submit_contract(
+    submit: dict | None,
+    action_name: str,
+    dag: dict | None,
+) -> list[dict]:
+    """Validate that the Planner used the tool interface with usable panel data."""
+    blockers: list[dict] = []
+
+    if not isinstance(submit, dict):
+        return [{
+            "code": "planner_tool_missing",
+            "message": "Planner 没有调用 planner_submit_turn 工具；系统不会从普通文本里猜测面板和 DAG。",
+        }]
+
+    action_requires_dag = action_name in {"update_dag", "set_ready"}
+    if action_requires_dag and not (isinstance(dag, dict) and isinstance(dag.get("nodes"), list) and dag.get("nodes")):
+        blockers.append({
+            "code": "planner_dag_missing",
+            "message": "planner_submit_turn 缺少可用 dag.nodes，无法更新画布。",
+        })
+
+    task_object = submit.get("task_object")
+    if not isinstance(task_object, dict):
+        blockers.append({
+            "code": "task_object_missing",
+            "message": "planner_submit_turn 缺少 task_object，左侧任务对象无法填充。",
+        })
+    else:
+        required_text = ["title", "objective", "background"]
+        missing_text = [key for key in required_text if not _has_text(task_object.get(key))]
+        required_lists = ["constraints", "success_criteria"]
+        missing_lists = [
+            key for key in required_lists
+            if not _has_string_list(task_object.get(key), allow_empty=False)
+        ]
+        for optional_key in ("assumptions", "open_questions"):
+            if optional_key in task_object and not _has_string_list(task_object.get(optional_key), allow_empty=True):
+                missing_lists.append(optional_key)
+        if missing_text or missing_lists:
+            blockers.append({
+                "code": "task_object_incomplete",
+                "message": f"task_object 字段不完整：缺少 {', '.join(missing_text + missing_lists)}。",
+            })
+
+    project_summary = submit.get("project_summary")
+    project_summary_keys = [
+        "project_type",
+        "tech_stack",
+        "startup",
+        "build",
+        "tests",
+        "key_directories",
+        "risk_points",
+        "suggested_next_steps",
+    ]
+    if not isinstance(project_summary, dict):
+        blockers.append({
+            "code": "project_summary_missing",
+            "message": "planner_submit_turn 缺少 project_summary，左侧项目摘要无法填充。",
+        })
+    else:
+        missing_summary = []
+        for key in project_summary_keys:
+            value = project_summary.get(key)
+            if key == "project_type":
+                if not _has_text(value):
+                    missing_summary.append(key)
+            elif not _has_string_list(value, allow_empty=True):
+                missing_summary.append(key)
+        if missing_summary:
+            blockers.append({
+                "code": "project_summary_incomplete",
+                "message": f"project_summary 字段不完整：缺少 {', '.join(missing_summary)}。",
+            })
+
+    if not _has_text(submit.get("shared_doc")):
+        blockers.append({
+            "code": "shared_doc_missing",
+            "message": "planner_submit_turn 缺少 shared_doc，项目文档无法填充。",
+        })
+
+    task_board = submit.get("task_board")
+    if not isinstance(task_board, list) or not task_board:
+        blockers.append({
+            "code": "task_board_missing",
+            "message": "planner_submit_turn 缺少 task_board，任务面板无法填充。",
+        })
+    else:
+        invalid = [
+            str(index)
+            for index, item in enumerate(task_board)
+            if not isinstance(item, dict) or not _has_text(item.get("id")) or not _has_text(item.get("title"))
+        ]
+        if invalid:
+            blockers.append({
+                "code": "task_board_incomplete",
+                "message": f"task_board 存在无效任务项：{', '.join(invalid)}。",
+            })
+
+    if blockers:
+        logger.warning(
+            "Planner submit contract invalid: action=%s blockers=%s submit_keys=%s",
+            action_name,
+            [item["code"] for item in blockers],
+            sorted(submit.keys()),
+        )
+    return blockers
+
+
+def _build_planner_retry_message(blockers: list[dict]) -> str:
+    lines = [
+        "你上一轮调用 `planner_submit_turn` 的参数不完整，系统没有接受更新。",
+        "请立刻重新调用 `planner_submit_turn`，不要输出普通正文，只补齐完整工具参数。",
+        "本轮只修正当前阶段需要的字段，并确保 `stage`、`stage_complete`、`patch` 正确。",
+        "本轮缺失/无效项如下：",
+    ]
+    for blocker in blockers:
+        code = str(blocker.get("code") or "unknown")
+        message = str(blocker.get("message") or "").strip()
+        lines.append(f"- {code}: {message}")
+    lines.append("要求：沿用你刚才的规划意图，输出更小、更稳定、字段完整的结构化结果。")
+    return "\n".join(lines)
 
 
 def _extract_dag_from_text(text: str) -> dict | None:
@@ -921,6 +1748,7 @@ async def _update_shared_doc_from_planner(
 
 async def _persist_planner_ui_state(
     ui_state: dict,
+    draft_state: dict | None,
     workflow: Workflow,
     workflow_id: uuid.UUID,
     db: "AsyncSessionType",
@@ -930,6 +1758,9 @@ async def _persist_planner_ui_state(
 
     task_object = ui_state.get("task_object")
     if isinstance(task_object, dict):
+        task_object = dict(task_object)
+        task_object.setdefault("assumptions", [])
+        task_object.setdefault("open_questions", [])
         normalized["task_object"] = task_object
 
     task_board = ui_state.get("task_board")
@@ -941,6 +1772,8 @@ async def _persist_planner_ui_state(
     dag_json = workflow.dag_json if isinstance(workflow.dag_json, dict) else {"nodes": [], "edges": []}
     metadata = dag_json.get("metadata") if isinstance(dag_json.get("metadata"), dict) else {}
     metadata["planner_ui_state"] = normalized
+    if isinstance(draft_state, dict):
+        metadata["planner_draft_state"] = _draft_state_ui_payload(draft_state)
     dag_json["metadata"] = metadata
     workflow.dag_json = dag_json
     flag_modified(workflow, "dag_json")
@@ -1058,85 +1891,276 @@ async def planner_chat(
 
     # 5. Stream the response as SSE
     async def generate():
-        full_response = ""
-        tool_calls: list[dict] = []
-        yield f"data: {json.dumps({'type': 'planner_status', 'message': 'Planner 请求已发送，等待模型流式事件。'}, ensure_ascii=False)}\n\n"
+        def _sse(payload: dict) -> str:
+            return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-        async for event in _call_llm_stream(
-            messages,
-            PLANNER_CHAT_SYSTEM,
-            body.thinking_level,
-            tools=_planner_tools(),
-        ):
-            event_type = event.get("type")
-            chunk = str(event.get("content") or "")
-            if event_type == "status":
-                data = json.dumps({"type": "planner_status", "message": chunk}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
+        workflow_goal = workflow.goal or body.message
+        existing_ui_state = metadata.get("planner_ui_state") if isinstance(metadata.get("planner_ui_state"), dict) else {}
+        existing_draft_state = metadata.get("planner_draft_state") if isinstance(metadata.get("planner_draft_state"), dict) else {}
+        draft_state = {
+            "current_stage": "plan_outline",
+            "lifecycle_phase": workflow.lifecycle_phase,
+            "task_object": existing_ui_state.get("task_object") or existing_draft_state.get("task_object"),
+            "project_summary": workflow.project_summary_json or existing_draft_state.get("project_summary"),
+            "shared_doc": shared_doc.content.strip() if shared_doc and shared_doc.content else existing_draft_state.get("shared_doc"),
+            "task_board": existing_ui_state.get("task_board") or existing_draft_state.get("task_board"),
+            "dag": existing_dag if isinstance(existing_dag, dict) and existing_dag.get("nodes") else existing_draft_state.get("dag"),
+            "blockers": workflow.blockers_json or existing_draft_state.get("blockers") or [],
+            "action": existing_draft_state.get("action"),
+            "system_generated_dag": bool(existing_draft_state.get("system_generated_dag")),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        assistant_visible_response = ""
+        stage_history: list[dict] = []
+        final_action = _normalize_action(draft_state.get("action"), "", "update_dag")
+
+        yield _sse({"type": "planner_status", "message": "Planner 请求已发送，开始分阶段规划。"})
+
+        for stage in PLANNER_STAGE_SEQUENCE:
+            stage_label = PLANNER_STAGE_LABELS[stage]
+            stage_retry_feedback = ""
+            stage_success = False
+            draft_state["current_stage"] = stage
+            draft_state["updated_at"] = datetime.now(timezone.utc).isoformat()
+
+            yield _sse({"type": "planner_stage_status", "stage": stage, "message": stage_label})
+            yield _sse({
+                "type": "planner_observable_progress",
+                "stage": stage,
+                "status": "started",
+                "attempt": 1,
+                "received_fields": [field for field in PLANNER_STAGE_FIELDS.get(stage, []) if field not in _missing_stage_fields(stage, draft_state)],
+                "missing_fields": _missing_stage_fields(stage, draft_state),
+                "next_action": PLANNER_STAGE_TIMELINE_MESSAGES[stage],
+                "draft_state": _draft_state_ui_payload(draft_state),
+            })
+
+            for attempt_index in range(2):
+                stage_messages = _build_stage_messages(
+                    stage=stage,
+                    latest_user_message=body.message,
+                    workflow_goal=workflow_goal,
+                    lifecycle_phase=workflow.lifecycle_phase,
+                    draft_state=draft_state,
+                    blockers=draft_state.get("blockers") or [],
+                    recent_messages=messages,
+                    retry_feedback=stage_retry_feedback,
+                )
+                tool_calls: list[dict] = []
+                raw_response = ""
+                if attempt_index > 0:
+                    yield _sse({
+                        "type": "planner_stage_status",
+                        "stage": stage,
+                        "message": f"{stage_label}（重试第 {attempt_index + 1} 次）",
+                    })
+
+                async for event in _call_llm_stream(
+                    stage_messages,
+                    PLANNER_CHAT_SYSTEM,
+                    body.thinking_level,
+                    tools=_planner_tools(stage),
+                ):
+                    event_type = event.get("type")
+                    chunk = str(event.get("content") or "")
+                    if event_type == "status":
+                        yield _sse({"type": "planner_status", "message": chunk})
+                        continue
+                    if event_type == "thinking":
+                        yield _sse({"type": "thinking_delta", "content": chunk})
+                        continue
+                    if event_type == "tool_call":
+                        tool_calls.append(event)
+                        yield _sse({
+                            "type": "planner_tool_call",
+                            "name": event.get("name"),
+                            "id": event.get("id", ""),
+                            "input_keys": sorted((event.get("input") or {}).keys()) if isinstance(event.get("input"), dict) else [],
+                        })
+                        continue
+                    raw_response += chunk
+                    if stage == "plan_outline":
+                        yield _sse({"type": "text", "content": chunk})
+
+                submit = _canonicalize_stage_submit(
+                    _tool_input(tool_calls, "planner_submit_turn"),
+                    expected_stage=stage,
+                    fallback_goal=workflow_goal,
+                    draft_state=draft_state,
+                )
+                blockers = _validate_stage_submit(submit, stage)
+                if not blockers and submit is not None:
+                    draft_state = _merge_stage_patch(draft_state, submit)
+                    if stage == "plan_outline":
+                        trace = submit.get("observable_trace") if isinstance(submit.get("observable_trace"), list) else []
+                        reply = str(submit.get("reply") or "").strip()
+                        synthetic_response = ""
+                        if trace:
+                            synthetic_response += "```observe\n" + "\n".join(f"- {line}" for line in trace if line) + "\n```\n"
+                        if reply:
+                            synthetic_response += f"```reply\n{reply}\n```"
+                        assistant_visible_response = synthetic_response or raw_response
+                        if synthetic_response and synthetic_response.strip() != raw_response.strip():
+                            yield _sse({"type": "text", "content": synthetic_response})
+                    if stage == "fill_dag" and isinstance(draft_state.get("dag"), dict):
+                        yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
+                    yield _sse({
+                        "type": "planner_stage_result",
+                        "stage": stage,
+                        "status": "completed",
+                        "attempt": attempt_index + 1,
+                        "applied_fields": sorted((submit.get("patch") or {}).keys()),
+                        "summary": stage_label,
+                        "draft_state": _draft_state_ui_payload(draft_state),
+                    })
+                    yield _sse({
+                        "type": "planner_observable_progress",
+                        "stage": stage,
+                        "status": "completed",
+                        "attempt": attempt_index + 1,
+                        "received_fields": sorted((submit.get("patch") or {}).keys()),
+                        "missing_fields": _missing_stage_fields(stage, draft_state),
+                        "next_action": PLANNER_STAGE_TIMELINE_MESSAGES.get(
+                            PLANNER_STAGE_SEQUENCE[PLANNER_STAGE_SEQUENCE.index(stage) + 1],
+                            "准备结束本轮规划。",
+                        ) if stage != "finalize_ready" else "本轮规划已完成。",
+                        "draft_state": _draft_state_ui_payload(draft_state),
+                    })
+                    stage_history.append({
+                        "stage": stage,
+                        "status": "completed",
+                        "attempt": attempt_index + 1,
+                        "summary": stage_label,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    })
+                    stage_success = True
+                    break
+
+                stage_retry_feedback = _build_planner_retry_message(blockers)
+                stage_history.append({
+                    "stage": stage,
+                    "status": "retrying" if attempt_index == 0 else "failed",
+                    "attempt": attempt_index + 1,
+                    "summary": "；".join(item.get("message", "") for item in blockers),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                yield _sse({
+                    "type": "planner_observable_progress",
+                    "stage": stage,
+                    "status": "retrying" if attempt_index == 0 else "failed",
+                    "attempt": attempt_index + 1,
+                    "received_fields": sorted(((submit or {}).get("patch") or {}).keys()) if isinstance(submit, dict) else [],
+                    "missing_fields": [item.get("code") for item in blockers],
+                    "next_action": "只重试当前阶段，不回退整轮。",
+                    "draft_state": _draft_state_ui_payload(draft_state),
+                })
+
+            if stage_success:
                 continue
-            if event_type == "thinking":
-                data = json.dumps({"type": "thinking_delta", "content": chunk}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
+
+            if stage == "fill_task_context":
+                draft_state["task_object"] = _normalize_task_object(
+                    draft_state.get("task_object"),
+                    workflow_goal,
+                    assistant_visible_response,
+                )
+                draft_state["project_summary"] = _normalize_project_summary(draft_state.get("project_summary"))
+                draft_state["shared_doc"] = draft_state.get("shared_doc") or _default_shared_doc(
+                    draft_state.get("task_object"),
+                    assistant_visible_response,
+                )
+                yield _sse({
+                    "type": "planner_stage_result",
+                    "stage": stage,
+                    "status": "fallback",
+                    "attempt": 2,
+                    "applied_fields": ["task_object", "project_summary", "shared_doc"],
+                    "summary": "当前阶段由系统补默认摘要继续推进。",
+                    "draft_state": _draft_state_ui_payload(draft_state),
+                })
                 continue
-            if event_type == "tool_call":
-                tool_calls.append(event)
-                data = json.dumps({
-                    "type": "planner_tool_call",
-                    "name": event.get("name"),
-                    "id": event.get("id", ""),
-                    "input_keys": sorted((event.get("input") or {}).keys()) if isinstance(event.get("input"), dict) else [],
-                }, ensure_ascii=False)
-                yield f"data: {data}\n\n"
+
+            if stage == "fill_dag":
+                draft_state["dag"] = _build_minimal_planner_dag(
+                    str((draft_state.get("task_object") or {}).get("title") or workflow_goal),
+                    str((draft_state.get("task_object") or {}).get("objective") or workflow_goal),
+                )
+                draft_state["system_generated_dag"] = True
+                draft_state["action"] = _normalize_action({
+                    "action": "update_dag",
+                    "message": "Planner 的 DAG 阶段连续失败，系统已补一个最小草案 DAG 以继续推进。",
+                })
+                yield _sse({
+                    "type": "planner_stage_result",
+                    "stage": stage,
+                    "status": "fallback",
+                    "attempt": 2,
+                    "applied_fields": ["dag", "action"],
+                    "summary": "DAG 阶段失败，系统已补最小草案 DAG。",
+                    "draft_state": _draft_state_ui_payload(draft_state),
+                })
+                yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
                 continue
 
-            full_response += chunk
+            if stage == "fill_task_board":
+                draft_state["task_board"] = _build_task_board_from_dag(draft_state.get("dag"))
+                yield _sse({
+                    "type": "planner_stage_result",
+                    "stage": stage,
+                    "status": "fallback",
+                    "attempt": 2,
+                    "applied_fields": ["task_board"],
+                    "summary": "任务面板阶段失败，系统已从 DAG 自动派生任务卡。",
+                    "draft_state": _draft_state_ui_payload(draft_state),
+                })
+                continue
 
-            # Emit as SSE text event
-            data = json.dumps({"type": "text", "content": chunk}, ensure_ascii=False)
-            yield f"data: {data}\n\n"
+            if stage == "finalize_ready":
+                requested_run = any(token in body.message for token in ("运行", "执行", "开始", "run", "start"))
+                if requested_run and isinstance(draft_state.get("dag"), dict) and (draft_state["dag"].get("nodes") or []):
+                    draft_state["action"] = _normalize_action({
+                        "action": "set_ready",
+                        "message": "方案已就绪，请点击顶部运行按钮开始执行。",
+                    })
+                else:
+                    draft_state["action"] = _normalize_action({
+                        "action": "update_dag",
+                        "message": "当前方案已进入 planning，可继续调整或直接准备运行。",
+                    })
+                continue
 
-        submit = _tool_input(tool_calls, "planner_submit_turn")
-        if submit:
-            trace = submit.get("observable_trace") if isinstance(submit.get("observable_trace"), list) else []
-            reply = str(submit.get("reply") or "").strip()
-            synthetic_response = ""
-            if trace:
-                synthetic_response += "```observe\n" + "\n".join(f"- {line}" for line in trace if line) + "\n```\n"
-            if reply:
-                synthetic_response += f"```reply\n{reply}\n```"
-            if synthetic_response:
-                full_response = synthetic_response
-                data = json.dumps({"type": "text", "content": synthetic_response}, ensure_ascii=False)
-                yield f"data: {data}\n\n"
-
-        dag_tool_input = submit.get("dag") if isinstance(submit, dict) and isinstance(submit.get("dag"), dict) else None
-        ui_tool_input = (
-            {
-                "task_object": submit.get("task_object"),
-                "project_summary": submit.get("project_summary"),
-                "shared_doc": submit.get("shared_doc"),
-                "task_board": submit.get("task_board"),
-            }
-            if isinstance(submit, dict)
-            else None
-        )
-        action_tool_input = submit.get("action") if isinstance(submit, dict) and isinstance(submit.get("action"), dict) else None
-
-        dag = _normalize_dag(dag_tool_input) if dag_tool_input else _extract_dag_from_text(full_response)
-        action = action_tool_input or _extract_action_from_text(full_response) or {}
-        ui_state = ui_tool_input or _extract_ui_state_from_text(full_response)
-        action_name = str(action.get("action") or ("update_dag" if dag else "clarify"))
-        plan_parse_failed = "```plan" in full_response and dag is None
-        if plan_parse_failed:
-            action_name = "report_blocker"
-            action = {
+            draft_state["action"] = _normalize_action({
                 "action": "report_blocker",
-                "message": "Planner 输出了结构化计划，但 JSON 没有完整闭合，系统无法安全更新画布。请让 Planner 重新生成更简洁的 DAG。",
+                "message": f"{stage_label}失败，且系统无法安全补全。",
                 "blockers": [{
-                    "code": "planner_dag_parse_failed",
-                    "message": "Planner 结构化 DAG 解析失败：plan 代码块不完整或 JSON 无效。",
+                    "code": f"{stage}_failed",
+                    "message": f"{stage_label}失败，且系统无法安全补全。",
                 }],
-            }
+            }, default_action="report_blocker")
+            break
+
+        ui_state = {
+            "task_object": draft_state.get("task_object"),
+            "project_summary": draft_state.get("project_summary"),
+            "shared_doc": draft_state.get("shared_doc"),
+            "task_board": draft_state.get("task_board"),
+        }
+        dag = draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else None
+        final_action = _normalize_action(
+            draft_state.get("action"),
+            assistant_visible_response,
+            "update_dag",
+        )
+        action_name = str(final_action.get("action") or "update_dag")
+        draft_state["action"] = final_action
+        draft_state["blockers"] = final_action.get("blockers") or []
+        draft_state["lifecycle_phase"] = (
+            "ready" if action_name == "set_ready"
+            else "blocked" if action_name == "report_blocker"
+            else "assessing" if action_name == "assess"
+            else "planning"
+        )
+
         if dag and action_name in {"update_dag", "set_ready"}:
             old_metadata = (
                 workflow.dag_json.get("metadata", {})
@@ -1144,20 +2168,24 @@ async def planner_chat(
                 else {}
             )
             new_metadata = dag.get("metadata", {}) if isinstance(dag.get("metadata"), dict) else {}
-            dag["metadata"] = {**old_metadata, **new_metadata}
-            action["dag"] = dag
-        if ui_state:
-            action["ui_state"] = ui_state
+            dag["metadata"] = {
+                **old_metadata,
+                **new_metadata,
+                "planner_draft_state": _draft_state_ui_payload(draft_state),
+            }
+            final_action["dag"] = dag
+        final_action["ui_state"] = ui_state
+        full_response = assistant_visible_response or "```reply\n规划已按阶段完成结构化填充。\n```"
         logger.info(
-            "Planner chat completed: workflow=%s node=%s action=%s dag_nodes=%d dag_edges=%d blockers=%d ui_state=%s plan_parse_failed=%s",
+            "Planner chat completed: workflow=%s node=%s action=%s dag_nodes=%d dag_edges=%d blockers=%d ui_state=%s stage_history=%d",
             body.workflow_id,
             body.node_id,
             action_name,
             len((dag or {}).get("nodes", []) or []),
             len((dag or {}).get("edges", []) or []),
-            len(action.get("blockers") or []) if isinstance(action, dict) else 0,
+            len(final_action.get("blockers") or []),
             bool(ui_state),
-            plan_parse_failed,
+            len(stage_history),
         )
 
         # Save the assistant message to DB
@@ -1188,9 +2216,9 @@ async def planner_chat(
                 flag_modified(workflow, "blockers_json")
             elif action_name == "report_blocker":
                 workflow.lifecycle_phase = "blocked"
-                workflow.blockers_json = action.get("blockers") or [{
+                workflow.blockers_json = final_action.get("blockers") or [{
                     "code": "planner_blocked",
-                    "message": action.get("message") or "Planner 报告当前方案存在阻塞项。",
+                    "message": final_action.get("message") or "Planner 报告当前方案存在阻塞项。",
                 }]
                 flag_modified(workflow, "blockers_json")
             elif workflow.lifecycle_phase == "draft":
@@ -1198,9 +2226,14 @@ async def planner_chat(
             persisted_ui_state = None
             if ui_state:
                 persisted_ui_state = await _persist_planner_ui_state(
-                    ui_state, workflow, uuid.UUID(body.workflow_id), db
+                    ui_state, draft_state, workflow, uuid.UUID(body.workflow_id), db
                 )
-                action["ui_state"] = persisted_ui_state
+                final_action["ui_state"] = persisted_ui_state
+            elif isinstance(workflow.dag_json, dict):
+                metadata_local = workflow.dag_json.get("metadata") if isinstance(workflow.dag_json.get("metadata"), dict) else {}
+                metadata_local["planner_draft_state"] = _draft_state_ui_payload(draft_state)
+                workflow.dag_json["metadata"] = metadata_local
+                flag_modified(workflow, "dag_json")
             await db.execute(
                 update(Workflow)
                 .where(Workflow.id == uuid.UUID(body.workflow_id))
@@ -1223,14 +2256,26 @@ async def planner_chat(
         if ui_state:
             data = json.dumps({
                 "type": "planner_ui_update",
-                "ui_state": action.get("ui_state") or ui_state,
+                "ui_state": final_action.get("ui_state") or ui_state,
+                "draft": False,
             }, ensure_ascii=False)
             yield f"data: {data}\n\n"
 
-        if action:
+        yield _sse({
+            "type": "planner_observable_progress",
+            "stage": "finalize_ready",
+            "status": "completed",
+            "attempt": 1,
+            "received_fields": ["action"],
+            "missing_fields": [],
+            "next_action": "本轮规划已完成。",
+            "draft_state": _draft_state_ui_payload(draft_state),
+        })
+
+        if final_action:
             data = json.dumps({
                 "type": "planner_action",
-                "action": action,
+                "action": final_action,
             }, ensure_ascii=False)
             yield f"data: {data}\n\n"
 
@@ -1240,6 +2285,7 @@ async def planner_chat(
             data = json.dumps({
                 "type": "dag_update",
                 "dag": dag,
+                "draft": False,
             }, ensure_ascii=False)
             yield f"data: {data}\n\n"
 
