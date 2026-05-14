@@ -7,7 +7,7 @@ Orchestration flow for each node:
   1. Create sandbox container
   2. Provision workspace directories + Git init
   3. Git checkpoint (auto-commit before agent runs)
-  4. Build and launch mas_agent command
+  4. Build and launch the opencode source runner
   5. Poll process status, streaming events from stream.jsonl
   6. On completion: emit node_completed/node_failed, destroy sandbox
   7. Plan nodes: parse output and execute dynamic child tasks
@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import shlex
-import sys
 import time
 import shutil
 import uuid
@@ -47,22 +46,35 @@ _KNOWN_EVENT_TYPES = frozenset({
     "task_blocked", "task_unblocked",
 })
 
-# Resolve the mas_agent package directory: apps/agent/ relative to project root
+# Resolve repository-local runner/source paths.
 # __file__ = .../apps/orchestrator/app/core/local_engine.py
 # parents[0] = .../apps/orchestrator/app/core
 # parents[1] = .../apps/orchestrator/app
 # parents[2] = .../apps/orchestrator
 # parents[3] = .../apps
-# Project root = parents[4] = .../mat
-_AGENT_PKG_DIR = str(Path(__file__).resolve().parents[4] / "apps" / "agent")
+# Project root = parents[4] = .../mas
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_OPENCODE_RUNNER = _REPO_ROOT / "apps" / "opencode-runner" / "run-node.ts"
+_OPENCODE_PACKAGE_DIR = Path(
+    os.environ.get(
+        "MAS_OPENCODE_PACKAGE_DIR",
+        str(_REPO_ROOT / "apps" / "opencode-runner" / "vendor" / "opencode" / "packages" / "opencode"),
+    )
+)
+_OPENCODE_SOURCE_ENTRY = Path(
+    os.environ.get(
+        "MAS_OPENCODE_SOURCE_ENTRY",
+        str(_OPENCODE_PACKAGE_DIR / "src" / "index.ts"),
+    )
+)
 
 
 def _build_subprocess_env() -> dict[str, str]:
-    """Build environment for subprocess with mas_agent on PYTHONPATH."""
+    """Build environment for node subprocesses."""
     env = dict(os.environ)
-    existing = env.get("PYTHONPATH", "")
-    extra = _AGENT_PKG_DIR
-    env["PYTHONPATH"] = f"{extra}{os.pathsep}{existing}" if existing else extra
+    env["OPENCODE_PACKAGE_DIR"] = str(_OPENCODE_PACKAGE_DIR)
+    env["OPENCODE_SOURCE_ENTRY"] = str(_OPENCODE_SOURCE_ENTRY)
+    env.setdefault("OPENCODE_DISABLE_MODELS_FETCH", "1")
     return env
 
 
@@ -750,7 +762,8 @@ class LocalDAGExecutor:
             sandbox_id,
             (
                 'git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" '
-                f"diff {shlex.quote(parent_hash)} {shlex.quote(commit_hash)}"
+                f"diff {shlex.quote(parent_hash)} {shlex.quote(commit_hash)} "
+                "-- . ':(exclude).agent/**' ':(exclude).workflow/**' ':(exclude).mas/**'"
             ),
         )
         return patch_stdout
@@ -2394,7 +2407,7 @@ class LocalDAGExecutor:
             except Exception:
                 pass
 
-            # 4. Build agent command
+            # 4. Build opencode source runner command
             # React Flow nodes store type in top-level "type" and "data.agentType";
             # compiled node dicts may use "agent_type".  Try all.
             data = node.get("data", {})
@@ -2518,9 +2531,10 @@ class LocalDAGExecutor:
             prompt_file = "/workspace/.agent/prompt.txt"
             await self._sandbox.write_file(sandbox_id, prompt_file, prompt)
 
+            runner_path = str(_OPENCODE_RUNNER)
             cmd = (
                 f"mkdir -p /workspace/.agent /workspace/.workflow && "
-                f"cd /workspace && {shlex.quote(sys.executable)} -m mas_agent "
+                f"cd /workspace && bun {shlex.quote(runner_path)} "
                 f"--provider {shlex.quote(model_provider)} "
                 f"--model {shlex.quote(model_id)} "
                 f"--agent-type {shlex.quote(agent_type)} "
@@ -2531,17 +2545,18 @@ class LocalDAGExecutor:
                 f"--stream-dir /workspace/.agent "
                 f"--max-tokens {max_output_tokens} "
                 f"--context-window {context_window} "
-                f"--thinking-level high "
             )
             if provider_url:
                 cmd += f"--provider-url {shlex.quote(provider_url)} "
+
+            runner_env = dict(subprocess_env)
             if provider_key:
-                cmd += f"--provider-key {shlex.quote(provider_key)} "
+                runner_env["MAS_OPENCODE_PROVIDER_KEY"] = provider_key
 
             await self._emit("shell_stdout", run_id, node_id, content=f"$ {cmd}")
 
             # 5. Run agent asynchronously
-            exec_id = await self._sandbox.exec_async(sandbox_id, cmd, env=subprocess_env)
+            exec_id = await self._sandbox.exec_async(sandbox_id, cmd, env=runner_env)
             await self._write_mas_node_state(
                 run_id, node_id, "running", node=node,
                 extra={
@@ -2553,7 +2568,7 @@ class LocalDAGExecutor:
                 },
             )
             logger.info(
-                "Started mas_agent exec %s in sandbox %s",
+                "Started opencode source runner exec %s in sandbox %s",
                 exec_id[:12], sandbox_id[:12],
             )
 
@@ -2562,6 +2577,8 @@ class LocalDAGExecutor:
             poll_count = 0
             last_stream_activity = time.monotonic()
             last_heartbeat = 0.0
+            idle_timeout_seconds = int(os.environ.get("MAS_NODE_IDLE_TIMEOUT_SECONDS", "240") or "240")
+            forced_failure_reason = ""
             while not cancel_event.is_set():
                 # Read new stream content
                 new_log_pos = await self._stream_log_lines(
@@ -2571,9 +2588,29 @@ class LocalDAGExecutor:
                     last_stream_activity = time.monotonic()
                 log_pos = new_log_pos
 
+                terminal_events = self._runs.get(run_id, {}).get("_node_terminal_events", {})
+                terminal_event = terminal_events.get(node_id) if isinstance(terminal_events, dict) else None
+
                 # Check if the process is still running
                 proc_info = await self._sandbox.get_process(exec_id)
                 poll_count += 1
+                if terminal_event:
+                    if proc_info.running:
+                        shim = self._sandbox._find_process(exec_id)
+                        if shim is not None:
+                            try:
+                                shim.terminate()
+                                await asyncio.wait_for(shim.wait(), timeout=2.0)
+                            except Exception:
+                                try:
+                                    shim.kill()
+                                except Exception:
+                                    pass
+                    logger.info(
+                        "Process %s finished by stream terminal event %s after %d polls",
+                        exec_id[:12], terminal_event, poll_count,
+                    )
+                    break
                 if not proc_info.running:
                     logger.info(
                         "Process %s finished after %d polls (exit_code=%s)",
@@ -2592,6 +2629,25 @@ class LocalDAGExecutor:
                     )
                     last_heartbeat = now
 
+                if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
+                    forced_failure_reason = f"node idle timeout after {idle_seconds}s without stream output"
+                    shim = self._sandbox._find_process(exec_id)
+                    if shim is not None:
+                        try:
+                            shim.terminate()
+                            await asyncio.wait_for(shim.wait(), timeout=2.0)
+                        except Exception:
+                            try:
+                                shim.kill()
+                            except Exception:
+                                pass
+                    await self._emit(
+                        "node_failed", run_id, node_id,
+                        content=forced_failure_reason,
+                    )
+                    logger.warning("Node %s idle timed out: %s", node_id, forced_failure_reason)
+                    break
+
                 await asyncio.sleep(1.0)
 
             # Final read to capture remaining output
@@ -2602,7 +2658,7 @@ class LocalDAGExecutor:
             proc_info = await self._sandbox.get_process(exec_id)
             exit_code = proc_info.exit_code if proc_info.exit_code is not None else -1
             logger.info("Node %s exit_code=%d, log_pos=%d", node_id, exit_code, log_pos)
-            state = "completed" if exit_code == 0 else "failed"
+            state = "failed" if forced_failure_reason else ("completed" if exit_code == 0 else "failed")
 
             await self._emit(
                 "node_completed" if state == "completed" else "node_failed",
@@ -2628,6 +2684,8 @@ class LocalDAGExecutor:
                 "exec_id": exec_id,
                 "sandbox_id": sandbox_id,
             }
+            if forced_failure_reason:
+                result["error"] = forced_failure_reason
 
             # Capture stderr on failure for debugging
             if state == "failed":
@@ -2737,6 +2795,12 @@ class LocalDAGExecutor:
             try:
                 ev = json.loads(line)
                 event_type = ev.get("type", "")
+                if event_type in {"node_completed", "node_failed"}:
+                    run_state = self._runs.get(run_id)
+                    if isinstance(run_state, dict):
+                        terminal_events = run_state.setdefault("_node_terminal_events", {})
+                        if isinstance(terminal_events, dict):
+                            terminal_events[node_id] = event_type
                 if event_type in _KNOWN_EVENT_TYPES:
                     extra: dict[str, Any] = {
                         "content": ev.get("content", ""),

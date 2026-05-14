@@ -1,8 +1,8 @@
 class SandboxProvisioner:
     """Provisions sandbox containers: setup workspace directories, initialize Git.
 
-    Creates the directory layout expected by the Python agent framework (mas_agent)
-    and the orchestrator's workflow inter-node context sharing.
+    Creates the directory layout expected by the opencode source runner and
+    the orchestrator's workflow inter-node context sharing.
     """
 
     def __init__(self, sandbox_manager: "app.core.local_sandbox.LocalSandbox"):
@@ -13,7 +13,7 @@ class SandboxProvisioner:
         1. Create workspace directories (.agent, .workflow)
         2. Initialize separated Git repo (metadata in /sandbox-meta, work tree in /workspace)
         """
-        # Create workspace directories for the Python agent
+        # Create workspace directories for the node runner.
         await self.sandbox.exec(container_id, "mkdir -p /workspace/.agent")
         await self.sandbox.exec(container_id, "mkdir -p /workspace/.workflow")
         await self.sandbox.exec(container_id, "mkdir -p /sandbox-meta/.git")

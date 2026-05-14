@@ -23,7 +23,10 @@ class GitCheckpointManager:
 
     async def auto_commit(self, sandbox_id: str, message: str) -> str:
         """Auto-commit before node execution. Agent is unaware of this."""
-        await self.sandbox.exec(sandbox_id, self._git_cmd("add -A"))
+        await self.sandbox.exec(
+            sandbox_id,
+            self._git_cmd("add -A -- . ':(exclude).agent/**' ':(exclude).workflow/**' ':(exclude).mas/**'")
+        )
         await self.sandbox.exec(
             sandbox_id, self._git_cmd(f'commit -m "{message}" --allow-empty')
         )
