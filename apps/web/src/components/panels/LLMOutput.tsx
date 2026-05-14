@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import MarkdownMessage from "@/components/common/MarkdownMessage";
-import type { LLMTokenEvent, LLMChunkEvent, ToolCallEvent, ToolResultEvent } from "@/types/events";
+import type { AgentHeartbeatEvent, LLMTokenEvent, LLMChunkEvent, PermissionRequestEvent, ToolCallEvent, ToolResultEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -37,14 +37,16 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
 
   const allEvents = useRunStore((s) => s.events);
 
-  // Include llm_token, llm_chunk, tool_call, and tool_result events
+  // Include LLM, tool, permission, and heartbeat events so the panel keeps
+  // showing observable progress even when the provider is temporarily silent.
   // so the thinking panel shows the agent's full reasoning + tool activity
   const events = useMemo(
     () =>
       allEvents.filter(
-        (e): e is LLMTokenEvent | LLMChunkEvent | ToolCallEvent | ToolResultEvent =>
+        (e): e is LLMTokenEvent | LLMChunkEvent | ToolCallEvent | ToolResultEvent | AgentHeartbeatEvent | PermissionRequestEvent =>
           (e.type === "llm_token" || e.type === "llm_chunk" ||
-           e.type === "tool_call" || e.type === "tool_result") &&
+           e.type === "tool_call" || e.type === "tool_result" ||
+           e.type === "agent_heartbeat" || e.type === "permission_request") &&
           (nodeId === "" || e.node_id === nodeId)
       ),
     [allEvents, nodeId]
@@ -113,6 +115,22 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
         const label = tr.tool_name || "tool";
         const payload = normalizeToolPayload(tr.content || "");
         blocks.push(`### 工具结果 \`${label}\`\n\n\`\`\`text\n${escapeFence(payload)}\n\`\`\``);
+      } else if (ev.type === "agent_heartbeat") {
+        flushAssistant();
+        if (inThinking) {
+          flushThinking();
+          inThinking = false;
+        }
+        const heartbeat = ev as AgentHeartbeatEvent;
+        blocks.push(`> 系统进度：${heartbeat.content}`);
+      } else if (ev.type === "permission_request") {
+        flushAssistant();
+        if (inThinking) {
+          flushThinking();
+          inThinking = false;
+        }
+        const request = ev as PermissionRequestEvent;
+        blocks.push(`> 权限请求：\`${request.tool_name}\` -> \`${request.target}\``);
       }
     }
 

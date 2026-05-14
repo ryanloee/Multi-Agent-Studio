@@ -29,6 +29,8 @@ export type StreamEventType =
   | "task_unblocked"
   | "artifact_created"
   | "progress_summary"
+  | "agent_heartbeat"
+  | "permission_request"
   | "ping";
 
 // ---------------------------------------------------------------------------
@@ -113,6 +115,24 @@ export interface ErrorEvent extends StreamEvent {
   /** Error message */
   content: string;
   metadata?: Record<string, unknown>;
+}
+
+/** Backend heartbeat emitted while a node is still alive but silent */
+export interface AgentHeartbeatEvent extends StreamEvent {
+  type: "agent_heartbeat";
+  content: string;
+  idle_seconds?: number;
+  poll_count?: number;
+}
+
+/** Tool permission request. Usually avoided in autonomous runs. */
+export interface PermissionRequestEvent extends StreamEvent {
+  type: "permission_request";
+  request_id: string;
+  permission: string;
+  target: string;
+  tool_name: string;
+  arguments?: Record<string, unknown>;
 }
 
 /** Run has started */
@@ -219,4 +239,6 @@ export interface StreamEventMap {
   task_unblocked: StreamEvent;
   artifact_created: ArtifactCreatedEvent;
   progress_summary: ProgressSummaryEvent;
+  agent_heartbeat: AgentHeartbeatEvent;
+  permission_request: PermissionRequestEvent;
 }

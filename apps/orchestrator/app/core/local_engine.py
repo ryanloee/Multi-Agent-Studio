@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import shlex
+import sys
 import time
 import shutil
 import uuid
@@ -32,7 +33,7 @@ from app.core.task_scheduler import TaskScheduler, ESCALATION_MARKER, PROGRESS_M
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
 from app.workflows.compiler import compile_dag
-from app.workflows.plan_parser import parse_plan_output, parse_plan_to_dag, PLAN_SYSTEM_SUFFIX
+from app.workflows.plan_parser import parse_plan_output, parse_plan_to_dag
 
 logger = logging.getLogger(__name__)
 
@@ -410,11 +411,25 @@ class LocalDAGExecutor:
         """Store a stream event so UI panels can be restored after reconnect."""
         try:
             from app.core.database import async_session_factory
-            from app.models.db import RunEvent
+            from app.models.db import Run, RunEvent
 
             run_id = uuid.UUID(str(event.get("run_id", "")))
             node_id = str(event.get("node_id") or "")
             async with async_session_factory() as session:
+                run = await session.get(Run, run_id)
+                if run is None:
+                    run_state = self._runs.get(str(run_id), {})
+                    workflow_id_raw = (
+                        (run_state.get("global_config") or {}).get("_workflow_id")
+                        or event.get("workflow_id")
+                    )
+                    if workflow_id_raw:
+                        session.add(Run(
+                            id=run_id,
+                            workflow_id=uuid.UUID(str(workflow_id_raw)),
+                            status=str(run_state.get("status") or "running"),
+                            engine_workflow_id=str(run_id),
+                        ))
                 session.add(RunEvent(
                     run_id=run_id,
                     event_type=str(event.get("type") or ""),
@@ -454,6 +469,12 @@ class LocalDAGExecutor:
         if run_dir is None:
             return None
         return run_dir / "integration"
+
+    def _mas_sandbox_root(self, workspace_directory: str | None, run_id: str) -> Path | None:
+        run_dir = self._mas_run_dir(workspace_directory, run_id)
+        if run_dir is None:
+            return None
+        return run_dir / "sandboxes"
 
     async def _write_mas_json(self, workspace_directory: str | None, run_id: str, relative: str, data: dict) -> None:
         run_dir = self._mas_run_dir(workspace_directory, run_id)
@@ -497,12 +518,16 @@ class LocalDAGExecutor:
     @staticmethod
     def _node_agent_type(node: dict[str, Any]) -> str:
         data = node.get("data", {})
-        return (
+        agent_type = (
             node.get("agent_type")
             or node.get("type")
             or (data.get("agentType") if isinstance(data, dict) else None)
             or "coder"
         )
+        node_id = str(node.get("id") or node.get("node_id") or "")
+        if agent_type == "plan" and node_id != "planner":
+            return "design"
+        return str(agent_type)
 
     @staticmethod
     def _upstream_ids_for_node(node_id: str, edges: list[dict[str, Any]]) -> list[str]:
@@ -638,12 +663,20 @@ class LocalDAGExecutor:
         def _copy() -> None:
             skip_dirs = {".git", ".agent", ".workflow", ".mas", "sandbox-meta"}
             if target_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
+                if target_dir.is_symlink() or target_dir.is_file():
+                    target_dir.unlink(missing_ok=True)
+                else:
+                    shutil.rmtree(target_dir, ignore_errors=True)
             target_dir.mkdir(parents=True, exist_ok=True)
             for item in sandbox_workspace.iterdir():
                 if item.name in skip_dirs:
                     continue
                 dest = target_dir / item.name
+                try:
+                    if dest.exists() and item.samefile(dest):
+                        continue
+                except OSError:
+                    pass
                 if item.is_dir():
                     shutil.copytree(item, dest, dirs_exist_ok=True)
                 else:
@@ -701,7 +734,7 @@ class LocalDAGExecutor:
             return "合并报告"
         if agent_type == "shell":
             return "执行报告"
-        if agent_type == "plan":
+        if agent_type in {"plan", "design"}:
             return "规划结果"
         return "变更摘要"
 
@@ -1282,10 +1315,19 @@ class LocalDAGExecutor:
                         run_id, node_id, _atype, result.get("state"),
                         bool(result.get("raw_output")),
                     )
+                    allow_dynamic_plan = (
+                        node_id == "planner"
+                        or bool(global_config.get("_allow_dynamic_plan"))
+                        or (
+                            isinstance(_node_data, dict)
+                            and bool(_node_data.get("allowDynamicPlan") or _node_data.get("allow_dynamic_plan"))
+                        )
+                    )
                     if (
                         _atype == "plan"
                         and result.get("state") == "completed"
                         and not global_config.get("_disable_dynamic_plan")
+                        and allow_dynamic_plan
                     ):
                         plan_results = await self._execute_dynamic_plan(
                             run_id, node_id, result, global_config, cancel_event,
@@ -1363,6 +1405,54 @@ class LocalDAGExecutor:
                 "Task-aware layers run=%s layer %d: executing %d nodes (%d already completed)",
                 run_id, layer_idx, len(runnable_nodes), len(nodes) - len(runnable_nodes),
             )
+            if not runnable_nodes:
+                continue
+
+            runnable_after_dependency_check: list[dict] = []
+            for node in runnable_nodes:
+                node_id = str(node.get("id", node.get("node_id", "")))
+                upstream_ids = self._upstream_ids_for_node(node_id, edges)
+                bad_upstreams = [
+                    upstream_id for upstream_id in upstream_ids
+                    if isinstance(layer_results.get(upstream_id), dict)
+                    and layer_results[upstream_id].get("state") != "completed"
+                ]
+                if not bad_upstreams:
+                    runnable_after_dependency_check.append(node)
+                    continue
+                message = (
+                    "Blocked because upstream node(s) did not complete: "
+                    + ", ".join(bad_upstreams)
+                )
+                result = {
+                    "state": "blocked",
+                    "node_id": node_id,
+                    "error": message,
+                    "result_summary": message,
+                }
+                layer_results[node_id] = result
+                task_id = task_db_map.get(node_id)
+                if task_id:
+                    await self._update_task_status_db(
+                        task_id,
+                        "blocked",
+                        progress=0,
+                        result_summary=message,
+                    )
+                    await self._emit(
+                        "task_updated", run_id, "",
+                        task_id=task_id,
+                        status="blocked",
+                        progress=0,
+                        result_summary=message,
+                    )
+                await self._emit("node_failed", run_id, node_id, content=message)
+                await self._emit(
+                    "child_completed", run_id, parent_node_id,
+                    child_node_id=node_id,
+                    content="state=blocked",
+                )
+            runnable_nodes = runnable_after_dependency_check
             if not runnable_nodes:
                 continue
 
@@ -1666,6 +1756,8 @@ class LocalDAGExecutor:
             return "test_result"
         if agent_type == "plan":
             return "final_output"
+        if agent_type == "design":
+            return "decision"
         return "file_change"
 
     async def _create_artifact_for_task(
@@ -1806,6 +1898,8 @@ class LocalDAGExecutor:
                         or node.get("type")
                         or "coder"
                     )
+                    if agent_type == "plan" and node_id != "planner":
+                        agent_type = "design"
                     label = data.get("label") or node.get("label") or node_id
                     prompt = node.get("prompt") or data.get("prompt") or ""
                     model_provider = (
@@ -1932,7 +2026,7 @@ class LocalDAGExecutor:
                 )
 
             has_failed = any(
-                isinstance(result, dict) and result.get("state") == "failed"
+                isinstance(result, dict) and result.get("state") in {"failed", "blocked"}
                 for result in child_results.values()
             )
             status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
@@ -2022,6 +2116,8 @@ class LocalDAGExecutor:
                         or node.get("type")
                         or "coder"
                     )
+                    if agent_type == "plan" and node_id != "planner":
+                        agent_type = "design"
                     label = str(data.get("label") or node.get("label") or node_id)
                     prompt = node.get("prompt") or data.get("prompt") or ""
                     model_provider = (
@@ -2149,7 +2245,7 @@ class LocalDAGExecutor:
                 )
 
             has_failed = any(
-                isinstance(result, dict) and result.get("state") == "failed"
+                isinstance(result, dict) and result.get("state") in {"failed", "blocked"}
                 for result in child_results.values()
             )
             status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
@@ -2266,8 +2362,11 @@ class LocalDAGExecutor:
         _owns_sandbox = False
         if sandbox_id is None:
             workspace_id = f"ws-{node_id}-{uuid4().hex[:8]}"
+            sandbox_storage_root = self._mas_sandbox_root(workspace_directory, run_id)
             sandbox_id = await self._sandbox.create(
-                workspace_id, template_dir=workspace_directory,
+                workspace_id,
+                template_dir=workspace_directory,
+                storage_root=sandbox_storage_root,
             )
             _owns_sandbox = True
             logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
@@ -2305,6 +2404,8 @@ class LocalDAGExecutor:
                 or (data.get("agentType") if isinstance(data, dict) else None)
                 or "coder"
             )
+            if agent_type == "plan" and node_id != "planner":
+                agent_type = "design"
             model_provider: str = (
                 node.get("model_provider")
                 or (data.get("modelProvider") if isinstance(data, dict) else "")
@@ -2326,9 +2427,6 @@ class LocalDAGExecutor:
                 or (data.get("prompt") if isinstance(data, dict) else "")
                 or ""
             )
-
-            if agent_type == "plan":
-                prompt = prompt + PLAN_SYSTEM_SUFFIX
 
             # --- Human-in-the-Loop: pause execution and wait for approval ---
             if agent_type == "human":
@@ -2422,7 +2520,7 @@ class LocalDAGExecutor:
 
             cmd = (
                 f"mkdir -p /workspace/.agent /workspace/.workflow && "
-                f"cd /workspace && python3 -m mas_agent "
+                f"cd /workspace && {shlex.quote(sys.executable)} -m mas_agent "
                 f"--provider {shlex.quote(model_provider)} "
                 f"--model {shlex.quote(model_id)} "
                 f"--agent-type {shlex.quote(agent_type)} "
@@ -2462,11 +2560,16 @@ class LocalDAGExecutor:
             # 6. Poll until process completes
             log_pos = 0
             poll_count = 0
+            last_stream_activity = time.monotonic()
+            last_heartbeat = 0.0
             while not cancel_event.is_set():
                 # Read new stream content
-                log_pos = await self._stream_log_lines(
+                new_log_pos = await self._stream_log_lines(
                     sandbox_id, stream_file, log_pos, run_id, node_id,
                 )
+                if new_log_pos != log_pos:
+                    last_stream_activity = time.monotonic()
+                log_pos = new_log_pos
 
                 # Check if the process is still running
                 proc_info = await self._sandbox.get_process(exec_id)
@@ -2477,6 +2580,17 @@ class LocalDAGExecutor:
                         exec_id[:12], poll_count, proc_info.exit_code,
                     )
                     break
+
+                now = time.monotonic()
+                idle_seconds = int(now - last_stream_activity)
+                if idle_seconds >= 20 and now - last_heartbeat >= 20:
+                    await self._emit(
+                        "agent_heartbeat", run_id, node_id,
+                        content=f"节点仍在运行，等待模型或工具输出 {idle_seconds}s",
+                        idle_seconds=idle_seconds,
+                        poll_count=poll_count,
+                    )
+                    last_heartbeat = now
 
                 await asyncio.sleep(1.0)
 
@@ -2624,12 +2738,14 @@ class LocalDAGExecutor:
                 ev = json.loads(line)
                 event_type = ev.get("type", "")
                 if event_type in _KNOWN_EVENT_TYPES:
-                    await self._emit(
-                        event_type, run_id, node_id,
-                        content=ev.get("content", ""),
-                        tool_name=ev.get("tool_name", ""),
-                        timestamp=ev.get("timestamp", 0),
-                    )
+                    extra: dict[str, Any] = {
+                        "content": ev.get("content", ""),
+                        "tool_name": ev.get("tool_name", ""),
+                        "timestamp": ev.get("timestamp", 0),
+                    }
+                    if isinstance(ev.get("metadata"), dict):
+                        extra["metadata"] = ev["metadata"]
+                    await self._emit(event_type, run_id, node_id, **extra)
                     content = ev.get("content", "")
                     if isinstance(content, str):
                         if "ESCALATE_TO_PLANNER:" in content:
@@ -2649,9 +2765,12 @@ class LocalDAGExecutor:
                         content=ev.get("content", ""),
                     )
                 elif event_type:
-                    content = ev.get("content", "")
-                    if content:
-                        await self._emit(event_type, run_id, node_id, content=content)
+                    extra = {
+                        key: value
+                        for key, value in ev.items()
+                        if key not in {"type", "run_id", "node_id"}
+                    }
+                    await self._emit(event_type, run_id, node_id, **extra)
             except json.JSONDecodeError:
                 # Non-JSON line (stdout pollution) -- treat as plain text
                 # Check for escalation markers in the streamed content

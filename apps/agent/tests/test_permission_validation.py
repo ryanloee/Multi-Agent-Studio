@@ -56,10 +56,10 @@ def _register_real_tools():
     ToolRegistry.register(_StubTool("grep"))
 
     # Restricted tools — matching the real registration
-    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["plan", "coder", "merge", "review", "shell"]))
+    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["coder", "merge", "review", "shell"]))
     ToolRegistry.register(_StubTool("write", allowed_agent_types=["plan", "coder", "merge", "shell"]))
-    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["plan", "coder", "merge", "shell"]))
-    ToolRegistry.register(_StubTool("apply_patch", allowed_agent_types=["plan", "coder", "merge"]))
+    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["coder", "merge", "shell"]))
+    ToolRegistry.register(_StubTool("apply_patch", allowed_agent_types=["coder", "merge"]))
 
 
 # ===========================================================================
@@ -210,15 +210,15 @@ class TestValidateExecution:
         warnings = ToolRegistry.validate_execution("plan", "write", {"path": "/workspace/app.ts"})
         assert len(warnings) > 0
 
-    def test_planner_can_edit(self):
-        """Planner can use edit tool."""
+    def test_planner_cannot_edit(self):
+        """Local plan worker cannot use edit tool."""
         _register_real_tools()
         warnings = ToolRegistry.validate_execution("plan", "edit", {
             "path": "/workspace/test.py",
             "old_text": "a",
             "new_text": "b",
         })
-        assert not any("Permission denied" in w for w in warnings)
+        assert any("Permission denied" in w for w in warnings)
 
     # ------------------------------------------------------------------
     # Shell
@@ -361,11 +361,11 @@ class TestValidateExecution:
         warnings = ToolRegistry.validate_execution("shell", "edit", {})
         assert not any("Permission denied" in w for w in warnings)
 
-    def test_apply_patch_plan_allowed(self):
-        """Plan agent can use apply_patch."""
+    def test_apply_patch_plan_denied(self):
+        """Local plan worker cannot use apply_patch."""
         _register_real_tools()
         warnings = ToolRegistry.validate_execution("plan", "apply_patch", {})
-        assert not any("Permission denied" in w for w in warnings)
+        assert any("Permission denied" in w for w in warnings)
 
     def test_apply_patch_coder_allowed(self):
         """Coder agent can use apply_patch."""

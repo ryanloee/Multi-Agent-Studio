@@ -174,6 +174,8 @@ def _validate_run_request(
             or "coder"
         )
         node_id = str(node.get("id") or "")
+        if agent_type == "plan" and node_id != "planner":
+            agent_type = "design"
         node_model = _extract_node_model(node)
         has_fallback = _workflow_has_model_fallback(workflow, agent_type)
         logger.info(
@@ -190,7 +192,7 @@ def _validate_run_request(
                 "message": f"Merge 节点 {node_id} 没有上游依赖，无法执行。",
             })
         if (
-            agent_type in {"plan", "coder", "explore", "merge", "review"}
+            agent_type in {"design", "plan", "coder", "explore", "merge", "review"}
             and not node_model
             and not has_fallback
         ):
@@ -207,6 +209,28 @@ def _validate_run_request(
     else:
         logger.info("Run preflight passed: workflow=%s", getattr(workflow, "id", ""))
     return blockers
+
+
+def _strip_internal_planner_node(dag_json: dict | None) -> dict:
+    """Remove the top-level planner sentinel from executable auto DAGs."""
+    if not isinstance(dag_json, dict):
+        return {"nodes": [], "edges": []}
+
+    nodes = [
+        node for node in dag_json.get("nodes", [])
+        if isinstance(node, dict) and node.get("id") != "planner"
+    ]
+    node_ids = {str(node.get("id")) for node in nodes if node.get("id")}
+    edges = [
+        edge for edge in dag_json.get("edges", [])
+        if (
+            isinstance(edge, dict)
+            and str(edge.get("source") or "") in node_ids
+            and str(edge.get("target") or "") in node_ids
+        )
+    ]
+    metadata = dag_json.get("metadata", {}) if isinstance(dag_json.get("metadata"), dict) else {}
+    return {"nodes": nodes, "edges": edges, "metadata": metadata}
 
 
 @router.post("/{workflow_id}/run", response_model=RunResponse, status_code=201)
@@ -319,7 +343,7 @@ async def trigger_run(
             raise HTTPException(status_code=400, detail=blockers[0]["message"])
         if saved_nodes:
             try:
-                compile_dag(saved_dag)
+                compile_dag(_strip_internal_planner_node(saved_dag))
             except ValueError as exc:
                 workflow.lifecycle_phase = "blocked"
                 workflow.blockers_json = [{
@@ -332,7 +356,7 @@ async def trigger_run(
         if saved_nodes:
             # Planner chat already produced a concrete DAG. Execute that
             # saved team directly and mirror every node to the task board.
-            dag_json = saved_dag
+            dag_json = _strip_internal_planner_node(saved_dag)
             start_as_task_dag = True
             global_config["_mode"] = "auto"
             global_config["_goal"] = goal
@@ -376,6 +400,8 @@ async def trigger_run(
                     or node_data.get("agentType")
                     or "coder"
                 )
+                if agent_type == "plan" and node_def.get("id", "") != "planner":
+                    agent_type = "design"
                 model_provider = (
                     node_data.get("model_provider")
                     or node_data.get("modelProvider")

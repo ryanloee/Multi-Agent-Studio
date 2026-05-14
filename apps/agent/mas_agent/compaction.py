@@ -56,16 +56,18 @@ def _extract_tool_names(messages: list[dict]) -> list[str]:
         content = msg.get("content", "")
         if isinstance(content, str):
             try:
-                parsed = json.loads(content)
+                blocks = json.loads(content)
             except (json.JSONDecodeError, TypeError):
                 continue
-            if isinstance(parsed, list):
-                for block in parsed:
-                    if isinstance(block, dict) and block.get("type") == "tool_use":
-                        name = block.get("name", "")
-                        if name and name not in seen:
-                            names.append(name)
-                            seen.add(name)
+        else:
+            blocks = content
+        if isinstance(blocks, list):
+            for block in blocks:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    name = block.get("name", "")
+                    if name and name not in seen:
+                        names.append(name)
+                        seen.add(name)
     return names
 
 
@@ -76,31 +78,43 @@ def _truncate_tool_results(messages: list[dict], max_chars: int = 2000) -> list[
         content = msg.get("content", "")
         if isinstance(content, str):
             try:
-                parsed = json.loads(content)
+                blocks = json.loads(content)
             except (json.JSONDecodeError, TypeError):
                 result.append(msg)
                 continue
-            if isinstance(parsed, list):
-                modified = False
-                for block in parsed:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "tool_result"
-                        and isinstance(block.get("content"), str)
-                        and len(block["content"]) > max_chars
-                    ):
-                        block["content"] = truncate_output(
-                            block["content"], max_chars=max_chars
-                        )
-                        modified = True
-                if modified:
-                    result.append({"role": msg["role"], "content": json.dumps(parsed, ensure_ascii=False)})
-                else:
-                    result.append(msg)
-            else:
+            if not isinstance(blocks, list):
                 result.append(msg)
+                continue
+            stringify = True
         else:
+            blocks = content
+            stringify = False
+            if not isinstance(blocks, list):
+                result.append(msg)
+                continue
+
+        modified = False
+        next_blocks: list[Any] = []
+        for block in blocks:
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("content"), str)
+                and len(block["content"]) > max_chars
+            ):
+                block = {
+                    **block,
+                    "content": truncate_output(block["content"], max_chars=max_chars),
+                }
+                modified = True
+            next_blocks.append(block)
+
+        if not modified:
             result.append(msg)
+        elif stringify:
+            result.append({"role": msg["role"], "content": json.dumps(next_blocks, ensure_ascii=False)})
+        else:
+            result.append({"role": msg["role"], "content": next_blocks})
     return result
 
 

@@ -32,8 +32,9 @@ class PermissionRule:
 
 # Default rule set (built-in, can be overridden)
 DEFAULT_RULES: list[PermissionRule] = [
-    PermissionRule(permission="shell", pattern="rm *", action=PermissionAction.ASK),
-    PermissionRule(permission="write", pattern="*.env", action=PermissionAction.ASK),
+    # Autonomous workflow nodes do not have a reliable interactive approval
+    # loop. High-risk operations must fail fast instead of blocking the agent.
+    PermissionRule(permission="shell", pattern="rm *", action=PermissionAction.DENY),
     PermissionRule(permission="write", pattern="*.lock", action=PermissionAction.DENY),
 ]
 

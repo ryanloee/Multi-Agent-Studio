@@ -50,6 +50,22 @@ export const NODE_META: Record<
       description: "",
     },
   },
+  design: {
+    icon: "Map",
+    color: "green",
+    label: "Designer",
+    description: "Produces local architecture/design guidance for downstream workers",
+    defaultData: {
+      label: "Designer",
+      agentType: "design",
+      modelProvider: "mimo",
+      modelId: "mimo-v2.5",
+      prompt: "",
+      permissions: {},
+      command: "",
+      description: "",
+    },
+  },
   explore: {
     icon: "Search",
     color: "yellow",
@@ -146,6 +162,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   // coder → *
   { source: "coder", target: "coder" },
   { source: "coder", target: "plan" },
+  { source: "coder", target: "design" },
   { source: "coder", target: "explore" },
   { source: "coder", target: "shell" },
   { source: "coder", target: "review" },
@@ -155,15 +172,26 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   // plan → *
   { source: "plan", target: "coder" },
   { source: "plan", target: "plan" },
+  { source: "plan", target: "design" },
   { source: "plan", target: "explore" },
   { source: "plan", target: "shell" },
   { source: "plan", target: "review" },
   { source: "plan", target: "merge" },
   { source: "plan", target: "human" },
 
+  // design → *
+  { source: "design", target: "coder" },
+  { source: "design", target: "design" },
+  { source: "design", target: "explore" },
+  { source: "design", target: "shell" },
+  { source: "design", target: "review" },
+  { source: "design", target: "merge" },
+  { source: "design", target: "human" },
+
   // explore → *
   { source: "explore", target: "coder" },
   { source: "explore", target: "plan" },
+  { source: "explore", target: "design" },
   { source: "explore", target: "explore" },
   { source: "explore", target: "shell" },
   { source: "explore", target: "review" },
@@ -173,6 +201,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   // shell → * (no shell→review)
   { source: "shell", target: "coder" },
   { source: "shell", target: "plan" },
+  { source: "shell", target: "design" },
   { source: "shell", target: "explore" },
   { source: "shell", target: "shell" },
   { source: "shell", target: "merge" },
@@ -181,6 +210,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   // review → * (no review→shell)
   { source: "review", target: "coder" },
   { source: "review", target: "plan" },
+  { source: "review", target: "design" },
   { source: "review", target: "explore" },
   { source: "review", target: "review" },
   { source: "review", target: "merge" },
@@ -189,6 +219,7 @@ export const VALID_CONNECTIONS: ConnectionRule[] = [
   // merge → downstream validation / review / planner feedback
   { source: "merge", target: "coder" },
   { source: "merge", target: "plan" },
+  { source: "merge", target: "design" },
   { source: "merge", target: "explore" },
   { source: "merge", target: "shell" },
   { source: "merge", target: "review" },

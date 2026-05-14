@@ -6,6 +6,7 @@ import type { Node, Edge } from "@xyflow/react";
 export type AgentNodeType =
   | "coder"
   | "plan"
+  | "design"
   | "explore"
   | "merge"
   | "shell"

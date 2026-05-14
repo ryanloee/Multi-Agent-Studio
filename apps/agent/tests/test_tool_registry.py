@@ -50,9 +50,9 @@ def _register_stubs():
     ToolRegistry.register(_StubTool("grep"))
 
     # Restricted tools
-    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["plan", "coder", "merge", "review"]))
+    ToolRegistry.register(_StubTool("edit", allowed_agent_types=["coder", "merge", "review"]))
     ToolRegistry.register(_StubTool("write", allowed_agent_types=["plan", "coder", "merge", "shell"]))
-    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["plan", "coder", "merge", "shell"]))
+    ToolRegistry.register(_StubTool("shell", allowed_agent_types=["coder", "merge", "shell"]))
 
 
 def _tool_names(schemas: list[dict[str, Any]]) -> set[str]:
@@ -112,13 +112,16 @@ class TestForAgentType:
                 f"secret should not be visible to {agent_type}"
             )
 
-    def test_plan_sees_edit_and_write(self) -> None:
-        """plan agents should see edit, write, and shell in addition to base tools."""
+    def test_plan_sees_read_tools_and_write_only(self) -> None:
+        """plan agents should see read tools and write for planning docs, not execution tools."""
         _register_stubs()
         tools = _tool_names(ToolRegistry.for_agent_type("plan"))
-        assert "edit" in tools
+        assert "glob" in tools
+        assert "read" in tools
+        assert "grep" in tools
         assert "write" in tools
-        assert "shell" in tools
+        assert "edit" not in tools
+        assert "shell" not in tools
 
     def test_review_sees_edit_but_not_write_nor_shell(self) -> None:
         """review agents can edit (for review files) but cannot write or shell."""

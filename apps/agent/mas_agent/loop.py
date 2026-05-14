@@ -5,6 +5,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import re
 from typing import Any
 
 from mas_agent.compaction import should_compact, compact_messages
@@ -30,12 +32,14 @@ class AgentLoop:
 
     def __init__(self, config: LoopConfig) -> None:
         self.config = config
-        self.messages: list[dict[str, str]] = []
+        self.messages: list[dict[str, Any]] = []
         self.stream = StreamWriter(config.stream_dir, config.run_id, config.node_id)
         self._permission = PermissionChecker(self.stream, config.workspace)
         # Doom-loop detection state
         self._tool_call_history: list[tuple[str, str]] = []
         self._doom_warned: bool = False
+        self._executed_tools: list[str] = []
+        self._initial_workspace_snapshot = self._workspace_snapshot()
 
     def _build_system_prompt(self) -> str:
         return load_prompt(
@@ -132,10 +136,132 @@ class AgentLoop:
 
         return None
 
+    def _latest_assistant_text(self) -> str:
+        """Return the most recent assistant prose, excluding tool_use blocks."""
+        for message in reversed(self.messages):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):
+                try:
+                    blocks = json.loads(content)
+                except json.JSONDecodeError:
+                    return content.strip()
+            else:
+                blocks = content
+
+            if isinstance(blocks, list):
+                text = "".join(
+                    str(block.get("text") or "")
+                    for block in blocks
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ).strip()
+                if text:
+                    return text
+        return ""
+
+    @staticmethod
+    def _is_internal_path(path: str) -> bool:
+        normalized = path.replace(os.sep, "/").lstrip("/")
+        return (
+            normalized.startswith(".agent/")
+            or normalized == ".agent"
+            or normalized.startswith(".workflow/")
+            or normalized == ".workflow"
+            or normalized.startswith(".git/")
+            or normalized == ".git"
+        )
+
+    def _workspace_snapshot(self) -> dict[str, tuple[int, int]]:
+        """Return a cheap file snapshot for node-local change detection."""
+        snapshot: dict[str, tuple[int, int]] = {}
+        for root, dirs, files in os.walk(self.config.workspace):
+            rel_root = os.path.relpath(root, self.config.workspace)
+            rel_root = "" if rel_root == "." else rel_root
+            dirs[:] = [
+                d for d in dirs
+                if not self._is_internal_path(os.path.join(rel_root, d))
+            ]
+            for filename in files:
+                rel_path = os.path.join(rel_root, filename) if rel_root else filename
+                if self._is_internal_path(rel_path):
+                    continue
+                full_path = os.path.join(self.config.workspace, rel_path)
+                try:
+                    stat = os.stat(full_path)
+                except OSError:
+                    continue
+                snapshot[rel_path.replace(os.sep, "/")] = (stat.st_size, stat.st_mtime_ns)
+        return snapshot
+
+    def _workspace_has_node_changes(self) -> bool:
+        """Return whether this loop changed visible workspace files."""
+        return self._workspace_snapshot() != self._initial_workspace_snapshot
+
+    def _completion_blocker(self, assistant_text: str) -> str | None:
+        """Return a concrete reason the node cannot be considered complete."""
+        agent_type = self.config.agent_type
+        if not assistant_text.strip() and not self._executed_tools:
+            return "模型没有产生可见文本，也没有调用任何工具。"
+
+        if agent_type in {"design", "coder", "merge"}:
+            if not self._workspace_has_node_changes():
+                return (
+                    f"{agent_type} 节点没有产生任何非 .agent/.workflow 的文件改动；"
+                    "不能把空结果判定为完成。"
+                )
+
+        if agent_type == "shell" and "shell" not in self._executed_tools:
+            return "shell 节点没有执行 shell 工具，不能判定为完成。"
+
+        return None
+
+    def _completion_retry_prompt(self, blocker: str) -> str:
+        agent_type = self.config.agent_type
+        if agent_type in {"design", "plan"}:
+            action = "请立刻使用 write 工具把本节点的 Markdown 方案文档写入工作区。"
+        elif agent_type in {"coder", "merge"}:
+            action = "请立刻使用 read/glob/grep 检查工作区，并用 write/edit/apply_patch 产生真实代码或合并产物。"
+        elif agent_type == "shell":
+            action = "请立刻使用 shell 工具执行本节点要求的验证命令。"
+        else:
+            action = "请继续完成节点任务并输出明确结果。"
+
+        return (
+            "当前节点不能完成："
+            f"{blocker}\n"
+            f"{action}\n"
+            "不要只解释计划；必须通过可用工具完成本节点。"
+        )
+
+    def _repair_plan_write_args(self, args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        """Best-effort recovery for weak models that call write with `{}` in plan/design nodes."""
+        if self.config.agent_type not in {"plan", "design"}:
+            return args, []
+
+        repaired = dict(args)
+        repairs: list[str] = []
+
+        if not repaired.get("path"):
+            safe_node_id = re.sub(r"[^A-Za-z0-9_.-]+", "-", self.config.node_id).strip("-")
+            repaired["path"] = f"{safe_node_id or 'plan'}.md"
+            repairs.append("plan_write[path]: defaulted to node markdown file")
+
+        if not repaired.get("content"):
+            assistant_text = self._latest_assistant_text()
+            if assistant_text:
+                repaired["content"] = assistant_text
+                repairs.append("plan_write[content]: used latest assistant text")
+
+        return repaired, repairs
+
     async def _execute_tool(self, tool_call: dict) -> str:
         """Execute a single tool call and return the result string."""
         # Repair common LLM formatting mistakes before lookup
         name, args, repairs = repair_tool_call(tool_call["name"], tool_call["input"])
+        if name == "write":
+            args, plan_write_repairs = self._repair_plan_write_args(args)
+            repairs.extend(plan_write_repairs)
         if repairs:
             self.stream.emit_tool_call(name, json.dumps({"repairs": repairs})[:2000])
 
@@ -181,6 +307,7 @@ class AgentLoop:
         except Exception as e:
             result = f"Error executing {name}: {e}"
 
+        self._executed_tools.append(name)
         self.stream.emit_tool_result(name, result[:5000])
         return result
 
@@ -209,12 +336,23 @@ class AgentLoop:
                             "name": tc["name"],
                             "input": tc["input"],
                         })
-                    self.messages.append({"role": "assistant", "content": json.dumps(content)})
+                    self.messages.append({"role": "assistant", "content": content})
                 else:
                     self.messages.append({"role": "assistant", "content": assistant_text})
 
-                # No tool calls → we're done
                 if not tool_calls:
+                    blocker = self._completion_blocker(assistant_text)
+                    if blocker:
+                        if turn < self.config.max_turns - 1:
+                            self.stream.emit_status("completion_retry")
+                            self.messages.append({
+                                "role": "user",
+                                "content": self._completion_retry_prompt(blocker),
+                            })
+                            continue
+                        self.stream.emit_error(blocker)
+                        self.stream.emit_status("failed")
+                        return 1
                     break
 
                 # Execute all tool calls and add results
@@ -228,11 +366,11 @@ class AgentLoop:
                     result = await self._execute_tool(tc)
                     tool_result_msg = {
                         "role": "user",
-                        "content": json.dumps([{
+                        "content": [{
                             "type": "tool_result",
                             "tool_use_id": tc["id"],
                             "content": result,
-                        }]),
+                        }],
                     }
                     self.messages.append(tool_result_msg)
 
@@ -241,6 +379,13 @@ class AgentLoop:
                 if should_compact(self.messages, self.config.context_window):
                     self.messages = compact_messages(self.messages, self.config.context_window)
                     self.stream.emit_status("context_compacted")
+
+            final_text = self._latest_assistant_text()
+            blocker = self._completion_blocker(final_text)
+            if blocker:
+                self.stream.emit_error(blocker)
+                self.stream.emit_status("failed")
+                return 1
 
             self.stream.emit_status("completed")
             return 0

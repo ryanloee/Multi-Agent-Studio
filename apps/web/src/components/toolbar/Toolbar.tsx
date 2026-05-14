@@ -127,7 +127,7 @@ export default function Toolbar({
       setStatus("running");
       setLifecyclePhase("running");
       setBlockers([]);
-      // Reload workflow so auto-mode planner node (saved to dag_json by backend) appears on canvas
+      // Reload workflow so runtime status uses the persisted executable DAG.
       const updated = await api.getWorkflow(workflowId);
       loadWorkflow(updated);
     } catch (err) {

@@ -171,7 +171,13 @@ class LocalSandbox:
     # Container lifecycle
     # ------------------------------------------------------------------
 
-    async def create(self, workspace_id: str, template: str = "base", template_dir: str | None = None) -> str:
+    async def create(
+        self,
+        workspace_id: str,
+        template: str = "base",
+        template_dir: str | None = None,
+        storage_root: str | Path | None = None,
+    ) -> str:
         """Create a local sandbox directory layout.
 
         If *template_dir* is provided and the directory exists on the host,
@@ -184,7 +190,8 @@ class LocalSandbox:
         handle).
         """
         sandbox_id = workspace_id
-        root = self.root / workspace_id
+        root_base = Path(storage_root).resolve() if storage_root else self.root
+        root = root_base / workspace_id
 
         # Create directories on the host
         (root / "workspace").mkdir(parents=True, exist_ok=True)
@@ -224,7 +231,9 @@ class LocalSandbox:
         """
         source_state = self._state(source_sandbox_id)
         sandbox_id = new_workspace_id
-        root = self.root / new_workspace_id
+        # Keep clones next to their source sandbox. This matters for workflow
+        # runs whose live workspaces are stored under .mas/runs/<run>/sandboxes.
+        root = source_state.root.parent / new_workspace_id
 
         # Create base directories for the new sandbox
         (root / "workspace").mkdir(parents=True, exist_ok=True)

@@ -675,6 +675,15 @@ class TaskScheduler:
             if ESCALATION_MARKER in line:
                 idx = line.index(ESCALATION_MARKER)
                 question = line[idx + len(ESCALATION_MARKER):].strip()
+                placeholder_questions = {
+                    "<your question>",
+                    "<your question or request>",
+                    "<question>",
+                    "<你的问题>",
+                    "<你的问题或请求>",
+                }
+                if question.lower() in placeholder_questions:
+                    continue
                 if question:
                     return question
         return None

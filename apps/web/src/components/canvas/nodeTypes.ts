@@ -18,6 +18,7 @@ import ChildNode from "@/components/canvas/nodes/ChildNode";
 export const nodeTypes: NodeTypes = {
   coder: CoderNode,
   plan: PlanNode,
+  design: PlanNode,
   shell: ShellNode,
   review: ReviewNode,
   explore: ExploreNode,

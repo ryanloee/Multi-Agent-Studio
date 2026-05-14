@@ -81,6 +81,8 @@ export default function PlannerChatTab() {
   const setLoadingHistory = usePlannerChatStore((s) => s.setLoadingHistory);
   const thinkingLevel = usePlannerChatStore((s) => s.thinkingLevel);
   const setThinkingLevel = usePlannerChatStore((s) => s.setThinkingLevel);
+  const alignmentMaxAttempts = usePlannerChatStore((s) => s.alignmentMaxAttempts);
+  const setAlignmentMaxAttempts = usePlannerChatStore((s) => s.setAlignmentMaxAttempts);
   const currentStage = usePlannerChatStore((s) => s.currentStage);
   const stageAttempt = usePlannerChatStore((s) => s.stageAttempt);
   const stageProgressItems = usePlannerChatStore((s) => s.stageProgressItems);
@@ -212,6 +214,7 @@ export default function PlannerChatTab() {
             message: text,
             node_id: selectedNodeId,
             thinking_level: thinkingLevel,
+            alignment_max_attempts: alignmentMaxAttempts,
             history: [],  // Backend loads from DB, no need to send history
           }),
           signal: controller.signal,
@@ -505,6 +508,20 @@ export default function PlannerChatTab() {
           <option value="low">轻思考</option>
           <option value="medium">中度思考</option>
           <option value="high">高度思考</option>
+        </select>
+        <select
+          value={alignmentMaxAttempts}
+          onChange={(e) => setAlignmentMaxAttempts(Number(e.target.value))}
+          disabled={streaming}
+          className="text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400"
+          title="DAG 对齐修复次数"
+        >
+          <option value={1}>修复 1 次</option>
+          <option value={2}>修复 2 次</option>
+          <option value={3}>修复 3 次</option>
+          <option value={5}>修复 5 次</option>
+          <option value={8}>修复 8 次</option>
+          <option value={10}>修复 10 次</option>
         </select>
         {streaming && (
           <button

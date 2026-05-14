@@ -30,7 +30,7 @@ def parse_args() -> tuple[argparse.Namespace, set[str]]:
     )
     parser.add_argument("--provider", required=True, help="Provider ID (e.g. mimo, glm)")
     parser.add_argument("--model", required=True, help="Model ID (e.g. mimo-v2.5)")
-    parser.add_argument("--agent-type", default="coder", help="Agent type (coder/plan/explore/merge/review/shell)")
+    parser.add_argument("--agent-type", default="coder", help="Agent type (coder/design/plan/explore/merge/review/shell)")
     parser.add_argument("--run-id", required=True, help="Run ID")
     parser.add_argument("--node-id", required=True, help="Node ID")
     parser.add_argument("--prompt-file", required=True, help="Path to prompt file")

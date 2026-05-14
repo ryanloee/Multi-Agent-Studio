@@ -281,13 +281,16 @@ def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
             node_id = node.get("id")
             if not node_id:
                 continue
+            node_type = node.get("type", "coder")
+            if node_type == "plan" and node_id != "planner":
+                node_type = "design"
             # Convert to standard format
             nodes.append({
                 "id": node_id,
-                "type": node.get("type", "coder"),
+                "type": node_type,
                 "data": {
                     "label": node.get("label", node_id),
-                    "agent_type": node.get("type", "coder"),
+                    "agent_type": node_type,
                     "prompt": node.get("prompt", ""),
                 },
             })
@@ -328,12 +331,15 @@ def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
             if "id" not in task or "type" not in task or "prompt" not in task or "depends_on" not in task:
                 return None
 
+            task_type = task["type"]
+            if task_type == "plan" and task["id"] != "planner":
+                task_type = "design"
             nodes.append({
                 "id": task["id"],
-                "type": task["type"],
+                "type": task_type,
                 "data": {
                     "label": task["id"],
-                    "agent_type": task["type"],
+                    "agent_type": task_type,
                     "prompt": task["prompt"],
                 },
             })
@@ -356,12 +362,14 @@ def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
 
 def _validate_tasks(tasks: list) -> list[dict]:
     """Validate and normalize task definitions."""
-    valid_types = {"coder", "explore", "merge", "review", "shell", "build", "plan"}
+    valid_types = {"coder", "explore", "merge", "review", "shell", "build", "plan", "design"}
     result = []
     for task in tasks:
         if not isinstance(task, dict):
             continue
         task_type = task.get("type", "")
+        if task_type == "plan" and task.get("id") != "planner":
+            task_type = "design"
         if task_type not in valid_types:
             task_type = "coder"
         # Accept "prompt" or "command" (shell tasks may use "command")

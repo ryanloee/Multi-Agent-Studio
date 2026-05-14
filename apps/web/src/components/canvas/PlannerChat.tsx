@@ -46,6 +46,7 @@ interface DagEdge {
 
 const NODE_STYLES: Record<string, { bg: string; border: string; text: string; label: string }> = {
   plan:    { bg: "bg-purple-50",  border: "border-purple-300", text: "text-purple-700", label: "规划器" },
+  design:  { bg: "bg-emerald-50", border: "border-emerald-300", text: "text-emerald-700", label: "设计器" },
   coder:   { bg: "bg-blue-50",    border: "border-blue-300",   text: "text-blue-700",   label: "编码器" },
   explore: { bg: "bg-green-50",   border: "border-green-300", text: "text-green-700",  label: "探索器" },
   merge:   { bg: "bg-teal-50",    border: "border-teal-300",  text: "text-teal-700",   label: "合并器" },
@@ -204,6 +205,7 @@ export default function PlannerChat() {
             workflow_id: currentWorkflowId,
             message: text,
             thinking_level: "medium",
+            alignment_max_attempts: 3,
             history,
           }),
           signal: abortRef.current?.signal,
@@ -347,7 +349,7 @@ export default function PlannerChat() {
           permissions: {},
           command: "",
           description: "",
-          parentNodeId: "planner",
+          parentNodeId: undefined,
           isDynamic: true,
         },
       };

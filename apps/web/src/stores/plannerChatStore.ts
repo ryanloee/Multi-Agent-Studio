@@ -28,6 +28,7 @@ interface PlannerChatState {
   lastPlannerToolInputKeys: string[];
   loadingHistory: boolean;
   thinkingLevel: "off" | "low" | "medium" | "high";
+  alignmentMaxAttempts: number;
   abortController: AbortController | null;
   currentStage: PlannerStage | null;
   stageAttempt: number;
@@ -50,6 +51,7 @@ interface PlannerChatState {
   recordPlannerToolCall: (toolName: string, inputKeys: string[]) => void;
   setLoadingHistory: (loading: boolean) => void;
   setThinkingLevel: (level: "off" | "low" | "medium" | "high") => void;
+  setAlignmentMaxAttempts: (attempts: number) => void;
   setCurrentStage: (stage: PlannerStage | null) => void;
   setStageAttempt: (attempt: number) => void;
   setStageProgressItems: (items: string[]) => void;
@@ -78,6 +80,7 @@ export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
   lastPlannerToolInputKeys: [],
   loadingHistory: false,
   thinkingLevel: "medium",
+  alignmentMaxAttempts: 3,
   abortController: null,
   currentStage: null,
   stageAttempt: 0,
@@ -161,6 +164,9 @@ export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
   })),
   setLoadingHistory: (loadingHistory) => set({ loadingHistory }),
   setThinkingLevel: (thinkingLevel) => set({ thinkingLevel }),
+  setAlignmentMaxAttempts: (alignmentMaxAttempts) => set({
+    alignmentMaxAttempts: Math.max(1, Math.min(Math.trunc(alignmentMaxAttempts || 3), 10)),
+  }),
   setCurrentStage: (currentStage) => set({ currentStage }),
   setStageAttempt: (stageAttempt) => set({ stageAttempt }),
   setStageProgressItems: (stageProgressItems) => set({ stageProgressItems }),

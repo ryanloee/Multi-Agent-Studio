@@ -56,6 +56,7 @@ interface FeatureFlags {
 const FEATURES: Record<AgentNodeType, FeatureFlags> = {
   coder:   { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
   plan:    { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
+  design:  { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
   explore: { agentType: true,  model: true,  prompt: true,  permissions: false, command: false, description: false },
   merge:   { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
   shell:   { agentType: false, model: false, prompt: false, permissions: false, command: true,  description: false },
@@ -63,7 +64,7 @@ const FEATURES: Record<AgentNodeType, FeatureFlags> = {
   human:   { agentType: false, model: false, prompt: false, permissions: false, command: false, description: true  },
 };
 
-const CHILD_MODEL_TYPES: WorkerAgentType[] = ["explore", "coder", "merge", "review", "shell"];
+const CHILD_MODEL_TYPES: WorkerAgentType[] = ["design", "explore", "coder", "merge", "review", "shell"];
 
 export default function ConfigPanel() {
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);

@@ -129,11 +129,14 @@ function isAgentNodeType(value: unknown): value is AgentNodeType {
 function normalizeWorkflowNode(node: unknown, index: number): WorkflowNode {
   const raw = (node ?? {}) as Record<string, unknown>;
   const data = (typeof raw.data === "object" && raw.data !== null ? raw.data : {}) as Partial<NodeData>;
-  const nodeType = isAgentNodeType(raw.type)
+  let nodeType = isAgentNodeType(raw.type)
     ? raw.type
     : isAgentNodeType(data.agentType)
       ? data.agentType
       : "coder";
+  if (nodeType === "plan" && String(raw.id || "") !== "planner") {
+    nodeType = "design";
+  }
   const meta = NODE_META[nodeType];
   const rawPosition = (typeof raw.position === "object" && raw.position !== null ? raw.position : {}) as {
     x?: unknown;
@@ -181,6 +184,15 @@ function normalizeWorkflowEdge(edge: unknown): WorkflowEdge | null {
       ...((typeof raw.data === "object" && raw.data !== null) ? raw.data : {}),
     },
   } as WorkflowEdge;
+}
+
+function stripInternalPlannerNodes(nodes: WorkflowNode[], edges: WorkflowEdge[]) {
+  const visibleNodes = nodes.filter((node) => node.id !== "planner");
+  const visibleNodeIds = new Set(visibleNodes.map((node) => node.id));
+  const visibleEdges = edges.filter(
+    (edge) => visibleNodeIds.has(edge.source) && visibleNodeIds.has(edge.target)
+  );
+  return { nodes: visibleNodes, edges: visibleEdges };
 }
 
 function layoutDagNodes(nodes: WorkflowNode[], edges: WorkflowEdge[]): WorkflowNode[] {
@@ -336,11 +348,12 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   ) => {
     const { nodes } = get();
     const parentNode = nodes.find((n) => n.id === parentId);
+    const attachToParent = parentId !== "planner" && Boolean(parentNode);
 
     // Calculate existing children count for positioning
-    const existingChildren = nodes.filter(
-      (n) => (n.data as NodeData).parentNodeId === parentId
-    );
+    const existingChildren = attachToParent
+      ? nodes.filter((n) => (n.data as NodeData).parentNodeId === parentId)
+      : [];
     const offset = existingChildren.length;
 
     // Position child below parent; fall back to origin if parent not found
@@ -371,7 +384,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
         permissions: meta.defaultData.permissions ?? {},
         command: "",
         description: "",
-        parentNodeId: parentId,
+        parentNodeId: attachToParent ? parentId : undefined,
         isDynamic: true,
       },
     };
@@ -387,7 +400,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
     // Update parent node's childNodeIds
     const updatedNodes = nodes.map((node) => {
-      if (node.id === parentId) {
+      if (attachToParent && node.id === parentId) {
         const currentChildIds = (node.data as NodeData).childNodeIds ?? [];
         if (currentChildIds.includes(childDef.id)) return node;
         return {
@@ -418,7 +431,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
                   modelProvider,
                   modelId,
                   prompt: childDef.prompt || node.data.prompt,
-                  parentNodeId: (node.data as NodeData).parentNodeId ?? parentId,
+                  parentNodeId: (node.data as NodeData).parentNodeId ?? (attachToParent ? parentId : undefined),
                   isDynamic: true,
                 },
               }
@@ -428,7 +441,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
 
     set({
       nodes: nodeExists ? nodesWithUpdatedChild : [...updatedNodes, newNode],
-      edges: edgeExists ? get().edges : [...get().edges, newEdge],
+      edges: attachToParent && !edgeExists ? [...get().edges, newEdge] : get().edges,
     });
   },
 
@@ -492,14 +505,15 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     const normalizedEdges = (workflow.edges ?? [])
       .map(normalizeWorkflowEdge)
       .filter((edge): edge is WorkflowEdge => edge !== null);
-    const shouldAutoLayout = workflow.mode === "auto" || normalizedNodes.some((node) => {
+    const visibleDag = stripInternalPlannerNodes(normalizedNodes, normalizedEdges);
+    const shouldAutoLayout = workflow.mode === "auto" || visibleDag.nodes.some((node) => {
       const raw = (workflow.nodes ?? []).find((item) => (item as WorkflowNode).id === node.id) as Partial<WorkflowNode> | undefined;
       return !raw?.position || typeof raw.position.x !== "number" || typeof raw.position.y !== "number";
     });
 
     set({
-      nodes: shouldAutoLayout ? layoutDagNodes(normalizedNodes, normalizedEdges) : normalizedNodes,
-      edges: normalizedEdges,
+      nodes: shouldAutoLayout ? layoutDagNodes(visibleDag.nodes, visibleDag.edges) : visibleDag.nodes,
+      edges: visibleDag.edges,
       selectedNodeId: null,
       selectedEdgeId: null,
       currentWorkflowId: workflow.id,
@@ -578,9 +592,10 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     const normalizedEdges = (dag.edges ?? [])
       .map(normalizeWorkflowEdge)
       .filter((edge): edge is WorkflowEdge => edge !== null);
+    const visibleDag = stripInternalPlannerNodes(normalizedNodes, normalizedEdges);
     set({
-      nodes: layoutDagNodes(normalizedNodes, normalizedEdges),
-      edges: normalizedEdges,
+      nodes: layoutDagNodes(visibleDag.nodes, visibleDag.edges),
+      edges: visibleDag.edges,
     });
   },
   clearPlannerDraftState: () => set({

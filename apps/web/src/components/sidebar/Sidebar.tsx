@@ -66,7 +66,7 @@ const COLOR_MAP: Record<string, { bg: string; text: string; border: string }> = 
   teal: { bg: "bg-teal-50", text: "text-teal-600", border: "border-teal-200" },
 };
 
-const NODE_ORDER: AgentNodeType[] = ["coder", "plan", "explore", "merge", "shell", "review", "human"];
+const NODE_ORDER: AgentNodeType[] = ["coder", "design", "plan", "explore", "merge", "shell", "review", "human"];
 
 export default function Sidebar() {
   const t = useLocaleStore((s) => s.t);

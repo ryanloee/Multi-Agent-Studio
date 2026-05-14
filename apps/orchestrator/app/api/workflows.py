@@ -171,26 +171,11 @@ async def create_workflow(
         blockers_json=[],
     )
 
-    # Auto mode: initialize with a default Planner node
+    # Auto mode uses Planner chat as an internal planning service. Do not store
+    # that top-level Planner as an executable canvas node.
     if body.dag_json is None:
         workflow.dag_json = {
-            "nodes": [
-                {
-                    "id": "planner",
-                    "type": "plan",
-                    "position": {"x": 300, "y": 200},
-                    "data": {
-                        "label": "Planner",
-                        "agentType": "plan",
-                        "modelProvider": "",
-                        "modelId": "",
-                        "prompt": body.goal or "",
-                        "permissions": {},
-                        "command": "",
-                        "description": "",
-                    },
-                }
-            ],
+            "nodes": [],
             "edges": [],
             "metadata": body.metadata or {},
         }
@@ -267,10 +252,27 @@ async def update_workflow(
         next_dag = body.dag_json
         if isinstance(next_dag, dict):
             incoming_metadata = next_dag.get("metadata", {}) if isinstance(next_dag.get("metadata"), dict) else {}
-            next_dag = {
-                **next_dag,
-                "metadata": {**existing_metadata, **incoming_metadata},
-            }
+            incoming_node_count = len(next_dag.get("nodes") or []) if isinstance(next_dag.get("nodes"), list) else 0
+            existing_node_count = (
+                len(workflow.dag_json.get("nodes") or [])
+                if isinstance(workflow.dag_json, dict) and isinstance(workflow.dag_json.get("nodes"), list)
+                else 0
+            )
+            if (
+                workflow.mode == "auto"
+                and incoming_node_count == 0
+                and existing_node_count > 0
+                and workflow.lifecycle_phase in {"planning", "ready", "running"}
+            ):
+                next_dag = {
+                    **(workflow.dag_json or {"nodes": [], "edges": []}),
+                    "metadata": {**existing_metadata, **incoming_metadata},
+                }
+            else:
+                next_dag = {
+                    **next_dag,
+                    "metadata": {**existing_metadata, **incoming_metadata},
+                }
         workflow.dag_json = next_dag
     if body.metadata is not None:
         current_metadata = (

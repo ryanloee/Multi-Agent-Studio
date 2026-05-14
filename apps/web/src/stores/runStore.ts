@@ -24,6 +24,7 @@ interface RunState {
   setStatus: (status: RunStatus) => void;
   addEvent: (event: StreamEvent) => void;
   hydrateEvents: (events: StreamEvent[]) => void;
+  mergeEvents: (events: StreamEvent[]) => void;
   clearEvents: () => void;
   setNodeStatus: (nodeId: string, status: RunStatus) => void;
   setSelectedRunNode: (id: string | null) => void;
@@ -190,6 +191,12 @@ export const useRunStore = create<RunState>((set, get) => ({
 
   hydrateEvents: (events: StreamEvent[]) => {
     set({ events: [], nodeStatuses: {}, parentChildMap: {}, progressSummary: null });
+    for (const event of events) {
+      get().addEvent(event);
+    }
+  },
+
+  mergeEvents: (events: StreamEvent[]) => {
     for (const event of events) {
       get().addEvent(event);
     }

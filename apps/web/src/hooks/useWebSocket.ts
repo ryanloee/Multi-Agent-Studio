@@ -81,6 +81,7 @@ export function useWebSocket(
   // -----------------------------------------------------------------------
   useEffect(() => {
     if (!runId) return;
+    const activeRunId = runId;
 
     // Reset manual close flag on new connect cycle
     manualCloseRef.current = false;
@@ -90,13 +91,23 @@ export function useWebSocket(
     function connect() {
       if (cancelled || manualCloseRef.current) return;
 
-      const url = withAccessToken(`${baseUrl}/ws/runs/${runId}/stream`);
+      const url = withAccessToken(`${baseUrl}/ws/runs/${activeRunId}/stream`);
       const ws = new WebSocket(url);
 
       ws.onopen = () => {
         if (!cancelled) {
           setIsConnected(true);
-          useTaskStore.getState().setCurrentRunId(runId);
+          useTaskStore.getState().setCurrentRunId(activeRunId);
+          void import("@/lib/api")
+            .then(({ api }) => api.listRunEvents(activeRunId))
+            .then((events) => {
+              if (!cancelled) {
+                useRunStore.getState().mergeEvents(events);
+              }
+            })
+            .catch(() => {
+              // WebSocket remains the primary live path; backfill is best-effort.
+            });
         }
       };
 
@@ -294,6 +305,8 @@ export function useWebSocket(
         try {
           const { api } = await import("@/lib/api");
           const runInfo = await api.getRun(runId);
+          const events = await api.listRunEvents(runId);
+          useRunStore.getState().mergeEvents(events);
           if (
             runInfo.status === "completed" ||
             runInfo.status === "failed" ||

@@ -80,8 +80,8 @@ class ToolRegistry:
                     "Reviewer edit limited to ~10 lines per change"
                 )
 
-        if tool_name == "write" and agent_type == "plan":
-            # Planner: only planning-related file types
+        if tool_name == "write" and agent_type in {"plan", "design"}:
+            # Planner/design workers can only write planning documents.
             path = arguments.get("path", "")
             valid_exts = (".md", ".txt", ".json", ".markdown")
             if path and not any(path.endswith(ext) for ext in valid_exts):
@@ -152,24 +152,24 @@ ToolRegistry.register(GlobTool())
 ToolRegistry.register(GrepTool())
 ToolRegistry.register(ReadTool())
 
-# write — plan, coder, merge, shell only
+# write — plan/design can write planning docs; coder/merge/shell use it for implementation/config artifacts
 _write = WriteTool()
-_write.allowed_agent_types = ["plan", "coder", "merge", "shell"]
+_write.allowed_agent_types = ["plan", "design", "coder", "merge", "shell"]
 ToolRegistry.register(_write)
 
-# shell — plan, coder, merge, shell only
+# shell — implementation/integration/verification agents only. Local plan workers do not see shell.
 _shell = ShellTool()
-_shell.allowed_agent_types = ["plan", "coder", "merge", "shell"]
+_shell.allowed_agent_types = ["coder", "merge", "shell"]
 ToolRegistry.register(_shell)
 
-# edit — available to all agent types that write
+# edit — implementation/review agents only. Local plan workers should write docs, not edit code.
 _edit = EditTool()
-_edit.allowed_agent_types = ["plan", "coder", "merge", "review", "shell"]
+_edit.allowed_agent_types = ["coder", "merge", "review", "shell"]
 ToolRegistry.register(_edit)
 
 from mas_agent.tools.apply_patch_tool import ApplyPatchTool  # noqa: E402
 
-# apply_patch — plan, coder, merge only (diff-based editing for GPT models)
+# apply_patch — implementation/integration agents only
 _apply_patch = ApplyPatchTool()
-_apply_patch.allowed_agent_types = ["plan", "coder", "merge"]
+_apply_patch.allowed_agent_types = ["coder", "merge"]
 ToolRegistry.register(_apply_patch)

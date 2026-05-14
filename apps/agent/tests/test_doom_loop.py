@@ -153,6 +153,38 @@ class TestCheckDoomLoop:
         assert "doom_loop_detected" not in stream.status_events()
 
 
+class TestPlanWriteRepair:
+    """Weak-model recovery for plan workers that call write with missing args."""
+
+    def test_plan_write_defaults_path_and_uses_latest_text(self, tmp_path) -> None:
+        config = _make_config(tmp_path)
+        config.agent_type = "plan"
+        config.node_id = "plan-architecture"
+        loop, _ = _patched_loop(config)
+        loop.messages.append({
+            "role": "assistant",
+            "content": json.dumps([
+                {"type": "text", "text": "# Architecture\nUse Prisma models."},
+                {"type": "tool_use", "id": "call_write", "name": "write", "input": {}},
+            ]),
+        })
+
+        repaired, repairs = loop._repair_plan_write_args({})
+
+        assert repaired["path"] == "plan-architecture.md"
+        assert repaired["content"] == "# Architecture\nUse Prisma models."
+        assert "plan_write[path]: defaulted to node markdown file" in repairs
+        assert "plan_write[content]: used latest assistant text" in repairs
+
+    def test_coder_write_is_not_repaired(self, tmp_path) -> None:
+        loop, _ = _patched_loop(_make_config(tmp_path))
+
+        repaired, repairs = loop._repair_plan_write_args({})
+
+        assert repaired == {}
+        assert repairs == []
+
+
 class TestDoomLoopIntegration:
     """End-to-end tests patching _call_llm / _execute_tool."""
 
@@ -160,6 +192,7 @@ class TestDoomLoopIntegration:
     async def test_normal_run_no_doom_loop(self, tmp_path) -> None:
         """Three different tool calls — no doom-loop events."""
         config = _make_config(tmp_path)
+        config.agent_type = "explore"
         loop, stream = _patched_loop(config)
 
         # Simulate 3 turns with different tools, then a final text-only turn
@@ -184,6 +217,7 @@ class TestDoomLoopIntegration:
     async def test_warning_injected_on_3_identical(self, tmp_path) -> None:
         """After 3 identical tool calls, a warning message is injected."""
         config = _make_config(tmp_path)
+        config.agent_type = "explore"
         loop, stream = _patched_loop(config)
 
         args = {"pattern": "stuck"}
@@ -236,6 +270,7 @@ class TestDoomLoopIntegration:
     async def test_similar_but_different_args_no_trigger(self, tmp_path) -> None:
         """Three grep calls with different patterns should NOT trigger."""
         config = _make_config(tmp_path)
+        config.agent_type = "explore"
         loop, stream = _patched_loop(config)
 
         llm_responses: list[tuple[str, list[dict]]] = [
