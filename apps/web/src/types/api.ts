@@ -43,7 +43,7 @@ export interface WorkflowSummary {
   id: string;
   name: string;
   description: string;
-  /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
+  /** Workflow mode: always "auto" — Planner builds the workflow */
   mode?: string;
   lifecycle_phase?: WorkflowLifecyclePhase;
   /** ISO timestamp of last modification */
@@ -58,7 +58,7 @@ export interface WorkflowDetail {
   name: string;
   description: string;
   workspace_directory?: string;
-  /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
+  /** Workflow mode: always "auto" — Planner builds the workflow */
   mode?: string;
   /** Natural-language goal for auto-mode workflows */
   goal?: string;
@@ -82,8 +82,8 @@ export interface CreateWorkflowRequest {
   name: string;
   description?: string;
   workspace_directory?: string;
-  /** Workflow mode: "auto" lets a Planner build the workflow, "manual" is user-designed */
-  mode?: "auto" | "manual";
+  /** Workflow mode: always "auto" */
+  mode?: "auto";
   /** Natural-language goal for auto-mode workflows */
   goal?: string;
   metadata?: {
@@ -98,7 +98,7 @@ export interface UpdateWorkflowRequest {
   name?: string;
   description?: string;
   workspace_directory?: string;
-  mode?: "auto" | "manual";
+  mode?: "auto";
   goal?: string;
   lifecycle_phase?: WorkflowLifecyclePhase;
   blockers?: WorkflowBlocker[];

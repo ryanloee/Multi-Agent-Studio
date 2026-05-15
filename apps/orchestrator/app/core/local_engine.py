@@ -1038,11 +1038,10 @@ class LocalDAGExecutor:
     ) -> None:
         """Route an escalation from a worker to its upstream node.
 
-        In auto mode, the planner is always the upstream — the existing
-        TaskScheduler handles this.  In manual mode, we look up the
-        edges to find the direct upstream node(s) and emit a
-        ``escalation_routed`` event targeting them.  The UI can then
-        display the escalation in the upstream node's output panel.
+        The planner is always the upstream — the existing
+        TaskScheduler handles this.  For DAG-defined workflows,
+        we look up the edges to find the direct upstream node(s)
+        and emit an ``escalation_routed`` event targeting them.
 
         If the upstream node has already completed, we inject the
         escalation as a new message into the run's event stream.
@@ -2546,7 +2545,7 @@ class LocalDAGExecutor:
                     "sandbox_id": sandbox_id,
                 }
 
-            # Inject escalation protocol for non-plan, non-human nodes (manual mode)
+            # Inject escalation protocol for non-plan, non-human nodes
             if agent_type != "plan" and agent_type != "human":
                 escalation_hint = (
                     f"\n\n---\nNode ID: {node_id}\n"
@@ -2627,7 +2626,11 @@ class LocalDAGExecutor:
                 idle_timeout_seconds = int(env_timeout)
             forced_failure_reason = ""
 
-            sse_port = await self._read_runner_port(sandbox_id, timeout=15)
+            sse_port = await self._read_runner_port(
+                sandbox_id, timeout=15,
+                run_id=run_id,
+                workspace_directory=workspace_directory,
+            )
             if sse_port:
                 forced_failure_reason = await self._consume_runner_sse(
                     sse_port, run_id, node_id, exec_id,
@@ -2663,7 +2666,6 @@ class LocalDAGExecutor:
                     "exec_id": exec_id,
                     "exit_code": exit_code,
                     "completed_at": datetime.now(timezone.utc).isoformat(),
-                    "log_pos": log_pos,
                 },
             )
 
@@ -2833,8 +2835,7 @@ class LocalDAGExecutor:
                     await self._emit(
                         "worker_escalation", run_id, node_id, content=escalation_msg,
                     )
-                    # In manual mode, route the escalation to the upstream node
-                    # based on the edges defined in the workflow.
+                    # Route the escalation to the upstream node based on workflow edges.
                     await self._route_escalation(run_id, node_id, escalation_msg)
                 await self._emit("shell_stdout", run_id, node_id, content=line)
 
@@ -2845,25 +2846,72 @@ class LocalDAGExecutor:
     # ------------------------------------------------------------------
 
     async def _read_runner_port(
-        self, sandbox_id: str, timeout: int = 15,
+        self,
+        sandbox_id: str,
+        timeout: int = 15,
+        *,
+        run_id: str | None = None,
+        workspace_directory: str | None = None,
     ) -> int | None:
-        """Read the SSE port from runner.port file written by run-node.ts."""
-        port_file = "/workspace/.agent/runner.port"
+        """Read the SSE port from runner.port file written by run-node.ts.
+
+        Tries direct host filesystem first (faster), then sandbox exec.
+        If sandbox state is not in memory, attempts to reconstruct the path
+        from run_id and workspace_directory.
+        """
+        # Method 1: direct host filesystem read via sandbox path mapping
+        port_path: Path | None = None
+        try:
+            state = self._sandbox._state(sandbox_id)
+            port_path = state.workspace_dir / ".agent" / "runner.port"
+            logger.debug("runner.port path from sandbox state: %s", port_path)
+        except KeyError:
+            # Sandbox state not in memory (e.g., after restart) - reconstruct path
+            if run_id and workspace_directory:
+                sandbox_root = self._mas_sandbox_root(workspace_directory, run_id)
+                if sandbox_root:
+                    port_path = sandbox_root / sandbox_id / "workspace" / ".agent" / "runner.port"
+                    logger.info(
+                        "Reconstructed runner.port path from run context: %s", port_path,
+                    )
+            if port_path is None:
+                logger.warning(
+                    "Sandbox %s not in memory and cannot reconstruct path "
+                    "(run_id=%s, workspace_directory=%s)",
+                    sandbox_id[:12], run_id, workspace_directory,
+                )
+        except Exception:
+            logger.debug("Unexpected error getting sandbox state", exc_info=True)
+
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            # Try direct read first
+            if port_path is not None:
+                try:
+                    content = await asyncio.to_thread(lambda: port_path.read_text().strip())
+                    if content and content.isdigit():
+                        port = int(content)
+                        logger.info("Read runner SSE port (direct): %d", port)
+                        return port
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
+            # Fallback: sandbox exec
             try:
                 content, _ = await self._sandbox.exec(
-                    sandbox_id, f"cat {port_file} 2>/dev/null || true",
+                    sandbox_id, "cat /workspace/.agent/runner.port 2>/dev/null || true",
                 )
                 port_str = content.strip()
                 if port_str and port_str.isdigit():
                     port = int(port_str)
-                    logger.info("Read runner SSE port: %d", port)
+                    logger.info("Read runner SSE port (exec): %d", port)
                     return port
             except Exception:
                 pass
             await asyncio.sleep(0.5)
-        logger.warning("Failed to read runner.port within %ds", timeout)
+        logger.warning("Failed to read runner.port within %ds for sandbox %s", timeout, sandbox_id[:12])
         return None
 
     async def _consume_runner_sse(
@@ -2886,6 +2934,46 @@ class LocalDAGExecutor:
         last_activity = time.monotonic()
         idle_warnings_sent: set[int] = set()
 
+        async def _idle_monitor() -> str:
+            """Concurrent task that enforces idle timeout."""
+            nonlocal last_activity, forced_failure_reason
+            while True:
+                await asyncio.sleep(5)
+                if cancel_event.is_set():
+                    break
+                idle_seconds = int(time.monotonic() - last_activity)
+                if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
+                    forced_failure_reason = (
+                        f"node idle timeout after {idle_seconds}s "
+                        f"without SSE activity (status events stopped)"
+                    )
+                    logger.warning("Node %s SSE idle timeout: %s", node_id, forced_failure_reason)
+                    shim = self._sandbox._find_process(exec_id)
+                    if shim is not None:
+                        try:
+                            shim.terminate()
+                            await asyncio.wait_for(shim.wait(), timeout=2.0)
+                        except Exception:
+                            try:
+                                shim.kill()
+                            except Exception:
+                                pass
+                    return forced_failure_reason
+                # Progressive warnings
+                if idle_timeout_seconds > 0 and idle_seconds > 0:
+                    pct = int(idle_seconds / idle_timeout_seconds * 100)
+                    for threshold in (50, 75, 90):
+                        if pct >= threshold and threshold not in idle_warnings_sent:
+                            idle_warnings_sent.add(threshold)
+                            await self._emit(
+                                "idle_warning", run_id, node_id,
+                                content=f"节点无活动 {idle_seconds}s，超过 {threshold}%",
+                                idle_seconds=idle_seconds,
+                                timeout_seconds=idle_timeout_seconds,
+                                threshold_pct=threshold,
+                            )
+            return ""
+
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=None, write=5, pool=5)) as client:
                 async with client.stream("GET", url) as response:
@@ -2895,104 +2983,78 @@ class LocalDAGExecutor:
 
                     logger.info("SSE connected to runner on port %d for node %s", port, node_id)
 
-                    async for raw_line in response.aiter_lines():
-                        if cancel_event.is_set():
-                            break
+                    monitor_task = asyncio.create_task(_idle_monitor())
 
-                        if not raw_line.startswith("data:"):
-                            continue
+                    try:
+                        async for raw_line in response.aiter_lines():
+                            if cancel_event.is_set() or forced_failure_reason:
+                                break
 
-                        raw_line = raw_line[5:].strip()
-                        if not raw_line:
-                            continue
+                            if not raw_line.startswith("data:"):
+                                continue
 
+                            raw_line = raw_line[5:].strip()
+                            if not raw_line:
+                                continue
+
+                            try:
+                                ev = json.loads(raw_line)
+                            except json.JSONDecodeError:
+                                continue
+
+                            event_type = ev.get("type", "")
+
+                            # Track terminal events
+                            if event_type in {"node_completed", "node_failed"}:
+                                run_state = self._runs.get(run_id)
+                                if isinstance(run_state, dict):
+                                    terminal_events = run_state.setdefault("_node_terminal_events", {})
+                                    if isinstance(terminal_events, dict):
+                                        terminal_events[node_id] = event_type
+
+                            # agent_status from opencode: busy/idle/retry
+                            if event_type == "agent_status":
+                                status_type = ev.get("status_type", "")
+                                last_activity = time.monotonic()
+                                logger.debug(
+                                    "Node %s agent_status=%s", node_id, status_type,
+                                )
+                                await self._emit(
+                                    "agent_status", run_id, node_id,
+                                    content=ev.get("content", ""),
+                                    status_type=status_type,
+                                )
+                                continue
+
+                            # Emit known event types
+                            if event_type in _KNOWN_EVENT_TYPES:
+                                extra: dict[str, Any] = {
+                                    "content": ev.get("content", ""),
+                                    "tool_name": ev.get("tool_name", ""),
+                                    "timestamp": ev.get("timestamp", 0),
+                                }
+                                if isinstance(ev.get("metadata"), dict):
+                                    extra["metadata"] = ev["metadata"]
+                                await self._emit(event_type, run_id, node_id, **extra)
+                                last_activity = time.monotonic()
+                                content = ev.get("content", "")
+                                if isinstance(content, str):
+                                    if "ESCALATE_TO_PLANNER:" in content:
+                                        await self._emit(
+                                            "planner_guidance", run_id, node_id,
+                                            content=content.split("ESCALATE_TO_PLANNER:", 1)[1].strip(),
+                                        )
+                                    if "ASK_WORKER:" in content or "BROADCAST_TO_PEERS:" in content:
+                                        await self._emit(
+                                            "worker_message", run_id, node_id,
+                                            content=content,
+                                        )
+                    finally:
+                        monitor_task.cancel()
                         try:
-                            ev = json.loads(raw_line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        event_type = ev.get("type", "")
-
-                        # Track terminal events
-                        if event_type in {"node_completed", "node_failed"}:
-                            run_state = self._runs.get(run_id)
-                            if isinstance(run_state, dict):
-                                terminal_events = run_state.setdefault("_node_terminal_events", {})
-                                if isinstance(terminal_events, dict):
-                                    terminal_events[node_id] = event_type
-
-                        # agent_status from opencode: busy/idle/retry
-                        if event_type == "agent_status":
-                            status_type = ev.get("status_type", "")
-                            last_activity = time.monotonic()
-                            logger.debug(
-                                "Node %s agent_status=%s", node_id, status_type,
-                            )
-                            await self._emit(
-                                "agent_status", run_id, node_id,
-                                content=ev.get("content", ""),
-                                status_type=status_type,
-                            )
-                            continue
-
-                        # Emit known event types
-                        if event_type in _KNOWN_EVENT_TYPES:
-                            extra: dict[str, Any] = {
-                                "content": ev.get("content", ""),
-                                "tool_name": ev.get("tool_name", ""),
-                                "timestamp": ev.get("timestamp", 0),
-                            }
-                            if isinstance(ev.get("metadata"), dict):
-                                extra["metadata"] = ev["metadata"]
-                            await self._emit(event_type, run_id, node_id, **extra)
-                            last_activity = time.monotonic()
-                            content = ev.get("content", "")
-                            if isinstance(content, str):
-                                if "ESCALATE_TO_PLANNER:" in content:
-                                    await self._emit(
-                                        "planner_guidance", run_id, node_id,
-                                        content=content.split("ESCALATE_TO_PLANNER:", 1)[1].strip(),
-                                    )
-                                if "ASK_WORKER:" in content or "BROADCAST_TO_PEERS:" in content:
-                                    await self._emit(
-                                        "worker_message", run_id, node_id,
-                                        content=content,
-                                    )
-
-                        # Idle timeout safety net (only if no activity for a long time)
-                        idle_seconds = int(time.monotonic() - last_activity)
-                        if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
-                            forced_failure_reason = (
-                                f"node idle timeout after {idle_seconds}s "
-                                f"without SSE activity (status events stopped)"
-                            )
-                            logger.warning("Node %s SSE idle timeout: %s", node_id, forced_failure_reason)
-                            shim = self._sandbox._find_process(exec_id)
-                            if shim is not None:
-                                try:
-                                    shim.terminate()
-                                    await asyncio.wait_for(shim.wait(), timeout=2.0)
-                                except Exception:
-                                    try:
-                                        shim.kill()
-                                    except Exception:
-                                        pass
-                            break
-
-                        # Progressive warnings
-                        if idle_timeout_seconds > 0:
-                            idle_seconds_now = int(time.monotonic() - last_activity)
-                            pct = int(idle_seconds_now / idle_timeout_seconds * 100)
-                            for threshold in (50, 75, 90):
-                                if pct >= threshold and threshold not in idle_warnings_sent:
-                                    idle_warnings_sent.add(threshold)
-                                    await self._emit(
-                                        "idle_warning", run_id, node_id,
-                                        content=f"节点无活动 {idle_seconds_now}s，超过 {threshold}%",
-                                        idle_seconds=idle_seconds_now,
-                                        timeout_seconds=idle_timeout_seconds,
-                                        threshold_pct=threshold,
-                                    )
+                            await monitor_task
+                        except asyncio.CancelledError:
+                            pass
 
         except Exception:
             logger.warning("SSE subscription error for node %s", node_id, exc_info=True)
@@ -3056,7 +3118,9 @@ class LocalDAGExecutor:
                     poll_count=poll_count,
                 )
                 last_heartbeat = now
-                last_stream_activity = now
+                # NOTE: do NOT reset last_stream_activity here!
+                # In file-polling mode, heartbeats are self-generated by Python,
+                # not from the model. Resetting would make timeout impossible.
 
             # Progressive warnings
             if idle_timeout_seconds > 0:

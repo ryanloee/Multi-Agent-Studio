@@ -45,8 +45,8 @@ interface WorkflowState {
   currentWorkflowId: string | null;
   workspaceDirectory: string;
 
-  // Workflow dual mode (auto vs manual)
-  mode: "auto" | "manual";
+  // Workflow mode (always auto)
+  mode: "auto";
   goal: string;
   autoChildModelMap: AutoChildModelMap;
   lifecyclePhase: WorkflowLifecyclePhase;
@@ -108,7 +108,7 @@ interface WorkflowState {
   clearPlannerDraftState: () => void;
 
   // Mode & goal
-  updateMode: (mode: "auto" | "manual") => Promise<void>;
+  updateMode: () => Promise<void>;
   updateGoal: (goal: string) => Promise<void>;
   updateAutoChildModelMap: (agentType: WorkerAgentType, model: string) => Promise<void>;
 }
@@ -604,9 +604,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   }),
 
   // ---- Mode & goal ----
-  updateMode: async (_mode: "auto" | "manual") => {
+  updateMode: async () => {
     const { currentWorkflowId } = get();
-    // Always update local state immediately (optimistic)
     set({ mode: "auto" });
     if (!currentWorkflowId) return;
     try {

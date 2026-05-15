@@ -27,7 +27,7 @@ class Workflow(Base):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     dag_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     workspace_directory: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="manual", server_default="manual")
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="auto", server_default="auto")
     goal: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     lifecycle_phase: Mapped[str] = mapped_column(
         String(32), nullable=False, default="draft", server_default="draft",

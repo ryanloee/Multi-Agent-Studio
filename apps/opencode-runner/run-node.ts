@@ -147,14 +147,8 @@ function npmForProvider(provider: string, baseURL: string) {
 }
 
 function resolveProviderConfig(provider: string, baseURL: string) {
-  if (provider === "anthropic" && baseURL.includes("open.bigmodel.cn/api/anthropic")) {
-    return {
-      provider: "bigmodel",
-      baseURL: "https://open.bigmodel.cn/api/paas/v4",
-      npm: "@ai-sdk/openai-compatible",
-      note: "converted_bigmodel_anthropic_to_openai_compatible",
-    }
-  }
+  // Previously converted bigmodel Anthropic -> OpenAI compatible, but GLM
+  // keys often only have quota on the Anthropic endpoint. Keep original.
   return {
     provider,
     baseURL,

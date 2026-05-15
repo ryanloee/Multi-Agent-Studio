@@ -241,18 +241,15 @@ async def trigger_run(
 ):
     """Trigger workflow execution via the local DAG engine.
 
-    Supports two modes:
-    - "manual" (default): Compile the user-drawn DAG from dag_json and execute.
-    - "auto": Build a synthetic Planner node from workflow.goal, run it first,
-      then let the engine parse its output into a DAG and execute dynamically.
+    Always uses auto mode: the Planner builds the workflow DAG from
+    workflow.goal and planner chat history.
 
     Steps:
     1. Look up workflow from DB to get DAG JSON, mode, and goal.
-    2. Route based on mode (auto vs manual).
+    2. Recover or validate DAG from planner chat history.
     3. Compile DAG into execution layers via compiler.compile_dag().
-    4. Convert layers into dicts for the LocalDAGExecutor.
-    5. Start DAG execution in the background.
-    6. Persist run record to DB and return it.
+    4. Start DAG execution in the background via start_task_dag().
+    5. Persist run record to DB and return it.
     """
     from app.workflows.compiler import compile_dag
 
@@ -271,162 +268,93 @@ async def trigger_run(
 
     payload = body or TriggerRunRequest()
     global_config = payload.config or {}
-    workflow_mode = "auto"
     dag_json: dict | None = None
     run_id = uuid4()
-    start_as_task_dag = False
     workflow_metadata = (
         workflow.dag_json.get("metadata", {})
         if isinstance(workflow.dag_json, dict)
         else {}
     )
 
-    # 2. Route based on mode
-    if workflow_mode == "auto":
-        goal = getattr(workflow, "goal", "") or ""
-        saved_dag = payload.dag if payload.dag else (workflow.dag_json or {})
-        saved_nodes = [
-            node for node in saved_dag.get("nodes", [])
-            if isinstance(node, dict) and node.get("id") != "planner"
-        ]
-        if not saved_nodes:
-            from app.api.planner_chat import _extract_dag_from_text
-            from app.models.db import ChatMessage as ChatMessageORM
+    # 2. Auto mode: recover DAG from payload or planner chat history
+    goal = getattr(workflow, "goal", "") or ""
+    saved_dag = payload.dag if payload.dag else (workflow.dag_json or {})
+    saved_nodes = [
+        node for node in saved_dag.get("nodes", [])
+        if isinstance(node, dict) and node.get("id") != "planner"
+    ]
+    if not saved_nodes:
+        from app.api.planner_chat import _extract_dag_from_text
+        from app.models.db import ChatMessage as ChatMessageORM
 
-            saw_unparsed_plan = False
-            chat_result = await db.execute(
-                select(ChatMessageORM)
-                .where(
-                    ChatMessageORM.workflow_id == workflow_id,
-                    ChatMessageORM.node_id == "planner",
-                    ChatMessageORM.role == "assistant",
-                )
-                .order_by(ChatMessageORM.created_at.desc())
+        saw_unparsed_plan = False
+        chat_result = await db.execute(
+            select(ChatMessageORM)
+            .where(
+                ChatMessageORM.workflow_id == workflow_id,
+                ChatMessageORM.node_id == "planner",
+                ChatMessageORM.role == "assistant",
             )
-            for msg in chat_result.scalars().all():
-                if "```plan" in (msg.content or ""):
-                    saw_unparsed_plan = True
-                recovered_dag = _extract_dag_from_text(msg.content or "")
-                recovered_nodes = [
-                    node for node in (recovered_dag or {}).get("nodes", [])
-                    if isinstance(node, dict) and node.get("id") != "planner"
-                ]
-                if recovered_nodes:
-                    saved_dag = recovered_dag or {}
-                    saved_nodes = recovered_nodes
-                    workflow.dag_json = saved_dag
-                    db.add(workflow)
-                    await db.flush()
-                    logger.info(
-                        "Recovered auto DAG for workflow %s from planner chat history (%d nodes)",
-                        workflow_id, len(saved_nodes),
-                    )
-                    break
-            if not saved_nodes and saw_unparsed_plan:
-                workflow.lifecycle_phase = "blocked"
-                workflow.blockers_json = [{
-                    "code": "planner_dag_parse_failed",
-                    "message": "Planner 曾输出结构化计划，但 JSON 不完整或无效，系统无法恢复画布节点。请让 Planner 重新生成更简洁的 DAG。",
-                }]
-                await db.commit()
-                logger.warning(
-                    "Run blocked by unrecoverable planner DAG: workflow=%s",
-                    workflow_id,
+            .order_by(ChatMessageORM.created_at.desc())
+        )
+        for msg in chat_result.scalars().all():
+            if "```plan" in (msg.content or ""):
+                saw_unparsed_plan = True
+            recovered_dag = _extract_dag_from_text(msg.content or "")
+            recovered_nodes = [
+                node for node in (recovered_dag or {}).get("nodes", [])
+                if isinstance(node, dict) and node.get("id") != "planner"
+            ]
+            if recovered_nodes:
+                saved_dag = recovered_dag or {}
+                saved_nodes = recovered_nodes
+                workflow.dag_json = saved_dag
+                db.add(workflow)
+                await db.flush()
+                logger.info(
+                    "Recovered auto DAG for workflow %s from planner chat history (%d nodes)",
+                    workflow_id, len(saved_nodes),
                 )
-                raise HTTPException(status_code=400, detail=workflow.blockers_json[0])
-
-        blockers = _validate_run_request(workflow, saved_dag)
-        if blockers:
-            workflow.lifecycle_phase = "blocked"
-            workflow.blockers_json = blockers
-            await db.commit()
-            raise HTTPException(status_code=400, detail=blockers[0]["message"])
-        if saved_nodes:
-            try:
-                compile_dag(_strip_internal_planner_node(saved_dag))
-            except ValueError as exc:
-                workflow.lifecycle_phase = "blocked"
-                workflow.blockers_json = [{
-                    "code": "dag_invalid",
-                    "message": str(exc),
-                }]
-                await db.commit()
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        if saved_nodes:
-            # Planner chat already produced a concrete DAG. Execute that
-            # saved team directly and mirror every node to the task board.
-            dag_json = _strip_internal_planner_node(saved_dag)
-            start_as_task_dag = True
-            global_config["_mode"] = "auto"
-            global_config["_goal"] = goal
-        else:
+                break
+        if not saved_nodes and saw_unparsed_plan:
             workflow.lifecycle_phase = "blocked"
             workflow.blockers_json = [{
-                "code": "dag_empty",
-                "message": "当前只有 Planner 规划，没有形成可执行 DAG。请先在 Planner 中完成方案并进入 Ready。",
+                "code": "planner_dag_parse_failed",
+                "message": "Planner 曾输出结构化计划，但 JSON 不完整或无效，系统无法恢复画布节点。请让 Planner 重新生成更简洁的 DAG。",
             }]
             await db.commit()
-            raise HTTPException(status_code=400, detail=workflow.blockers_json[0]["message"])
+            logger.warning(
+                "Run blocked by unrecoverable planner DAG: workflow=%s",
+                workflow_id,
+            )
+            raise HTTPException(status_code=400, detail=workflow.blockers_json[0])
+
+    blockers = _validate_run_request(workflow, saved_dag)
+    if blockers:
+        workflow.lifecycle_phase = "blocked"
+        workflow.blockers_json = blockers
+        await db.commit()
+        raise HTTPException(status_code=400, detail=blockers[0]["message"])
+    if saved_nodes:
+        # Planner chat already produced a concrete DAG. Execute that
+        # saved team directly and mirror every node to the task board.
+        dag_json = _strip_internal_planner_node(saved_dag)
+        global_config["_mode"] = "auto"
+        global_config["_goal"] = goal
     else:
-        # Manual mode (default): compile the user-drawn DAG
-        dag_json = payload.dag if payload.dag else (workflow.dag_json or {})
-        if not dag_json:
-            raise HTTPException(status_code=400, detail="No DAG definition found")
-        blockers = _validate_run_request(workflow, dag_json)
-        if blockers:
-            workflow.lifecycle_phase = "blocked"
-            workflow.blockers_json = blockers
-            await db.commit()
-            raise HTTPException(status_code=400, detail=blockers[0]["message"])
-
-        # 3. Compile DAG into layers
-        try:
-            compiled_layers = compile_dag(dag_json)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-        # 4. Serialise layers into dicts for the engine
-        #    Frontend sends camelCase (agentType, modelProvider, modelId).
-        #    Engine expects snake_case -- normalise here.
-        layers_data: list[dict] = []
-        for layer_nodes in compiled_layers:
-            layer_list = []
-            for node_def in layer_nodes:
-                node_data = node_def.get("data", node_def)
-                # Accept both camelCase (from frontend) and snake_case
-                agent_type = (
-                    node_data.get("agent_type")
-                    or node_data.get("agentType")
-                    or "coder"
-                )
-                if agent_type == "plan" and node_def.get("id", "") != "planner":
-                    agent_type = "design"
-                model_provider = (
-                    node_data.get("model_provider")
-                    or node_data.get("modelProvider")
-                    or ""
-                )
-                model_id = (
-                    node_data.get("model_id")
-                    or node_data.get("modelId")
-                    or ""
-                )
-                prompt = node_data.get("prompt", "")
-                layer_list.append({
-                    "id": node_def.get("id", ""),
-                    "agent_type": agent_type,
-                    "model_provider": model_provider,
-                    "model_id": model_id,
-                    "prompt": prompt,
-                })
-            layers_data.append(layer_list)
+        workflow.lifecycle_phase = "blocked"
+        workflow.blockers_json = [{
+            "code": "dag_empty",
+            "message": "当前只有 Planner 规划，没有形成可执行 DAG。请先在 Planner 中完成方案并进入 Ready。",
+        }]
+        await db.commit()
+        raise HTTPException(status_code=400, detail=workflow.blockers_json[0]["message"])
 
     global_config["_edges"] = (dag_json or workflow.dag_json or {}).get("edges", [])
     global_config["_workflow_id"] = str(workflow_id)
     global_config["_auto_child_model_map"] = workflow_metadata.get("auto_child_model_map", {})
 
-    # 5. Persist run record before starting background execution. Dynamic
+    # 3. Persist run record before starting background execution. Dynamic
     # tasks are inserted from a separate DB session and need this FK visible.
     workflow.lifecycle_phase = "running"
     workflow.blockers_json = []
@@ -440,21 +368,13 @@ async def trigger_run(
     await db.commit()
     await db.refresh(run)
 
-    # 6. Start execution via LocalDAGExecutor
-    if start_as_task_dag:
-        await engine.start_task_dag(
-            run_id=str(run_id),
-            dag_json=dag_json or {},
-            global_config=global_config,
-            workspace_directory=workspace_directory,
-        )
-    else:
-        await engine.start_workflow(
-            run_id=str(run_id),
-            layers=layers_data,
-            global_config=global_config,
-            workspace_directory=workspace_directory,
-        )
+    # 4. Start execution via LocalDAGExecutor (always task_dag mode)
+    await engine.start_task_dag(
+        run_id=str(run_id),
+        dag_json=dag_json or {},
+        global_config=global_config,
+        workspace_directory=workspace_directory,
+    )
 
     return run
 

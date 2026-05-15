@@ -441,7 +441,7 @@ interface EdgeConfigSectionProps {
   nodes: WorkflowNode[];
   updateEdgeData: (id: string, data: Partial<EdgeData>) => void;
   t: (key: string) => string;
-  mode: "auto" | "manual";
+  mode: "auto";
   onClose: () => void;
 }
 

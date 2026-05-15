@@ -71,7 +71,6 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.edgeInfo": "连线定义了节点间的数据通道：执行顺序、文件继承和上下文传递。禁用文件传递时，下游节点将获得独立 sandbox。禁用摘要注入时，下游节点不会收到上游的输出信息。",
     "config.workflowMode": "工作流模式",
     "config.modeAutoHint": "自动模式：输入目标，Planner 自动规划并构建工作流 DAG",
-    "config.modeManualHint": "手动模式：在画布上拖拽节点、连线，自定义工作流",
 
     // ─── OutputPanel ───
     "output.tab.llm": "LLM",
@@ -183,9 +182,7 @@ export const translations: Record<Locale, Record<string, string>> = {
 
     // ─── Workflow Dual Mode ───
     "workflow.modeAuto": "自动规划",
-    "workflow.modeManual": "手动工作流",
     "workflow.modeAutoDesc": "描述目标，Planner 自动构建工作流",
-    "workflow.modeManualDesc": "在画布上设计节点和连线",
     "workflow.goalLabel": "目标",
     "workflow.goalPlaceholder": "描述你想要实现的目标...",
 
@@ -327,7 +324,6 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.edgeInfo": "Edges define data channels between nodes: execution order, file inheritance, and context passing. Disabling file transfer gives the downstream node an independent sandbox. Disabling summary injection prevents the downstream from receiving upstream output.",
     "config.workflowMode": "Workflow Mode",
     "config.modeAutoHint": "Auto mode: describe your goal, Planner automatically designs and builds the workflow DAG",
-    "config.modeManualHint": "Manual mode: drag nodes and draw connections on canvas to customize your workflow",
 
     // ─── OutputPanel ───
     "output.tab.llm": "LLM",
@@ -438,9 +434,7 @@ export const translations: Record<Locale, Record<string, string>> = {
 
     // ─── Workflow Dual Mode ───
     "workflow.modeAuto": "Auto Plan",
-    "workflow.modeManual": "Manual Workflow",
     "workflow.modeAutoDesc": "Describe your goal, Planner builds the workflow",
-    "workflow.modeManualDesc": "Design nodes and connections on canvas",
     "workflow.goalLabel": "Goal",
     "workflow.goalPlaceholder": "Describe what you want to achieve...",
 

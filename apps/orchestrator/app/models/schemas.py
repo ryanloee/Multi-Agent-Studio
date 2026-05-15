@@ -27,7 +27,7 @@ class CreateWorkflowRequest(BaseModel):
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
     workspace_directory: Optional[str] = None
-    mode: Optional[str] = Field("manual", pattern="^(auto|manual)$")
+    mode: Optional[str] = Field("auto", pattern="^(auto|manual)$")
     goal: Optional[str] = None
     metadata: Optional[dict[str, Any]] = None
 
@@ -68,7 +68,7 @@ class WorkflowResponse(BaseModel):
     description: Optional[str] = None
     dag_json: Optional[dict[str, Any]] = None
     workspace_directory: Optional[str] = None
-    mode: str = "manual"
+    mode: str = "auto"
     goal: Optional[str] = None
     lifecycle_phase: str = "draft"
     blockers_json: Optional[list[dict[str, Any]]] = None
