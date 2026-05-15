@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Multi-Agent Studio is a visual AI multi-agent workflow orchestration platform. Users build DAG workflows by dragging node types (Coder, Plan, Explore, Shell, Review, Human) onto a React Flow canvas, then run them with real-time streaming output. It supports two workflow modes: **manual** (user designs the DAG on canvas) and **auto** (planner agent builds the DAG from a goal description). The monorepo has a Next.js 14 frontend, a Python FastAPI backend, and a standalone Python agent framework.
+Multi-Agent Studio is a visual AI multi-agent workflow orchestration platform. Users build DAG workflows by dragging node types (Coder, Plan, Explore, Shell, Review, Human) onto a React Flow canvas, then run them with real-time streaming output. It supports two workflow modes: **manual** (user designs the DAG on canvas) and **auto** (planner agent builds the DAG from a goal description). The monorepo has a Next.js 14 frontend, a Python FastAPI backend, and uses a vendored opencode TypeScript CLI for node execution.
 
 ## Common Commands
 
@@ -30,13 +30,6 @@ poetry run ruff check app/      # lint
 poetry run mypy app/            # type check
 ```
 
-### Agent framework (apps/agent)
-```bash
-cd apps/agent
-pip install -e ".[dev]"         # install in dev mode
-python -m pytest tests/ -v      # run tests
-```
-
 ### Dev environment (both services)
 ```bash
 # Windows
@@ -50,7 +43,6 @@ bash scripts/dev.sh
 ### Monorepo Layout
 - `apps/web/` — Next.js 14 frontend (App Router, TypeScript)
 - `apps/orchestrator/` — Python FastAPI backend (Poetry, Python 3.11+)
-- `apps/agent/` — Standalone Python agent framework (`mas_agent` package)
 - `apps/gateway/` — Go API gateway (Phase 2, not yet active)
 - `packages/shared-types/` — JSON schemas for workflow/events/node-config
 - `scripts/` — Setup and dev shell scripts (setup.sh/ps1, dev.sh/ps1)
@@ -102,13 +94,6 @@ Backend module responsibilities:
 - `app/models/db.py` — SQLAlchemy ORM models
 - `app/models/schemas.py` — Pydantic request/response schemas
 
-### Agent Framework (apps/agent)
-Standalone `mas_agent` package providing the agentic loop:
-- `mas_agent/loop.py` — Core agent loop with doom-loop detection and message compaction
-- `mas_agent/tools/` — Tool system with permission checking (allow/deny/ask)
-- `mas_agent/providers/` — Multi-provider LLM support (Anthropic, OpenAI-compatible)
-- `mas_agent/tool_registry.py` — Tool registry with agent-type-specific validation
-
 ### Event Streaming Pipeline
 Agent output → InProcessEventBus → WebSocketHub → WebSocket → Frontend renders in Monaco (llm_token), Xterm.js (shell_stdout), or tool call panels.
 
@@ -131,11 +116,11 @@ WebSocket behavior: 30-second heartbeat pings, max 500 buffered events per run f
 GitHub Actions (`main` branch pushes and PRs):
 - **Frontend** — lint, type-check, build (Node 20, pnpm)
 - **Backend** — pytest, ruff (Python 3.12, Poetry)
-- **Agent** — pytest (Python 3.12, pip)
 
 ## Development Notes
 
 - The `apps/orchestrator/app/workflows/` directory has `compiler.py` and `plan_parser.py` but the deleted files (dag_workflow.py, activities.py, worker.py) were Temporal-specific and no longer exist — the local engine in `core/local_engine.py` handles execution.
+- `apps/agent/` (mas_agent) has been removed — node execution is handled entirely by the vendored opencode TypeScript CLI via `apps/opencode-runner/run-node.ts`.
 - Similarly, `agents/`, `mcp_server/`, `memory/`, `streaming/`, and `sandbox/manager.py` are deleted (git status shows `D`) — their functionality is collapsed into the local engine/sandbox modules.
 - Ruff config: target Python 3.11, line length 100, rules E/F/I/N/W
 - pytest-asyncio mode is `auto`

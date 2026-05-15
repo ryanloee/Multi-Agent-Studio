@@ -4,7 +4,7 @@
 
 .DESCRIPTION
     1. Builds the Next.js frontend with static export (output -> apps/web/out/)
-    2. Installs Python dependencies (orchestrator + agent)
+    2. Installs Python dependencies (orchestrator)
     3. Runs PyInstaller to produce a self-contained dist/MAS-Studio/ directory
     4. Zips the result into dist/MAS-Studio-v<Version>-win64.zip
 
@@ -61,7 +61,6 @@ try {
 Write-Host "[3/4] Building executable with PyInstaller..." -ForegroundColor Yellow
 
 $webOut   = "$ProjectRoot\apps\web\out"
-$agentPkg = "$ProjectRoot\apps\agent\mas_agent"
 
 # PyInstaller must run from the repo root so relative --add-data paths resolve.
 Push-Location $ProjectRoot
@@ -69,7 +68,6 @@ try {
     pyinstaller --noconfirm --onedir `
         --name "MAS-Studio" `
         --add-data "$webOut;static" `
-        --add-data "$agentPkg;mas_agent" `
         --hidden-import uvicorn.logging `
         --hidden-import uvicorn.loops.auto `
         --hidden-import uvicorn.protocols.http.auto `
@@ -96,27 +94,6 @@ try {
         --hidden-import app.sandbox.checkpoint `
         --hidden-import app.sandbox.provision `
         --hidden-import app.ws.hub `
-        --hidden-import mas_agent `
-        --hidden-import mas_agent.loop `
-        --hidden-import mas_agent.providers `
-        --hidden-import mas_agent.providers.base `
-        --hidden-import mas_agent.providers.anthropic_provider `
-        --hidden-import mas_agent.tools `
-        --hidden-import mas_agent.tools.glob_tool `
-        --hidden-import mas_agent.tools.grep_tool `
-        --hidden-import mas_agent.tools.read_tool `
-        --hidden-import mas_agent.tools.write_tool `
-        --hidden-import mas_agent.tools.edit_tool `
-        --hidden-import mas_agent.tools.shell_tool `
-        --hidden-import mas_agent.tools.apply_patch_tool `
-        --hidden-import mas_agent.tools.output_utils `
-        --hidden-import mas_agent.prompts `
-        --hidden-import mas_agent.events `
-        --hidden-import mas_agent.permission `
-        --hidden-import mas_agent.compaction `
-        --hidden-import mas_agent.snapshot `
-        --hidden-import mas_agent.tool_repair `
-        --hidden-import mas_agent.types `
         --hidden-import aiosqlite `
         --collect-all aiosqlite `
         "apps\orchestrator\app\launcher.py"
