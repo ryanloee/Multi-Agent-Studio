@@ -44,7 +44,22 @@ _KNOWN_EVENT_TYPES = frozenset({
     "task_created", "task_updated", "task_message", "worker_escalation",
     "artifact_created", "worker_message", "planner_guidance",
     "task_blocked", "task_unblocked",
+    "idle_warning", "agent_status",
 })
+
+# Idle timeout defaults per agent type (seconds).  Override with
+# MAS_NODE_IDLE_TIMEOUT_SECONDS for the global default.
+_NODE_IDLE_TIMEOUT: dict[str, int] = {
+    "explore": 600,
+    "plan": 600,
+    "design": 600,
+    "coder": 480,
+    "shell": 300,
+    "review": 300,
+    "human": 0,  # human nodes never idle-timeout
+    "merge": 300,
+}
+_DEFAULT_IDLE_TIMEOUT = 480
 
 # Resolve repository-local runner/source paths.
 # __file__ = .../apps/orchestrator/app/core/local_engine.py
@@ -1425,10 +1440,11 @@ class LocalDAGExecutor:
             for node in runnable_nodes:
                 node_id = str(node.get("id", node.get("node_id", "")))
                 upstream_ids = self._upstream_ids_for_node(node_id, edges)
+                # P4: only block on direct upstream failures, not transitive
                 bad_upstreams = [
                     upstream_id for upstream_id in upstream_ids
                     if isinstance(layer_results.get(upstream_id), dict)
-                    and layer_results[upstream_id].get("state") != "completed"
+                    and layer_results[upstream_id].get("state") in {"failed", "blocked"}
                 ]
                 if not bad_upstreams:
                     runnable_after_dependency_check.append(node)
@@ -1499,87 +1515,114 @@ class LocalDAGExecutor:
             async def _run_one(node: dict) -> tuple[str, dict]:
                 node_id = str(node.get("id", node.get("node_id", "")))
                 agent_type = self._node_agent_type(node)
-                assigned_sid = layer_sandbox_assignments.get(node_id)
-                if assigned_sid is None and node_id in layer_clone_requests:
-                    source_sid = layer_clone_requests[node_id]
-                    try:
-                        assigned_sid = await self._sandbox.clone(
-                            source_sid,
-                            f"ws-{node_id}-{uuid4().hex[:8]}",
+                max_retries = int(
+                    (node.get("data", {}).get("retry_count") if isinstance(node.get("data"), dict) else None)
+                    or node.get("retry_count")
+                    or 1
+                )
+
+                for attempt in range(max_retries + 1):
+                    if cancel_event.is_set():
+                        return node_id, {"state": "failed", "error": "cancelled", "node_id": node_id}
+
+                    assigned_sid = layer_sandbox_assignments.get(node_id)
+                    if assigned_sid is None and node_id in layer_clone_requests:
+                        source_sid = layer_clone_requests[node_id]
+                        try:
+                            assigned_sid = await self._sandbox.clone(
+                                source_sid,
+                                f"ws-{node_id}-{uuid4().hex[:8]}",
+                            )
+                        except Exception:
+                            logger.warning("Failed to clone sandbox %s for task-layer node %s", source_sid[:12], node_id, exc_info=True)
+                            assigned_sid = None
+
+                    merge_context = ""
+                    if agent_type == "merge":
+                        prepared_sid, prepared_context = await self._prepare_merge_sandbox(
+                            run_id=run_id,
+                            node_id=node_id,
+                            workspace_directory=workspace_directory,
+                            upstream_ids=self._upstream_ids_for_node(node_id, edges),
+                            sandbox_map=sandbox_map,
+                            commit_map=commit_map,
+                            layer_results=layer_results,
                         )
-                    except Exception:
-                        logger.warning("Failed to clone sandbox %s for task-layer node %s", source_sid[:12], node_id, exc_info=True)
-                        assigned_sid = None
+                        if prepared_sid:
+                            assigned_sid = prepared_sid
+                        merge_context = prepared_context
 
-                merge_context = ""
-                if agent_type == "merge":
-                    prepared_sid, prepared_context = await self._prepare_merge_sandbox(
-                        run_id=run_id,
-                        node_id=node_id,
-                        workspace_directory=workspace_directory,
-                        upstream_ids=self._upstream_ids_for_node(node_id, edges),
-                        sandbox_map=sandbox_map,
-                        commit_map=commit_map,
-                        layer_results=layer_results,
-                    )
-                    if prepared_sid:
-                        assigned_sid = prepared_sid
-                    merge_context = prepared_context
+                    task_id = task_db_map.get(node_id)
+                    if not task_id:
+                        result = await self._execute_node(
+                            run_id, node, layer_results, global_config, cancel_event,
+                            workspace_directory=workspace_directory,
+                            sandbox_id=assigned_sid,
+                            upstream_context=self._build_upstream_context(
+                                node_id, edges, layer_results,
+                            ) + merge_context,
+                            destroy_owned_sandbox=False,
+                        )
+                    else:
+                        from app.core.task_scheduler import ManagedTask
+                        managed = ManagedTask(
+                            db_id=task_id,
+                            run_id=run_id,
+                            title=task_label_map.get(node_id, node_id),
+                            description=node.get("prompt", ""),
+                            status="pending",
+                            assigned_node_id=node_id,
+                            assigned_worker_label=task_label_map.get(node_id, node_id),
+                        )
+                        result = await self._task_scheduler.run_worker_task(
+                            worker_node=node,
+                            task=managed,
+                            global_config=global_config,
+                            cancel_event=cancel_event,
+                            db_session=True,
+                            planner_node=fallback_planner,
+                            layer_results=layer_results,
+                            workspace_directory=workspace_directory,
+                            upstream_context=self._build_upstream_context(
+                                node_id, edges, layer_results,
+                            ) + merge_context,
+                            sandbox_id=assigned_sid,
+                            destroy_owned_sandbox=False,
+                        )
 
-                task_id = task_db_map.get(node_id)
-                if not task_id:
-                    result = await self._execute_node(
-                        run_id, node, layer_results, global_config, cancel_event,
-                        workspace_directory=workspace_directory,
-                        sandbox_id=assigned_sid,
-                        upstream_context=self._build_upstream_context(
-                            node_id, edges, layer_results,
-                        ) + merge_context,
-                        destroy_owned_sandbox=False,
+                    # P3: retry on failure
+                    if result.get("state") == "failed" and attempt < max_retries:
+                        logger.info(
+                            "Node %s attempt %d/%d failed, retrying: %s",
+                            node_id, attempt + 1, max_retries + 1,
+                            result.get("error", "")[:200],
+                        )
+                        await self._emit(
+                            "status", run_id, node_id,
+                            content=f"retrying (attempt {attempt + 2}/{max_retries + 1})",
+                        )
+                        # Reset sandbox assignment for retry (fresh sandbox)
+                        layer_sandbox_assignments[node_id] = None
+                        continue
+
+                    if result.get("state") == "completed" and task_id:
+                        await self._create_artifact_for_task(
+                            run_id=run_id,
+                            workflow_id=workflow_id,
+                            task_id=task_id,
+                            node_id=node_id,
+                            agent_type=task_type_map.get(node_id, "coder"),
+                            title=task_label_map.get(node_id, node_id),
+                            result=result,
+                        )
+                    await self._emit(
+                        "child_completed", run_id, parent_node_id,
+                        child_node_id=node_id,
+                        content=f"state={result.get('state', 'unknown')}",
                     )
                     return node_id, result
 
-                from app.core.task_scheduler import ManagedTask
-                managed = ManagedTask(
-                    db_id=task_id,
-                    run_id=run_id,
-                    title=task_label_map.get(node_id, node_id),
-                    description=node.get("prompt", ""),
-                    status="pending",
-                    assigned_node_id=node_id,
-                    assigned_worker_label=task_label_map.get(node_id, node_id),
-                )
-                result = await self._task_scheduler.run_worker_task(
-                    worker_node=node,
-                    task=managed,
-                    global_config=global_config,
-                    cancel_event=cancel_event,
-                    db_session=True,
-                    planner_node=fallback_planner,
-                    layer_results=layer_results,
-                    workspace_directory=workspace_directory,
-                    upstream_context=self._build_upstream_context(
-                        node_id, edges, layer_results,
-                    ) + merge_context,
-                    sandbox_id=assigned_sid,
-                    destroy_owned_sandbox=False,
-                )
-                if result.get("state") == "completed":
-                    await self._create_artifact_for_task(
-                        run_id=run_id,
-                        workflow_id=workflow_id,
-                        task_id=task_id,
-                        node_id=node_id,
-                        agent_type=task_type_map.get(node_id, "coder"),
-                        title=task_label_map.get(node_id, node_id),
-                        result=result,
-                    )
-                await self._emit(
-                    "child_completed", run_id, parent_node_id,
-                    child_node_id=node_id,
-                    content=f"state={result.get('state', 'unknown')}",
-                )
-                return node_id, result
+                return node_id, {"state": "failed", "error": "max retries exceeded", "node_id": node_id}
 
             results = await asyncio.gather(
                 *[_run_one(node) for node in runnable_nodes],
@@ -2572,92 +2615,39 @@ class LocalDAGExecutor:
                 exec_id[:12], sandbox_id[:12],
             )
 
-            # 6. Poll until process completes
-            log_pos = 0
-            poll_count = 0
-            last_stream_activity = time.monotonic()
-            last_heartbeat = 0.0
-            idle_timeout_seconds = int(os.environ.get("MAS_NODE_IDLE_TIMEOUT_SECONDS", "240") or "240")
+            # 6. Subscribe to runner SSE for real-time events
+            # Try SSE first (run-node.ts exposes /events), fall back to file polling
+            _agent_type_for_timeout = agent_type or "coder"
+            idle_timeout_seconds = _NODE_IDLE_TIMEOUT.get(
+                _agent_type_for_timeout,
+                _DEFAULT_IDLE_TIMEOUT,
+            )
+            env_timeout = os.environ.get("MAS_NODE_IDLE_TIMEOUT_SECONDS")
+            if env_timeout:
+                idle_timeout_seconds = int(env_timeout)
             forced_failure_reason = ""
-            while not cancel_event.is_set():
-                # Read new stream content
-                new_log_pos = await self._stream_log_lines(
-                    sandbox_id, stream_file, log_pos, run_id, node_id,
+
+            sse_port = await self._read_runner_port(sandbox_id, timeout=15)
+            if sse_port:
+                forced_failure_reason = await self._consume_runner_sse(
+                    sse_port, run_id, node_id, exec_id,
+                    cancel_event, idle_timeout_seconds,
                 )
-                if new_log_pos != log_pos:
-                    last_stream_activity = time.monotonic()
-                log_pos = new_log_pos
+            else:
+                # Fallback: file polling (legacy)
+                forced_failure_reason = await self._poll_stream_file(
+                    sandbox_id, stream_file, run_id, node_id, exec_id,
+                    cancel_event, idle_timeout_seconds, _agent_type_for_timeout,
+                )
 
-                terminal_events = self._runs.get(run_id, {}).get("_node_terminal_events", {})
-                terminal_event = terminal_events.get(node_id) if isinstance(terminal_events, dict) else None
-
-                # Check if the process is still running
-                proc_info = await self._sandbox.get_process(exec_id)
-                poll_count += 1
-                if terminal_event:
-                    if proc_info.running:
-                        shim = self._sandbox._find_process(exec_id)
-                        if shim is not None:
-                            try:
-                                shim.terminate()
-                                await asyncio.wait_for(shim.wait(), timeout=2.0)
-                            except Exception:
-                                try:
-                                    shim.kill()
-                                except Exception:
-                                    pass
-                    logger.info(
-                        "Process %s finished by stream terminal event %s after %d polls",
-                        exec_id[:12], terminal_event, poll_count,
-                    )
-                    break
-                if not proc_info.running:
-                    logger.info(
-                        "Process %s finished after %d polls (exit_code=%s)",
-                        exec_id[:12], poll_count, proc_info.exit_code,
-                    )
-                    break
-
-                now = time.monotonic()
-                idle_seconds = int(now - last_stream_activity)
-                if idle_seconds >= 20 and now - last_heartbeat >= 20:
-                    await self._emit(
-                        "agent_heartbeat", run_id, node_id,
-                        content=f"节点仍在运行，等待模型或工具输出 {idle_seconds}s",
-                        idle_seconds=idle_seconds,
-                        poll_count=poll_count,
-                    )
-                    last_heartbeat = now
-
-                if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
-                    forced_failure_reason = f"node idle timeout after {idle_seconds}s without stream output"
-                    shim = self._sandbox._find_process(exec_id)
-                    if shim is not None:
-                        try:
-                            shim.terminate()
-                            await asyncio.wait_for(shim.wait(), timeout=2.0)
-                        except Exception:
-                            try:
-                                shim.kill()
-                            except Exception:
-                                pass
-                    await self._emit(
-                        "node_failed", run_id, node_id,
-                        content=forced_failure_reason,
-                    )
-                    logger.warning("Node %s idle timed out: %s", node_id, forced_failure_reason)
-                    break
-
-                await asyncio.sleep(1.0)
-
-            # Final read to capture remaining output
-            log_pos = await self._stream_log_lines(
-                sandbox_id, stream_file, log_pos, run_id, node_id,
+            # Final read to capture any remaining output from stream.jsonl
+            await self._stream_log_lines(
+                sandbox_id, stream_file, 0, run_id, node_id,
             )
 
             proc_info = await self._sandbox.get_process(exec_id)
             exit_code = proc_info.exit_code if proc_info.exit_code is not None else -1
-            logger.info("Node %s exit_code=%d, log_pos=%d", node_id, exit_code, log_pos)
+            logger.info("Node %s exit_code=%d", node_id, exit_code)
             state = "failed" if forced_failure_reason else ("completed" if exit_code == 0 else "failed")
 
             await self._emit(
@@ -2849,6 +2839,256 @@ class LocalDAGExecutor:
                 await self._emit("shell_stdout", run_id, node_id, content=line)
 
         return len(log_content)
+
+    # ------------------------------------------------------------------
+    # SSE-based real-time event subscription (replaces file polling)
+    # ------------------------------------------------------------------
+
+    async def _read_runner_port(
+        self, sandbox_id: str, timeout: int = 15,
+    ) -> int | None:
+        """Read the SSE port from runner.port file written by run-node.ts."""
+        port_file = "/workspace/.agent/runner.port"
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                content, _ = await self._sandbox.exec(
+                    sandbox_id, f"cat {port_file} 2>/dev/null || true",
+                )
+                port_str = content.strip()
+                if port_str and port_str.isdigit():
+                    port = int(port_str)
+                    logger.info("Read runner SSE port: %d", port)
+                    return port
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        logger.warning("Failed to read runner.port within %ds", timeout)
+        return None
+
+    async def _consume_runner_sse(
+        self,
+        port: int,
+        run_id: str,
+        node_id: str,
+        exec_id: str,
+        cancel_event: asyncio.Event,
+        idle_timeout_seconds: int,
+    ) -> str:
+        """Subscribe to run-node.ts SSE and process events in real-time.
+
+        Returns forced_failure_reason (empty string if no failure).
+        """
+        import httpx
+
+        url = f"http://127.0.0.1:{port}/events"
+        forced_failure_reason = ""
+        last_activity = time.monotonic()
+        idle_warnings_sent: set[int] = set()
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=None, write=5, pool=5)) as client:
+                async with client.stream("GET", url) as response:
+                    if response.status_code != 200:
+                        logger.warning("SSE connection failed: %d", response.status_code)
+                        return ""
+
+                    logger.info("SSE connected to runner on port %d for node %s", port, node_id)
+
+                    async for raw_line in response.aiter_lines():
+                        if cancel_event.is_set():
+                            break
+
+                        if not raw_line.startswith("data:"):
+                            continue
+
+                        raw_line = raw_line[5:].strip()
+                        if not raw_line:
+                            continue
+
+                        try:
+                            ev = json.loads(raw_line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        event_type = ev.get("type", "")
+
+                        # Track terminal events
+                        if event_type in {"node_completed", "node_failed"}:
+                            run_state = self._runs.get(run_id)
+                            if isinstance(run_state, dict):
+                                terminal_events = run_state.setdefault("_node_terminal_events", {})
+                                if isinstance(terminal_events, dict):
+                                    terminal_events[node_id] = event_type
+
+                        # agent_status from opencode: busy/idle/retry
+                        if event_type == "agent_status":
+                            status_type = ev.get("status_type", "")
+                            last_activity = time.monotonic()
+                            logger.debug(
+                                "Node %s agent_status=%s", node_id, status_type,
+                            )
+                            await self._emit(
+                                "agent_status", run_id, node_id,
+                                content=ev.get("content", ""),
+                                status_type=status_type,
+                            )
+                            continue
+
+                        # Emit known event types
+                        if event_type in _KNOWN_EVENT_TYPES:
+                            extra: dict[str, Any] = {
+                                "content": ev.get("content", ""),
+                                "tool_name": ev.get("tool_name", ""),
+                                "timestamp": ev.get("timestamp", 0),
+                            }
+                            if isinstance(ev.get("metadata"), dict):
+                                extra["metadata"] = ev["metadata"]
+                            await self._emit(event_type, run_id, node_id, **extra)
+                            last_activity = time.monotonic()
+                            content = ev.get("content", "")
+                            if isinstance(content, str):
+                                if "ESCALATE_TO_PLANNER:" in content:
+                                    await self._emit(
+                                        "planner_guidance", run_id, node_id,
+                                        content=content.split("ESCALATE_TO_PLANNER:", 1)[1].strip(),
+                                    )
+                                if "ASK_WORKER:" in content or "BROADCAST_TO_PEERS:" in content:
+                                    await self._emit(
+                                        "worker_message", run_id, node_id,
+                                        content=content,
+                                    )
+
+                        # Idle timeout safety net (only if no activity for a long time)
+                        idle_seconds = int(time.monotonic() - last_activity)
+                        if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
+                            forced_failure_reason = (
+                                f"node idle timeout after {idle_seconds}s "
+                                f"without SSE activity (status events stopped)"
+                            )
+                            logger.warning("Node %s SSE idle timeout: %s", node_id, forced_failure_reason)
+                            shim = self._sandbox._find_process(exec_id)
+                            if shim is not None:
+                                try:
+                                    shim.terminate()
+                                    await asyncio.wait_for(shim.wait(), timeout=2.0)
+                                except Exception:
+                                    try:
+                                        shim.kill()
+                                    except Exception:
+                                        pass
+                            break
+
+                        # Progressive warnings
+                        if idle_timeout_seconds > 0:
+                            idle_seconds_now = int(time.monotonic() - last_activity)
+                            pct = int(idle_seconds_now / idle_timeout_seconds * 100)
+                            for threshold in (50, 75, 90):
+                                if pct >= threshold and threshold not in idle_warnings_sent:
+                                    idle_warnings_sent.add(threshold)
+                                    await self._emit(
+                                        "idle_warning", run_id, node_id,
+                                        content=f"节点无活动 {idle_seconds_now}s，超过 {threshold}%",
+                                        idle_seconds=idle_seconds_now,
+                                        timeout_seconds=idle_timeout_seconds,
+                                        threshold_pct=threshold,
+                                    )
+
+        except Exception:
+            logger.warning("SSE subscription error for node %s", node_id, exc_info=True)
+
+        return forced_failure_reason
+
+    async def _poll_stream_file(
+        self,
+        sandbox_id: str,
+        stream_file: str,
+        run_id: str,
+        node_id: str,
+        exec_id: str,
+        cancel_event: asyncio.Event,
+        idle_timeout_seconds: int,
+        agent_type: str,
+    ) -> str:
+        """Legacy file-polling fallback when SSE is not available."""
+        log_pos = 0
+        poll_count = 0
+        last_stream_activity = time.monotonic()
+        last_heartbeat = 0.0
+        idle_warnings_sent: set[int] = set()
+
+        while not cancel_event.is_set():
+            new_log_pos = await self._stream_log_lines(
+                sandbox_id, stream_file, log_pos, run_id, node_id,
+            )
+            if new_log_pos != log_pos:
+                last_stream_activity = time.monotonic()
+            log_pos = new_log_pos
+
+            terminal_events = self._runs.get(run_id, {}).get("_node_terminal_events", {})
+            terminal_event = terminal_events.get(node_id) if isinstance(terminal_events, dict) else None
+
+            proc_info = await self._sandbox.get_process(exec_id)
+            poll_count += 1
+            if terminal_event:
+                if proc_info.running:
+                    shim = self._sandbox._find_process(exec_id)
+                    if shim is not None:
+                        try:
+                            shim.terminate()
+                            await asyncio.wait_for(shim.wait(), timeout=2.0)
+                        except Exception:
+                            try:
+                                shim.kill()
+                            except Exception:
+                                pass
+                break
+            if not proc_info.running:
+                break
+
+            now = time.monotonic()
+            idle_seconds = int(now - last_stream_activity)
+            if idle_seconds >= 20 and now - last_heartbeat >= 20:
+                await self._emit(
+                    "agent_heartbeat", run_id, node_id,
+                    content=f"节点仍在运行，等待模型或工具输出 {idle_seconds}s",
+                    idle_seconds=idle_seconds,
+                    poll_count=poll_count,
+                )
+                last_heartbeat = now
+                last_stream_activity = now
+
+            # Progressive warnings
+            if idle_timeout_seconds > 0:
+                pct = int(idle_seconds / idle_timeout_seconds * 100)
+                for threshold in (50, 75, 90):
+                    if pct >= threshold and threshold not in idle_warnings_sent:
+                        idle_warnings_sent.add(threshold)
+                        await self._emit(
+                            "idle_warning", run_id, node_id,
+                            content=f"节点已空闲 {idle_seconds}s，超过 {threshold}%",
+                            idle_seconds=idle_seconds,
+                            timeout_seconds=idle_timeout_seconds,
+                            threshold_pct=threshold,
+                        )
+
+            if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
+                reason = f"node idle timeout after {idle_seconds}s without stream output"
+                shim = self._sandbox._find_process(exec_id)
+                if shim is not None:
+                    try:
+                        shim.terminate()
+                        await asyncio.wait_for(shim.wait(), timeout=2.0)
+                    except Exception:
+                        try:
+                            shim.kill()
+                        except Exception:
+                            pass
+                return reason
+
+            await asyncio.sleep(1.0)
+
+        return ""
 
     async def _execute_dynamic_plan(
         self,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import path from "node:path"
-import { appendFile } from "node:fs/promises"
+import { appendFile, writeFile } from "node:fs/promises"
 import { pathToFileURL } from "node:url"
 
 type Args = Record<string, string | boolean>
@@ -61,9 +61,84 @@ function terminateChild(child: any) {
   }
 }
 
-async function appendEvent(streamFile: string, event: Record<string, unknown>) {
-  await appendFile(streamFile, JSON.stringify({ timestamp: now(), ...event }) + "\n", "utf8")
+// ---------------------------------------------------------------------------
+// SSE broadcaster — multiple subscribers, push events in real-time
+// ---------------------------------------------------------------------------
+
+type SseSubscriber = {
+  controller: ReadableStreamDefaultController
+  closed: boolean
 }
+
+const sseSubscribers = new Set<SseSubscriber>()
+
+function broadcastSse(event: Record<string, unknown>) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`
+  for (const sub of sseSubscribers) {
+    if (sub.closed) continue
+    try {
+      sub.controller.enqueue(new TextEncoder().encode(payload))
+    } catch {
+      sub.closed = true
+      sseSubscribers.delete(sub)
+    }
+  }
+}
+
+function startSseServer(): { port: number; stop: () => void } {
+  const server = Bun.serve({
+    port: 0,
+    fetch(req) {
+      const url = new URL(req.url)
+      if (url.pathname === "/events") {
+        const stream = new ReadableStream({
+          start(controller) {
+            const sub: SseSubscriber = { controller, closed: false }
+            sseSubscribers.add(sub)
+            // Send initial connected event
+            try {
+              controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify({ type: "connected" })}\n\n`))
+            } catch { /* */ }
+          },
+          cancel() {
+            // sub is captured in start closure; find and remove
+            for (const sub of sseSubscribers) {
+              if (sub.closed) {
+                sseSubscribers.delete(sub)
+              }
+            }
+          },
+        })
+        return new Response(stream, {
+          headers: {
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+          },
+        })
+      }
+      return new Response("not found", { status: 404 })
+    },
+  })
+  return { port: server.port, stop: () => server.stop() }
+}
+
+// ---------------------------------------------------------------------------
+// Dual event writer: stream.jsonl file + SSE broadcast
+// ---------------------------------------------------------------------------
+
+async function appendEvent(streamFile: string, event: Record<string, unknown>) {
+  const full = { timestamp: now(), ...event }
+  // 1. Write to stream.jsonl (backup/replay)
+  await appendFile(streamFile, JSON.stringify(full) + "\n", "utf8")
+  // 2. Broadcast to SSE subscribers (real-time)
+  broadcastSse(full)
+}
+
+// ---------------------------------------------------------------------------
+// Provider / config helpers
+// ---------------------------------------------------------------------------
 
 function npmForProvider(provider: string, baseURL: string) {
   if (provider === "anthropic") return "@ai-sdk/anthropic"
@@ -164,8 +239,27 @@ function buildConfig(input: {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Map opencode stdout JSON events → MAS event format
+// Now includes session.status (busy/idle/retry) for accurate state detection
+// ---------------------------------------------------------------------------
+
 function mapOpencodeEvent(raw: any): Record<string, unknown> | undefined {
   const part = raw?.part
+
+  // session.status — the key event for knowing model state
+  if (raw?.type === "session.status" || raw?.type === "session_status") {
+    const status = raw?.status ?? raw?.properties?.status
+    if (status) {
+      return {
+        type: "agent_status",
+        content: `session status: ${status.type}`,
+        status_type: status.type, // "busy" | "idle" | "retry"
+        metadata: { source: "opencode", status, sessionID: raw?.sessionID },
+      }
+    }
+  }
+
   if (raw?.type === "text" && typeof part?.text === "string") {
     return {
       type: "llm_chunk",
@@ -207,212 +301,9 @@ function mapOpencodeEvent(raw: any): Record<string, unknown> | undefined {
   return undefined
 }
 
-async function appendResponseParts(streamFile: string, response: any) {
-  const parts = Array.isArray(response?.parts) ? response.parts : []
-  for (const part of parts) {
-    if (part?.type === "reasoning" && typeof part.text === "string" && part.text.trim()) {
-      await appendEvent(streamFile, {
-        type: "llm_chunk",
-        content: part.text,
-        metadata: { source: "opencode", kind: "reasoning", part_id: part.id },
-      })
-      continue
-    }
-    if (part?.type === "text" && typeof part.text === "string" && part.text.trim()) {
-      await appendEvent(streamFile, {
-        type: "llm_chunk",
-        content: part.text,
-        metadata: { source: "opencode", part_id: part.id },
-      })
-      continue
-    }
-    if (part?.type === "tool") {
-      await appendEvent(streamFile, {
-        type: part.state?.status === "error" ? "tool_result" : "tool_call",
-        tool_name: String(part.tool || "tool"),
-        content: clip(JSON.stringify(part, null, 2), 8000),
-        metadata: { source: "opencode", part_id: part.id, status: part.state?.status },
-      })
-      continue
-    }
-    if (part?.type === "step-finish") {
-      await appendEvent(streamFile, {
-        type: "status",
-        content: "step_finish",
-        metadata: { source: "opencode", part },
-      })
-    }
-  }
-}
-
-function responseHasOutput(response: any) {
-  const parts = Array.isArray(response?.parts) ? response.parts : []
-  const hasContent = parts.some((part) => {
-    if (part?.type === "text" || part?.type === "reasoning") return Boolean(String(part.text || "").trim())
-    if (part?.type === "tool") return true
-    return false
-  })
-  const tokens = response?.info?.tokens ?? {}
-  const total =
-    Number(tokens.total || 0) +
-    Number(tokens.input || 0) +
-    Number(tokens.output || 0) +
-    Number(tokens.reasoning || 0) +
-    Number(tokens.cache?.write || 0) +
-    Number(tokens.cache?.read || 0)
-  return hasContent || total > 0
-}
-
-async function streamOpencodeEvents(input: {
-  client: any
-  app: any
-  workspace: string
-  streamFile: string
-  sessionID: string
-}) {
-  const eventURL = `http://opencode.internal/event?directory=${encodeURIComponent(input.workspace)}`
-  const response = await input.app.fetch(new Request(eventURL, { headers: { accept: "text/event-stream" } }))
-  if (!response.ok || !response.body) {
-    throw new Error(`opencode event stream failed: ${response.status} ${response.statusText}`)
-  }
-  const partTypes = new Map<string, string>()
-  const partLengths = new Map<string, number>()
-  let hasOutput = false
-  let errorText = ""
-
-  const decoder = new TextDecoder()
-  let buffer = ""
-  async function handleEventPayload(payload: string) {
-    if (!payload.trim()) return false
-    let event: any
-    try {
-      event = JSON.parse(payload)
-    } catch {
-      return false
-    }
-    const type = event?.type
-    const properties = event?.properties ?? {}
-
-    if (type === "message.part.delta" && properties.sessionID === input.sessionID) {
-      const delta = String(properties.delta || "")
-      if (!delta) return false
-      const partID = String(properties.partID || "")
-      const partType = partTypes.get(partID) || ""
-      await appendEvent(input.streamFile, {
-        type: "llm_chunk",
-        content: delta,
-        metadata: {
-          source: "opencode",
-          kind: partType === "reasoning" ? "reasoning" : undefined,
-          part_id: partID,
-          field: properties.field,
-          streaming: true,
-        },
-      })
-      hasOutput = true
-      partLengths.set(partID, (partLengths.get(partID) || 0) + delta.length)
-      return false
-    }
-
-    if (type === "message.part.updated") {
-      const part = properties.part
-      if (!part || part.sessionID !== input.sessionID) return false
-      if (part.id && part.type) partTypes.set(String(part.id), String(part.type))
-
-      if ((part.type === "text" || part.type === "reasoning") && typeof part.text === "string") {
-        const already = partLengths.get(String(part.id)) || 0
-        const next = part.text.slice(already)
-        if (next.trim()) {
-          await appendEvent(input.streamFile, {
-            type: "llm_chunk",
-            content: next,
-            metadata: {
-              source: "opencode",
-              kind: part.type === "reasoning" ? "reasoning" : undefined,
-              part_id: part.id,
-              streaming: true,
-            },
-          })
-          hasOutput = true
-          partLengths.set(String(part.id), part.text.length)
-        }
-        return false
-      }
-
-      if (part.type === "tool") {
-        await appendEvent(input.streamFile, {
-          type: part.state?.status === "error" ? "tool_result" : "tool_call",
-          tool_name: String(part.tool || "tool"),
-          content: clip(JSON.stringify(part, null, 2), 8000),
-          metadata: { source: "opencode", part_id: part.id, status: part.state?.status, streaming: true },
-        })
-        hasOutput = true
-        return false
-      }
-
-      if (part.type === "step-start" || part.type === "step-finish") {
-        await appendEvent(input.streamFile, {
-          type: "status",
-          content: part.type === "step-start" ? "step_start" : "step_finish",
-          metadata: { source: "opencode", part },
-        })
-      }
-      return false
-    }
-
-    if (type === "permission.asked" && properties.sessionID === input.sessionID) {
-      await appendEvent(input.streamFile, {
-        type: "status",
-        content: `permission requested: ${properties.permission || "unknown"}`,
-        metadata: { source: "opencode", permission_id: properties.id, patterns: properties.patterns || [] },
-      })
-      await input.client.postSessionIdPermissionsPermissionId({
-        path: { id: input.sessionID, permissionID: properties.id },
-        body: { response: "once" },
-      })
-      return false
-    }
-
-    if (type === "session.error" && properties.sessionID === input.sessionID) {
-      const err = properties.error
-      errorText = err?.data?.message ? String(err.data.message) : clip(JSON.stringify(err ?? properties, null, 2), 8000)
-      await appendEvent(input.streamFile, {
-        type: "error",
-        content: errorText,
-        metadata: { source: "opencode" },
-      })
-      return false
-    }
-
-    if (type === "session.status" && properties.sessionID === input.sessionID && properties.status?.type === "idle") {
-      return true
-    }
-    if (type === "session.idle" && properties.sessionID === input.sessionID) {
-      return true
-    }
-    return false
-  }
-
-  for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk, { stream: true })
-    while (true) {
-      const split = buffer.indexOf("\n\n")
-      if (split < 0) break
-      const rawEvent = buffer.slice(0, split)
-      buffer = buffer.slice(split + 2)
-      const dataLines = rawEvent
-        .split(/\r?\n/)
-        .filter((line) => line.startsWith("data:"))
-        .map((line) => line.slice(5).trimStart())
-      if (!dataLines.length) continue
-      if (await handleEventPayload(dataLines.join("\n"))) {
-        return { hasOutput, errorText }
-      }
-    }
-  }
-
-  return { hasOutput, errorText }
-}
+// ---------------------------------------------------------------------------
+// Utility: consume line stream
+// ---------------------------------------------------------------------------
 
 async function consumeLines(
   stream: ReadableStream<Uint8Array> | null,
@@ -434,6 +325,10 @@ async function consumeLines(
   buffer += decoder.decode()
   if (buffer.trim()) await onLine(buffer)
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 async function main() {
   const args = parseArgs(Bun.argv.slice(2))
@@ -459,7 +354,13 @@ async function main() {
 
   await Bun.$`mkdir -p ${streamDir}`.quiet()
   await Bun.write(streamFile, "")
-  await appendEvent(streamFile, { type: "node_started", run_id: runID, node_id: nodeID, content: "opencode runner started" })
+
+  // Start SSE server for real-time event streaming to Python backend
+  const sse = startSseServer()
+  const portFile = path.join(streamDir, "runner.port")
+  await Bun.write(portFile, String(sse.port))
+
+  await appendEvent(streamFile, { type: "node_started", run_id: runID, node_id: nodeID, content: "opencode runner started", sse_port: sse.port })
 
   const vendoredRoot = path.resolve(import.meta.dir, "vendor/opencode")
   const opencodeEntry =
@@ -549,6 +450,16 @@ async function main() {
         }
         await appendEvent(streamFile, mapped)
       }
+      // Also forward session.status events that mapOpencodeEvent may not catch
+      // opencode --format json outputs: { type: "session.status", sessionID, status: {type} }
+      if (raw?.type === "session.status" && raw?.status) {
+        await appendEvent(streamFile, {
+          type: "agent_status",
+          content: `session status: ${raw.status.type}`,
+          status_type: raw.status.type,
+          metadata: { source: "opencode", status: raw.status, sessionID: raw.sessionID },
+        })
+      }
       if (raw?.type === "step_finish") {
         const reason = String(raw?.part?.reason || "")
         if (reason && reason !== "tool-calls") {
@@ -575,6 +486,7 @@ async function main() {
       content: `opencode source runner timed out after ${timeoutMs}ms`,
       metadata: { source: "opencode-runner", exit_code: exitCode, timeout_ms: timeoutMs },
     })
+    sse.stop()
     process.exit(124)
   }
 
@@ -584,6 +496,7 @@ async function main() {
       content: `opencode source runner failed with exit_code=${exitCode}`,
       metadata: { source: "opencode-runner", exit_code: exitCode },
     })
+    sse.stop()
     process.exit(exitCode || 1)
   }
 
@@ -598,6 +511,7 @@ async function main() {
       content: "opencode source runner produced no output",
       metadata: { source: "opencode-runner" },
     })
+    sse.stop()
     process.exit(1)
   }
   await appendEvent(streamFile, {
@@ -605,6 +519,9 @@ async function main() {
     content: "opencode source runner completed",
     metadata: { source: "opencode" },
   })
+  // Give SSE subscribers a moment to receive the final events
+  await new Promise((r) => setTimeout(r, 200))
+  sse.stop()
   process.exit(0)
 }
 

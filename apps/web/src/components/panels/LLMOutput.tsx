@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef } from "react";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import MarkdownMessage from "@/components/common/MarkdownMessage";
-import type { AgentHeartbeatEvent, LLMTokenEvent, LLMChunkEvent, PermissionRequestEvent, ToolCallEvent, ToolResultEvent } from "@/types/events";
+import type { AgentHeartbeatEvent, AgentStatusEvent, LLMTokenEvent, LLMChunkEvent, PermissionRequestEvent, ToolCallEvent, ToolResultEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -43,10 +43,11 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
   const events = useMemo(
     () =>
       allEvents.filter(
-        (e): e is LLMTokenEvent | LLMChunkEvent | ToolCallEvent | ToolResultEvent | AgentHeartbeatEvent | PermissionRequestEvent =>
+        (e): e is LLMTokenEvent | LLMChunkEvent | ToolCallEvent | ToolResultEvent | AgentHeartbeatEvent | AgentStatusEvent | PermissionRequestEvent =>
           (e.type === "llm_token" || e.type === "llm_chunk" ||
            e.type === "tool_call" || e.type === "tool_result" ||
-           e.type === "agent_heartbeat" || e.type === "permission_request") &&
+           e.type === "agent_heartbeat" || e.type === "agent_status" ||
+           e.type === "permission_request") &&
           (nodeId === "" || e.node_id === nodeId)
       ),
     [allEvents, nodeId]
@@ -123,6 +124,17 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
         }
         const heartbeat = ev as AgentHeartbeatEvent;
         blocks.push(`> 系统进度：${heartbeat.content}`);
+      } else if (ev.type === "agent_status") {
+        flushAssistant();
+        if (inThinking) {
+          flushThinking();
+          inThinking = false;
+        }
+        const status = ev as AgentStatusEvent;
+        const label = status.status_type === "busy" ? "⏳ 模型思考中" :
+                      status.status_type === "retry" ? "🔄 重试中" :
+                      status.status_type === "idle" ? "✅ 完成" : status.status_type;
+        blocks.push(`> ${label}`);
       } else if (ev.type === "permission_request") {
         flushAssistant();
         if (inThinking) {

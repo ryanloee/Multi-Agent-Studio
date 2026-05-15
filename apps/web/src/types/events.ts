@@ -30,6 +30,8 @@ export type StreamEventType =
   | "artifact_created"
   | "progress_summary"
   | "agent_heartbeat"
+  | "agent_status"
+  | "idle_warning"
   | "permission_request"
   | "ping";
 
@@ -123,6 +125,22 @@ export interface AgentHeartbeatEvent extends StreamEvent {
   content: string;
   idle_seconds?: number;
   poll_count?: number;
+}
+
+/** Real-time agent status from opencode (busy/idle/retry) */
+export interface AgentStatusEvent extends StreamEvent {
+  type: "agent_status";
+  content: string;
+  status_type: "busy" | "idle" | "retry" | string;
+}
+
+/** Progressive idle warning before timeout */
+export interface IdleWarningEvent extends StreamEvent {
+  type: "idle_warning";
+  content: string;
+  idle_seconds?: number;
+  timeout_seconds?: number;
+  threshold_pct?: number;
 }
 
 /** Tool permission request. Usually avoided in autonomous runs. */
@@ -240,5 +258,7 @@ export interface StreamEventMap {
   artifact_created: ArtifactCreatedEvent;
   progress_summary: ProgressSummaryEvent;
   agent_heartbeat: AgentHeartbeatEvent;
+  agent_status: AgentStatusEvent;
+  idle_warning: IdleWarningEvent;
   permission_request: PermissionRequestEvent;
 }
