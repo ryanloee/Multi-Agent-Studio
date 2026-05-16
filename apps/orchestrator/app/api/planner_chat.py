@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 import asyncio
 from datetime import datetime, timezone
@@ -55,6 +56,8 @@ class PlannerChatRequest(BaseModel):
     node_id: str = Field(default="planner", description="Target node ID (planner or other node)")
     thinking_level: str = Field(default="medium", pattern="^(off|low|medium|high)$")
     alignment_max_attempts: int = Field(default=3, ge=1, le=10)
+    model_provider: str = Field(default="", description="Model provider format (openai or anthropic)")
+    model_id: str = Field(default="", description="Specific model ID to use")
     history: list[ChatMessage] = Field(default_factory=list)
 
 
@@ -117,11 +120,14 @@ async def _call_llm_stream(
     tools: list[dict] | None = None,
     tool_choice_mode: str = "force_first",
     max_tokens: int = 4096,
+    model_provider: str = "",
+    model_id_override: str = "",
 ):
     """Call the configured LLM and yield stream events.
 
     Reads model configuration from user settings (data/settings.json) first,
     then falls back to models.json and environment variables.
+    If model_provider and model_id_override are provided, use those instead.
     """
     import os
     from pathlib import Path
@@ -129,23 +135,45 @@ async def _call_llm_stream(
     provider_url = ""
     provider_key = ""
     model_id = ""
-
-    # 1. Try user settings first
-    settings_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "settings.json"
     fmt = "anthropic"  # default format
-    try:
-        settings_data = json.loads(settings_path.read_text(encoding="utf-8"))
-        settings_models = settings_data.get("models", [])
-        if isinstance(settings_models, list) and settings_models:
-            # Use the first configured model
-            first = settings_models[0]
-            if isinstance(first, dict) and first.get("base_url") and first.get("api_key"):
-                provider_url = first["base_url"].rstrip("/")
-                provider_key = first["api_key"]
-                model_id = first.get("default_model", "")
-                fmt = first.get("format", "openai")
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        pass
+
+    # 0. If specific model is requested, find it in settings
+    if model_provider and model_id_override:
+        settings_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "settings.json"
+        try:
+            settings_data = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings_models = settings_data.get("models", [])
+            if isinstance(settings_models, list):
+                for m in settings_models:
+                    if isinstance(m, dict):
+                        m_fmt = m.get("format", "")
+                        m_model = m.get("default_model", "") or m.get("name", "")
+                        if m_fmt == model_provider and m_model == model_id_override:
+                            if m.get("base_url") and m.get("api_key"):
+                                provider_url = m["base_url"].rstrip("/")
+                                provider_key = m["api_key"]
+                                model_id = m_model
+                                fmt = m_fmt
+                                break
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
+
+    # 1. Try user settings first (if not already found)
+    if not provider_url or not provider_key:
+        settings_path = Path(__file__).resolve().parent.parent.parent.parent / "data" / "settings.json"
+        try:
+            settings_data = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings_models = settings_data.get("models", [])
+            if isinstance(settings_models, list) and settings_models:
+                # Use the first configured model
+                first = settings_models[0]
+                if isinstance(first, dict) and first.get("base_url") and first.get("api_key"):
+                    provider_url = first["base_url"].rstrip("/")
+                    provider_key = first["api_key"]
+                    model_id = first.get("default_model", "")
+                    fmt = first.get("format", "openai")
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            pass
 
     # 2. Fallback to models.json
     if not provider_url or not provider_key:
@@ -493,6 +521,189 @@ def _planner_alignment_tools() -> list[dict]:
             },
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# New simplified planner: LLM outputs task list, compiler builds DAG
+# ---------------------------------------------------------------------------
+
+PLANNER_TASK_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
+
+一次性输出一个 `planner-tasks` fenced JSON 代码块，不要在代码块外输出其他结构化数据。你可以在代码块前写一段简短的自然语言说明。
+
+```planner-tasks
+{
+  "reply": "给用户看的中文规划说明。",
+  "task_object": {
+    "title": "任务标题",
+    "objective": "任务目标",
+    "background": "背景",
+    "constraints": ["约束"],
+    "success_criteria": ["验收标准"]
+  },
+  "project_summary": {
+    "project_type": "项目类型",
+    "tech_stack": ["技术栈"],
+    "startup": ["启动方式"],
+    "build": ["构建方式"],
+    "tests": ["测试方式"],
+    "key_directories": ["关键目录"],
+    "risk_points": ["风险点"]
+  },
+  "shared_doc": "# 项目规划\\n\\nMarkdown 项目文档",
+  "tasks": [
+    {
+      "id": "explore_requirements",
+      "type": "explore",
+      "label": "需求探索",
+      "prompt": "目标：...\\n具体要求：...\\n产出格式：...\\n验收标准：...",
+      "depends_on": [],
+      "target_files": ["path/to/file.py"],
+      "interface_contract": "GET /api/todos -> [{id, title, done}]",
+      "context_summary": "项目使用 FastAPI + SQLAlchemy"
+    },
+    {
+      "id": "design_architecture",
+      "type": "design",
+      "label": "架构设计",
+      "prompt": "...",
+      "depends_on": ["explore_requirements"]
+    },
+    {
+      "id": "implement_feature_a",
+      "type": "coder",
+      "label": "实现功能 A",
+      "prompt": "...",
+      "depends_on": ["design_architecture"]
+    },
+    {
+      "id": "implement_feature_b",
+      "type": "coder",
+      "label": "实现功能 B",
+      "prompt": "...",
+      "depends_on": ["design_architecture"]
+    }
+  ]
+}
+```
+
+硬性规则：
+- 任务类型只允许 explore / design / coder / merge / review / shell。
+- 不要生成 human/人工节点，不要生成顶级 plan/planner 节点。
+- 每个任务必须有：id（唯一 snake_case）、type、label、prompt、depends_on（任务 id 列表）。
+- 不要生成 edges 数组、坐标、React Flow 字段——边由 depends_on 自动推导。
+- 两个及以上并行 coder 后必须有 merge 任务。
+- 关键 coder/merge 结果后必须有 review 任务。
+- 末尾必须有 shell/test 验证任务。
+- 不确定第三方服务时，用 design 任务给下游 coder 明确方案。
+- target_files 路径必须来自项目文件结构中的实际路径。
+- prompt 必须可执行：目标、上下文、具体要求、产出格式、验收标准。
+- task_object 和 project_summary 为可选字段，不输出时系统自动填充默认值。
+"""
+
+
+def _extract_task_plan(text: str, fallback_goal: str) -> dict | None:
+    """Extract the planner-tasks JSON from LLM output.
+
+    Tries fenced ``planner-tasks`` blocks first, then raw JSON.
+    Returns None if no valid task plan found.
+    """
+    import json
+
+    # Strategy 1: fenced planner-tasks / planner_tasks / json block
+    for match in re.finditer(
+        r"```(?:planner-tasks|planner_tasks|json)\s*\n(.*?)```",
+        text,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        payload = match.group(1).strip()
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if _is_valid_task_plan(data):
+            return _normalize_task_plan(data, fallback_goal)
+
+    # Strategy 2: raw JSON object (largest brace-enclosed block)
+    first = text.find("{")
+    last = text.rfind("}")
+    if first != -1 and last > first:
+        try:
+            data = json.loads(text[first : last + 1])
+            if _is_valid_task_plan(data):
+                return _normalize_task_plan(data, fallback_goal)
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def _is_valid_task_plan(data: dict) -> bool:
+    """Check if a parsed JSON object looks like a valid task plan."""
+    if not isinstance(data, dict):
+        return False
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) == 0:
+        return False
+    return any(
+        isinstance(t, dict) and t.get("id") and t.get("type") and t.get("prompt")
+        for t in tasks
+    )
+
+
+def _normalize_task_plan(data: dict, fallback_goal: str) -> dict:
+    """Ensure the task plan has all required fields with defaults."""
+    result = dict(data)
+    if not result.get("reply"):
+        result["reply"] = fallback_goal
+    if not isinstance(result.get("tasks"), list):
+        result["tasks"] = []
+    # Normalize task_object
+    task_obj = result.get("task_object")
+    if not isinstance(task_obj, dict):
+        result["task_object"] = {
+            "title": fallback_goal,
+            "objective": fallback_goal,
+        }
+    elif not task_obj.get("title"):
+        task_obj["title"] = fallback_goal
+    return result
+
+
+def _build_minimal_task_plan(goal: str) -> dict:
+    """Build a minimal task plan as fallback when LLM output cannot be parsed."""
+    slug = "".join(ch.lower() if ch.isalnum() else "_" for ch in (goal or "task")).strip("_") or "task"
+    slug = "_".join(part for part in slug.split("_") if part)[:36] or "task"
+    return {
+        "reply": f"无法解析模型输出，已生成最小可执行任务规划：{goal}",
+        "task_object": {"title": goal, "objective": goal},
+        "tasks": [
+            {
+                "id": f"explore_{slug}",
+                "type": "explore",
+                "label": "梳理需求与现状",
+                "prompt": (
+                    f"目标：围绕「{goal}」梳理需求与当前上下文。\n"
+                    "具体要求：总结关键范围、前置依赖、潜在风险和推荐切入点。\n"
+                    "产出格式：research_note。\n"
+                    "验收标准：给出明确的实施边界和后续编码输入。"
+                ),
+                "depends_on": [],
+            },
+            {
+                "id": f"coder_{slug}",
+                "type": "coder",
+                "label": "实现核心功能",
+                "prompt": (
+                    f"目标：实现「{goal}」的核心功能。\n"
+                    "具体要求：基于探索结果，实现主要功能模块。\n"
+                    "产出格式：file_change。\n"
+                    "验收标准：功能可运行，代码通过 lint。"
+                ),
+                "depends_on": [f"explore_{slug}"],
+            },
+        ],
+    }
 
 
 def _tool_input(tool_calls: list[dict], name: str) -> dict | None:
@@ -2124,39 +2335,43 @@ async def planner_chat(
                 await db.rollback()
                 logger.warning("Failed to save planner draft checkpoint (%s): %s", reason, exc)
 
-        yield _sse({"type": "planner_status", "message": "Planner 请求已发送，正在生成规划大纲节点。"})
-        draft_state["current_stage"] = "plan_outline"
-        yield _sse({"type": "planner_stage_status", "stage": "plan_outline", "message": "正在生成规划大纲节点"})
+        # =====================================================================
+        # STAGE 1: generate_tasks — LLM outputs semantic task list (1 LLM call)
+        # =====================================================================
+        yield _sse({"type": "planner_status", "message": "Planner 请求已发送，正在生成任务规划。"})
+        draft_state["current_stage"] = "generate_tasks"
+        yield _sse({"type": "planner_stage_status", "stage": "generate_tasks", "message": "正在生成任务规划"})
         yield _sse({
             "type": "planner_observable_progress",
-            "stage": "plan_outline",
+            "stage": "generate_tasks",
             "status": "started",
             "attempt": 1,
             "received_fields": [],
-            "missing_fields": ["planner_outline"],
-            "next_action": "模型先输出大纲节点；系统解析成草稿 DAG 后，再让模型检查是否对齐。",
+            "missing_fields": ["task_plan"],
+            "next_action": "模型输出任务列表；系统编译成 DAG 后直接更新画布。",
             "draft_state": _draft_state_ui_payload(draft_state),
         })
 
-        outline_messages: list[dict] = _recent_messages(messages, limit=4)
-        outline_messages.append({
+        task_messages: list[dict] = _recent_messages(messages, limit=4)
+        task_messages.append({
             "role": "user",
             "content": (
-                "请先输出规划大纲节点，不要输出完整 planner-spec JSON。\n"
-                "大纲必须覆盖所有功能模块，并包含 planner-outline 代码块。\n\n"
+                "请输出完整的任务规划，包含 planner-tasks JSON 代码块。\n\n"
                 f"## 用户最新需求\n{body.message}\n\n"
                 f"## 工作流目标\n{workflow_goal}\n\n"
                 f"## 当前结构化草稿摘要\n{json.dumps(_draft_state_ui_payload(draft_state), ensure_ascii=False, indent=2)}"
             ),
         })
-        outline_parts: list[str] = []
+        task_parts: list[str] = []
         async for event in _call_llm_stream(
-            outline_messages,
-            PLANNER_OUTLINE_SYSTEM,
+            task_messages,
+            PLANNER_TASK_SYSTEM,
             body.thinking_level,
             tools=None,
             tool_choice_mode="auto",
-            max_tokens=6000,
+            max_tokens=10000,
+            model_provider=body.model_provider,
+            model_id_override=body.model_id,
         ):
             event_type = event.get("type")
             chunk = str(event.get("content") or "")
@@ -2167,508 +2382,126 @@ async def planner_chat(
                 yield _sse({"type": "thinking_delta", "content": chunk})
                 continue
             if event_type == "text":
-                outline_parts.append(chunk)
+                task_parts.append(chunk)
 
-        outline_response = "".join(outline_parts)
-        outline_dag = _extract_outline_dag(outline_response, workflow_goal, workflow_goal)
-        if outline_dag:
-            draft_state["dag"] = outline_dag
-            draft_state["system_generated_dag"] = True
-            yield _sse({"type": "dag_update", "dag": outline_dag, "draft": True})
-            await _persist_draft_checkpoint(outline_dag, "outline_parse")
+        raw_response = "".join(task_parts)
+        task_plan = _extract_task_plan(raw_response, workflow_goal)
+
+        # Single retry on parse failure
+        if not task_plan:
             yield _sse({
                 "type": "planner_observable_progress",
-                "stage": "plan_outline",
-                "status": "completed",
-                "attempt": 1,
-                "received_fields": ["planner_outline", "dag"],
-                "missing_fields": [],
-                "next_action": f"系统已从大纲解析出 {len(outline_dag.get('nodes') or [])} 个草稿节点，开始让模型检查是否对齐。",
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-        else:
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "plan_outline",
+                "stage": "generate_tasks",
                 "status": "retrying",
-                "attempt": 1,
-                "received_fields": ["planner_outline"],
-                "missing_fields": ["parseable_outline_dag"],
-                "next_action": "大纲节点解析失败，后续完整 JSON 阶段将强制模型修正。",
+                "attempt": 2,
+                "received_fields": ["raw_response"],
+                "missing_fields": ["parseable_task_plan"],
+                "next_action": "任务列表解析失败，正在重试并要求模型修正格式。",
                 "draft_state": _draft_state_ui_payload(draft_state),
             })
-
-        if outline_dag:
-            yield _sse({"type": "planner_stage_status", "stage": "fill_dag", "message": "正在让模型检查大纲 DAG 是否对齐"})
-            outline_alignment_messages = [{
+            retry_messages = list(task_messages)
+            retry_messages.append({"role": "assistant", "content": raw_response})
+            retry_messages.append({
                 "role": "user",
                 "content": (
-                    "请检查“规划大纲”和“系统解析出的当前 DAG”是否一一对齐。\n"
-                    "如果缺少节点、阶段、merge/review/shell，请调用 planner_alignment_check，aligned=false，"
-                    "并在 corrected_dag 中返回完整修正 DAG。\n"
-                    "如果已经对齐，调用 planner_alignment_check，aligned=true，message 必须包含 CONFIRMED_DAG_ALIGNED。\n\n"
-                    f"## 规划大纲\n{outline_response}\n\n"
-                    f"## 当前 DAG\n```json\n{json.dumps(outline_dag, ensure_ascii=False, indent=2)}\n```"
+                    "你上次输出的 JSON 无法解析。请严格按照 planner-tasks 格式重新输出。\n"
+                    "注意：必须包含 tasks 数组，每个任务必须有 id、type、prompt、depends_on 字段。"
                 ),
-            }]
-            outline_tool_calls: list[dict] = []
-            try:
-                async with asyncio.timeout(60):
-                    async for event in _call_llm_stream(
-                        outline_alignment_messages,
-                        "你是 Planner 大纲 DAG 对齐审查器。必须调用工具，不要输出普通正文。",
-                        body.thinking_level,
-                        tools=_planner_alignment_tools(),
-                        tool_choice_mode="force_first",
-                        max_tokens=8000,
-                    ):
-                        if event.get("type") == "thinking":
-                            yield _sse({"type": "thinking_delta", "content": str(event.get("content") or "")})
-                        elif event.get("type") == "tool_call":
-                            outline_tool_calls.append(event)
-                            yield _sse({
-                                "type": "planner_tool_call",
-                                "name": event.get("name"),
-                                "id": event.get("id", ""),
-                                "input_keys": sorted((event.get("input") or {}).keys()) if isinstance(event.get("input"), dict) else [],
-                            })
-            except TimeoutError:
-                yield _sse({
-                    "type": "planner_observable_progress",
-                    "stage": "fill_dag",
-                    "status": "retrying",
-                    "attempt": 1,
-                    "received_fields": ["outline_alignment_timeout"],
-                    "missing_fields": [],
-                    "next_action": "大纲 DAG 模型检查超时，继续进入完整 JSON 阶段。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-            outline_alignment = _tool_input(outline_tool_calls, "planner_alignment_check") or {}
-            corrected_outline_dag = outline_alignment.get("corrected_dag") if isinstance(outline_alignment.get("corrected_dag"), dict) else None
-            outline_current_count = len((draft_state.get("dag") or outline_dag or {}).get("nodes") or [])
-            outline_corrected_count = len((corrected_outline_dag or {}).get("nodes") or [])
-            outline_alignment_text = _alignment_visible_summary(
-                "大纲 DAG 二次确认",
-                outline_alignment,
-                outline_current_count,
-                outline_corrected_count,
-            )
-            yield _sse({"type": "text", "content": outline_alignment_text})
-            if corrected_outline_dag:
-                draft_state["dag"] = _normalize_dag(corrected_outline_dag)
-                draft_state["system_generated_dag"] = True
-                yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
-                await _persist_draft_checkpoint(draft_state["dag"], "outline_alignment")
-            yield _sse({
-                "type": "planner_stage_result",
-                "stage": "fill_dag",
-                "status": "completed" if outline_alignment.get("aligned") else "retrying",
-                "attempt": 1,
-                "applied_fields": ["outline_alignment_check"],
-                "summary": outline_alignment_text,
-                "alignment": {
-                    "aligned": bool(outline_alignment.get("aligned")),
-                    "message": str(outline_alignment.get("message") or ""),
-                    "missing_items": [str(item) for item in (outline_alignment.get("missing_items") or [])],
-                    "current_node_count": outline_current_count,
-                    "corrected_node_count": outline_corrected_count,
-                },
-                "draft_state": _draft_state_ui_payload(draft_state),
             })
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "fill_dag",
-                "status": "completed" if outline_alignment.get("aligned") else "retrying",
-                "attempt": 1,
-                "received_fields": ["outline_alignment_check"],
-                "missing_fields": [str(item) for item in (outline_alignment.get("missing_items") or [])],
-                "next_action": str(outline_alignment.get("message") or "大纲 DAG 检查完成，进入完整 JSON 生成。"),
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-
-        yield _sse({"type": "planner_stage_status", "stage": "fill_task_context", "message": "正在基于已检查大纲生成完整 planner-spec JSON"})
-        spec_messages: list[dict] = _recent_messages(messages, limit=4)
-        spec_messages.append({
-            "role": "user",
-            "content": (
-                "请根据当前用户需求、模型大纲、系统解析 DAG 和大纲检查结果，输出一个完整 planner-spec JSON。\n"
-                "不要使用增量工具，不要让系统猜节点，不要只输出自然语言规划。\n"
-                "DAG 必须完整覆盖 reply 中声明的所有阶段和节点数量，并尽量沿用已检查大纲中的节点 id。\n\n"
-                f"## 用户最新需求\n{body.message}\n\n"
-                f"## 工作流目标\n{workflow_goal}\n\n"
-                f"## 模型规划大纲\n{outline_response}\n\n"
-                f"## 系统解析并经检查的大纲 DAG\n```json\n{json.dumps(draft_state.get('dag') or {}, ensure_ascii=False, indent=2)}\n```\n\n"
-                f"## 当前结构化草稿摘要\n{json.dumps(_draft_state_ui_payload(draft_state), ensure_ascii=False, indent=2)}"
-            ),
-        })
-        raw_response = ""
-        planner_spec = None
-        last_spec_output = ""
-        for spec_attempt in range(2):
-            if spec_attempt > 0:
-                yield _sse({
-                    "type": "planner_observable_progress",
-                    "stage": "plan_outline",
-                    "status": "retrying",
-                    "attempt": spec_attempt + 1,
-                    "received_fields": [],
-                    "missing_fields": ["valid_planner_spec"],
-                    "next_action": "标准规格解析失败，正在要求模型只修复 JSON 格式，不重新规划。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-                spec_messages = [{
-                    "role": "user",
-                    "content": (
-                        "上一次输出没有被系统解析成合法 planner-spec。"
-                        "请只修复为一个合法 fenced `planner-spec` JSON 块，不要改变规划语义，不要输出其他正文。\n\n"
-                        f"## 用户需求\n{body.message}\n\n"
-                        f"## 上一次输出\n{last_spec_output}"
-                    ),
-                }]
-
-            raw_response_parts: list[str] = []
+            retry_parts: list[str] = []
             async for event in _call_llm_stream(
-                spec_messages,
-                PLANNER_SPEC_SYSTEM,
+                retry_messages,
+                PLANNER_TASK_SYSTEM,
                 body.thinking_level,
                 tools=None,
                 tool_choice_mode="auto",
-                max_tokens=12000,
+                max_tokens=10000,
+                model_provider=body.model_provider,
+                model_id_override=body.model_id,
             ):
-                event_type = event.get("type")
-                chunk = str(event.get("content") or "")
-                if event_type == "status":
-                    yield _sse({"type": "planner_status", "message": chunk})
-                    continue
-                if event_type == "thinking":
-                    yield _sse({"type": "thinking_delta", "content": chunk})
-                    continue
-                if event_type == "text":
-                    raw_response_parts.append(chunk)
+                if event.get("type") == "text":
+                    retry_parts.append(str(event.get("content") or ""))
+                elif event.get("type") == "thinking":
+                    yield _sse({"type": "thinking_delta", "content": str(event.get("content") or "")})
+            retry_response = "".join(retry_parts)
+            task_plan = _extract_task_plan(retry_response, workflow_goal)
+            if task_plan:
+                raw_response = retry_response
 
-            raw_response = "".join(raw_response_parts)
-            last_spec_output = raw_response
-            planner_spec = _extract_planner_spec(raw_response, workflow_goal)
-            if planner_spec:
-                break
+        if not task_plan:
+            task_plan = _build_minimal_task_plan(workflow_goal)
 
-        if planner_spec:
-            existing_planner_dag = draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else None
-            spec_dag = planner_spec.get("dag") if isinstance(planner_spec.get("dag"), dict) else None
-            draft_state["current_stage"] = "fill_task_context"
-            draft_state["outline_reply"] = planner_spec.get("reply") or workflow_goal
-            draft_state["observable_trace"] = planner_spec.get("observable_trace") or draft_state.get("observable_trace") or []
-            draft_state["task_object"] = planner_spec.get("task_object")
-            draft_state["project_summary"] = planner_spec.get("project_summary")
-            draft_state["shared_doc"] = planner_spec.get("shared_doc")
-            if existing_planner_dag and spec_dag and not _same_node_id_set(existing_planner_dag, spec_dag):
-                draft_state["dag"] = existing_planner_dag
-                draft_state["task_board"] = None
-                yield _sse({
-                    "type": "planner_observable_progress",
-                    "stage": "fill_dag",
-                    "status": "checking",
-                    "attempt": 1,
-                    "received_fields": ["planner_spec", "locked_outline_dag"],
-                    "missing_fields": [],
-                    "next_action": "标准规格 DAG 的节点 ID 与初始大纲不一致，已锁定初始大纲节点，不允许后续重写画布。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-            elif existing_planner_dag and spec_dag:
-                draft_state["dag"] = _merge_dag_node_details(existing_planner_dag, spec_dag)
-                draft_state["task_board"] = None
-            else:
-                draft_state["dag"] = spec_dag
-                draft_state["task_board"] = planner_spec.get("task_board")
-            draft_state["action"] = planner_spec.get("action")
-            draft_state["system_generated_dag"] = False
-            stage_history.append({
-                "stage": "plan_outline",
-                "status": "completed",
-                "attempt": 1,
-                "summary": "parsed planner-spec",
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            })
-            yield _sse({
-                "type": "planner_stage_result",
-                "stage": "plan_outline",
-                "status": "completed",
-                "attempt": 1,
-                "applied_fields": ["reply", "task_object", "project_summary", "shared_doc", "dag", "task_board", "action"],
-                "summary": f"已解析标准 planner-spec：{len((draft_state.get('dag') or {}).get('nodes') or [])} 个节点。",
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-            yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
-            await _persist_draft_checkpoint(draft_state["dag"], "planner_spec")
-            yield _sse({
-                "type": "planner_ui_update",
-                "ui_state": {
-                    "task_object": draft_state.get("task_object"),
-                    "project_summary": draft_state.get("project_summary"),
-                    "shared_doc": draft_state.get("shared_doc"),
-                    "task_board": draft_state.get("task_board"),
-                },
-                "draft": True,
-            })
-        else:
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "plan_outline",
-                "status": "retrying",
-                "attempt": 2,
-                "received_fields": [],
-                "missing_fields": ["valid_planner_spec"],
-                "next_action": "标准规格修复仍失败，改用文本 DAG 解析兜底。",
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-            await _persist_draft_checkpoint(draft_state["dag"], "text_parse")
+        reply = task_plan.get("reply") or workflow_goal
+        draft_state["outline_reply"] = reply
+        draft_state["task_object"] = _normalize_task_object(task_plan.get("task_object"), workflow_goal, reply)
+        draft_state["project_summary"] = _normalize_project_summary(task_plan.get("project_summary"))
+        draft_state["shared_doc"] = task_plan.get("shared_doc") or _default_shared_doc(draft_state.get("task_object"), reply)
+        draft_state["observable_trace"] = ["识别目标", "拆解任务", "编译 DAG"]
 
-        reply = str(draft_state.get("outline_reply") or workflow_goal).strip()
-        complete_plan_text = "\n".join(part for part in [outline_response, reply, raw_response] if part.strip())
-        fallback_parse_text = (
-            "\n".join(part for part in [outline_response, reply] if part.strip())
-            if planner_spec
-            else complete_plan_text
-        )
-        parsed_candidates = [
-            _extract_dag_from_any_text(fallback_parse_text),
-            _build_dag_from_planned_ids(fallback_parse_text, workflow_goal, workflow_goal),
-            _build_outline_based_dag(fallback_parse_text, workflow_goal, workflow_goal),
-        ]
-        parsed_dag = max(
-            (candidate for candidate in parsed_candidates if candidate),
-            key=lambda candidate: len((candidate or {}).get("nodes") or []),
-            default=None,
-        )
-        current_dag = draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else None
-        current_node_count = len((current_dag or {}).get("nodes") or [])
-        parsed_node_count = len((parsed_dag or {}).get("nodes") or [])
-        declared_node_count = _declared_outline_node_count(fallback_parse_text)
-        expected_min_nodes = _expected_min_node_count(fallback_parse_text, current_node_count)
-        if parsed_dag and (
-            current_node_count == 0
-            or (not planner_spec and (
-                parsed_node_count > current_node_count
-                or (expected_min_nodes and current_node_count < expected_min_nodes)
-            ))
-        ):
-            draft_state["dag"] = parsed_dag
-            draft_state["system_generated_dag"] = True
-            current_node_count = parsed_node_count
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "fill_dag",
-                "status": "completed",
-                "attempt": 1,
-                "received_fields": ["dag"],
-                "missing_fields": [],
-                "next_action": f"已从完整规划文本解析 DAG：{parsed_node_count} 个节点。",
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-
-        if not isinstance(draft_state.get("dag"), dict) or not (draft_state.get("dag") or {}).get("nodes"):
-            draft_state["dag"] = _build_minimal_planner_dag(workflow_goal, workflow_goal)
-            draft_state["system_generated_dag"] = True
-
-        static_aligned, static_missing = _dag_passes_static_alignment(
-            draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else None,
-            fallback_parse_text,
-        )
-        if static_aligned:
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "fill_dag",
-                "status": "checking",
-                "attempt": 0,
-                "received_fields": ["dag", "server_static_alignment"],
-                "missing_fields": [],
-                "next_action": "服务端静态校验已通过，仍会让模型做一次最终对齐检查。",
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-        elif static_missing:
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "fill_dag",
-                "status": "retrying",
-                "attempt": 0,
-                "received_fields": ["dag", "server_static_alignment"],
-                "missing_fields": static_missing,
-                "next_action": "服务端静态校验发现缺项，进入最多受限次数的模型修正。",
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-
-        final_alignment_attempts = 1 if (planner_spec or static_aligned) else alignment_max_attempts
-        final_alignment_confirmed = False
-        locked_final_dag = draft_state.get("dag") if planner_spec and isinstance(draft_state.get("dag"), dict) else None
-        for align_attempt in range(final_alignment_attempts):
-            dag_for_check = draft_state.get("dag") if isinstance(draft_state.get("dag"), dict) else {"nodes": [], "edges": []}
-            node_count_for_check = len(dag_for_check.get("nodes") or [])
-            expected_min_nodes = _expected_min_node_count(fallback_parse_text, node_count_for_check)
-            yield _sse({
-                "type": "planner_stage_status",
-                "stage": "fill_dag",
-                "message": f"正在让模型对齐检查完整 JSON DAG（第 {align_attempt + 1}/{final_alignment_attempts} 次）",
-            })
-            alignment_messages = [{
-                "role": "user",
-                "content": (
-                    "请检查“完整规划说明”和“当前 DAG”是否一一对齐。\n"
-                    f"完整规划中可识别的最小节点数是 {expected_min_nodes}。当前 DAG 只有 {node_count_for_check} 个节点时，不能判定 aligned=true。\n"
-                    "如果当前 DAG 缺少规划中的节点、阶段、merge/review/shell，请调用 planner_alignment_check，aligned=false，"
-                    "并在 corrected_dag 中返回完整修正 DAG。\n"
-                    "如果已经对齐，调用 planner_alignment_check，aligned=true，message 必须包含 CONFIRMED_DAG_ALIGNED。\n"
-                    "除非 aligned=true，否则不要停止；corrected_dag 必须是完整 DAG，不是差异补丁。\n\n"
-                    f"## 规划中显式节点 ID\n{json.dumps(_extract_planned_node_ids(complete_plan_text), ensure_ascii=False)}\n\n"
-                    f"## 完整规划说明\n{fallback_parse_text}\n\n"
-                    f"## 当前 DAG\n```json\n{json.dumps(dag_for_check, ensure_ascii=False, indent=2)}\n```"
-                ),
-            }]
-            alignment_tool_calls: list[dict] = []
-            try:
-                async with asyncio.timeout(60):
-                    async for event in _call_llm_stream(
-                        alignment_messages,
-                        "你是 Planner DAG 对齐审查器。只检查当前 DAG 是否完整覆盖原规划，不要输出普通正文，必须调用工具。",
-                        body.thinking_level,
-                        tools=_planner_alignment_tools(),
-                        tool_choice_mode="force_first",
-                        max_tokens=12000,
-                    ):
-                        event_type = event.get("type")
-                        if event_type == "thinking":
-                            yield _sse({"type": "thinking_delta", "content": str(event.get("content") or "")})
-                        elif event_type == "tool_call":
-                            alignment_tool_calls.append(event)
-                            yield _sse({
-                                "type": "planner_tool_call",
-                                "name": event.get("name"),
-                                "id": event.get("id", ""),
-                                "input_keys": sorted((event.get("input") or {}).keys()) if isinstance(event.get("input"), dict) else [],
-                            })
-            except TimeoutError:
-                yield _sse({
-                    "type": "planner_observable_progress",
-                    "stage": "fill_dag",
-                    "status": "retrying",
-                    "attempt": align_attempt + 1,
-                    "received_fields": [],
-                    "missing_fields": ["alignment_model_timeout"],
-                    "next_action": "DAG 对齐模型检查超时，本次确认跳过并进入服务端修复。",
-                    "draft_state": _draft_state_ui_payload(draft_state),
-                })
-                break
-            alignment = _tool_input(alignment_tool_calls, "planner_alignment_check") or {}
-            corrected_dag = alignment.get("corrected_dag") if isinstance(alignment.get("corrected_dag"), dict) else None
-            corrected_count = len((corrected_dag or {}).get("nodes") or [])
-            missing_items = alignment.get("missing_items") if isinstance(alignment.get("missing_items"), list) else []
-            alignment_text = _alignment_visible_summary(
-                f"完整 DAG 二次确认（第 {align_attempt + 1}/{final_alignment_attempts} 次）",
-                alignment,
-                node_count_for_check,
-                corrected_count,
-            )
-            yield _sse({"type": "text", "content": alignment_text})
-            if locked_final_dag and corrected_dag:
-                missing_items.append("planner_spec 已锁定 DAG，最终对齐阶段只记录模型意见，不再应用 corrected_dag。")
-            elif corrected_dag and corrected_count >= max(node_count_for_check, expected_min_nodes):
-                draft_state["dag"] = _normalize_dag(corrected_dag)
-                draft_state["system_generated_dag"] = True
-                yield _sse({"type": "dag_update", "dag": draft_state["dag"], "draft": True})
-                await _persist_draft_checkpoint(draft_state["dag"], f"alignment_{align_attempt + 1}")
-            elif corrected_dag and corrected_count < expected_min_nodes:
-                missing_items.append(f"corrected_dag 节点数 {corrected_count} 小于规划最小节点数 {expected_min_nodes}")
-            yield _sse({
-                "type": "planner_observable_progress",
-                "stage": "fill_dag",
-                "status": "completed" if alignment.get("aligned") else "retrying",
-                "attempt": align_attempt + 1,
-                "received_fields": ["alignment_check"],
-                "missing_fields": [str(item) for item in missing_items],
-                "next_action": str(alignment.get("message") or "DAG 对齐检查完成。"),
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-            yield _sse({
-                "type": "planner_stage_result",
-                "stage": "fill_dag",
-                "status": "completed" if alignment.get("aligned") else "retrying",
-                "attempt": align_attempt + 1,
-                "applied_fields": ["alignment_check"],
-                "summary": alignment_text,
-                "alignment": {
-                    "aligned": bool(alignment.get("aligned")),
-                    "message": str(alignment.get("message") or ""),
-                    "missing_items": [str(item) for item in missing_items],
-                    "current_node_count": node_count_for_check,
-                    "corrected_node_count": corrected_count,
-                },
-                "draft_state": _draft_state_ui_payload(draft_state),
-            })
-            if alignment.get("aligned") and (
-                planner_spec
-                or len((draft_state.get("dag") or {}).get("nodes") or []) >= expected_min_nodes
-            ):
-                final_alignment_confirmed = True
-                break
-
-        if locked_final_dag:
-            draft_state["dag"] = locked_final_dag
-
-        assistant_visible_response = ""
-        trace = draft_state.get("observable_trace") if isinstance(draft_state.get("observable_trace"), list) else []
-        if trace:
-            assistant_visible_response += "```observe\n" + "\n".join(f"- {line}" for line in trace if line) + "\n```\n"
-        if reply:
-            assistant_visible_response += f"```reply\n{reply}\n```"
-            yield _sse({"type": "text", "content": assistant_visible_response})
-
-        yield _sse({"type": "planner_stage_status", "stage": "fill_task_board", "message": "正在校验并修复 DAG"})
-        title = str((draft_state.get("task_object") or {}).get("title") or workflow_goal)
-        objective = str((draft_state.get("task_object") or {}).get("objective") or workflow_goal)
-        repair_should_complete = not planner_spec and not final_alignment_confirmed
-        repaired_dag, repair_blockers = _repair_planner_dag(
-            draft_state["dag"],
-            fallback_parse_text,
-            title,
-            objective,
-            auto_complete_missing_structure=repair_should_complete,
-        )
-        if locked_final_dag:
-            locked_repaired_dag, repair_blockers = _repair_planner_dag(
-                locked_final_dag,
-                fallback_parse_text,
-                title,
-                objective,
-                auto_complete_missing_structure=False,
-            )
-            if not _same_node_id_set(locked_final_dag, locked_repaired_dag):
-                locked_repaired_dag = _normalize_dag(locked_final_dag)
-            draft_state["dag"] = locked_repaired_dag
-            repaired_dag = locked_repaired_dag
-        else:
-            draft_state["dag"] = repaired_dag
-        draft_state["blockers"] = repair_blockers
-        draft_state["task_object"] = _normalize_task_object(draft_state.get("task_object"), workflow_goal, reply)
-        draft_state["project_summary"] = _normalize_project_summary(draft_state.get("project_summary"))
-        draft_state["shared_doc"] = draft_state.get("shared_doc") or _default_shared_doc(draft_state.get("task_object"), reply)
-        draft_state["current_stage"] = "fill_task_board"
-        draft_state["task_board"] = _build_task_board_from_dag(repaired_dag)
-        yield _sse({"type": "dag_update", "dag": repaired_dag, "draft": True})
+        yield _sse({"type": "text", "content": f"```reply\n{reply}\n```"})
         yield _sse({
             "type": "planner_stage_result",
-            "stage": "fill_task_board",
+            "stage": "generate_tasks",
             "status": "completed",
             "attempt": 1,
-            "applied_fields": ["task_board", "task_object", "project_summary", "shared_doc"],
-            "summary": "已从 DAG 派生面板与项目文档。",
+            "applied_fields": ["task_plan", "task_object", "project_summary", "shared_doc"],
+            "summary": f"已解析任务列表：{len(task_plan.get('tasks') or [])} 个任务。",
             "draft_state": _draft_state_ui_payload(draft_state),
         })
 
+        # =====================================================================
+        # STAGE 2: compile_dag — deterministic compiler converts tasks → DAG
+        # =====================================================================
+        yield _sse({"type": "planner_stage_status", "stage": "compile_dag", "message": "正在编译任务列表为 DAG"})
+        from app.workflows.task_compiler import compile_task_list_to_dag
+
+        tasks_list = task_plan.get("tasks") or []
+        title = str((draft_state.get("task_object") or {}).get("title") or workflow_goal)
+        objective = str((draft_state.get("task_object") or {}).get("objective") or workflow_goal)
+
+        compiled_dag, compile_blockers = compile_task_list_to_dag(tasks_list, title, objective)
+
+        # Normalize with existing function for model assignments
+        dag = _normalize_dag(compiled_dag)
+        draft_state["dag"] = dag
+        draft_state["system_generated_dag"] = True
+        draft_state["blockers"] = compile_blockers
+        draft_state["current_stage"] = "compile_dag"
+        draft_state["task_board"] = _build_task_board_from_dag(dag)
+
+        yield _sse({"type": "dag_update", "dag": dag, "draft": True})
+        await _persist_draft_checkpoint(dag, "task_compile")
+        yield _sse({
+            "type": "planner_observable_progress",
+            "stage": "compile_dag",
+            "status": "completed",
+            "attempt": 1,
+            "received_fields": ["tasks", "dag"],
+            "missing_fields": [],
+            "next_action": f"已从 {len(tasks_list)} 个任务编译出 {len(dag.get('nodes') or [])} 个 DAG 节点。",
+            "draft_state": _draft_state_ui_payload(draft_state),
+        })
+        yield _sse({
+            "type": "planner_stage_result",
+            "stage": "compile_dag",
+            "status": "completed",
+            "attempt": 1,
+            "applied_fields": ["dag", "task_board"],
+            "summary": f"已编译 DAG：{len(dag.get('nodes') or [])} 节点，{len(dag.get('edges') or [])} 条边。",
+            "draft_state": _draft_state_ui_payload(draft_state),
+        })
+
+        # =====================================================================
+        # STAGE 3: finalize — determine action, persist, emit events
+        # =====================================================================
+        # (old pipeline stages removed — task_compiler handles DAG generation)
+        assistant_visible_response = f"```reply\n{reply}\n```"
         requested_run = any(token in body.message for token in ("运行", "执行", "开始", "run", "start"))
-        if repair_blockers:
+        if compile_blockers:
             draft_state["action"] = _normalize_action({
                 "action": "report_blocker",
-                "message": "系统无法把当前规划修复为可执行 DAG。",
-                "blockers": repair_blockers,
+                "message": "系统无法把当前规划编译为可执行 DAG。",
+                "blockers": compile_blockers,
             }, default_action="report_blocker")
         elif not isinstance(draft_state.get("action"), dict):
             draft_state["action"] = _normalize_action({

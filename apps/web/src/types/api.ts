@@ -142,7 +142,10 @@ export type PlannerStage =
   | "fill_task_context"
   | "fill_dag"
   | "fill_task_board"
-  | "finalize_ready";
+  | "finalize_ready"
+  | "generate_tasks"
+  | "compile_dag"
+  | "finalize";
 
 export interface PlannerStageHistoryItem {
   stage: PlannerStage;

@@ -9,20 +9,43 @@
   },
   "models": [
     {
-      "id": "model_1778427756854_1",
-      "name": "mimo-v2.5-pro",
+      "id": "model_1778926730220_3",
+      "name": "glm-5.1",
       "format": "anthropic",
-      "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
-      "api_key": "tp-cirgolhviac2hnnqvdsxoj5xdndt0my7ye8jf4601qkvvkml",
-      "default_model": "mimo-v2.5-pro"
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "api_key": "f23a26bbc1c54d65bde85e54fa22b224.O8dR3Sr09bhWw0LI",
+      "default_model": "glm-5.1",
+      "context_window": 200000,
+      "max_output_tokens": 128000
     },
     {
-      "id": "model_1778427763343_2",
-      "name": "mimo-v2.5",
+      "id": "model_1778926742270_4",
+      "name": "glm-4.7",
       "format": "anthropic",
-      "base_url": "https://token-plan-cn.xiaomimimo.com/anthropic",
-      "api_key": "tp-cirgolhviac2hnnqvdsxoj5xdndt0my7ye8jf4601qkvvkml",
-      "default_model": "mimo-v2.5"
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "api_key": "f23a26bbc1c54d65bde85e54fa22b224.O8dR3Sr09bhWw0LI",
+      "default_model": "glm-4.7",
+      "context_window": 200000,
+      "max_output_tokens": 128000
+    },
+    {
+      "id": "model_1778926751264_5",
+      "name": "glm-5",
+      "format": "anthropic",
+      "base_url": "https://open.bigmodel.cn/api/anthropic",
+      "api_key": "f23a26bbc1c54d65bde85e54fa22b224.O8dR3Sr09bhWw0LI",
+      "default_model": "glm-5",
+      "context_window": 200000,
+      "max_output_tokens": 128000
     }
-  ]
+  ],
+  "model_strategy": {
+    "planner": "",
+    "design": "",
+    "review": "",
+    "merge": "",
+    "explore": "",
+    "coder": "",
+    "shell": ""
+  }
 }

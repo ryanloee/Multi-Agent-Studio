@@ -9,6 +9,7 @@ export interface PlannerChatMessage {
 
 interface PlannerChatState {
   selectedNodeId: string;
+  selectedModelId: string;
   conversationKey: string;
   messages: PlannerChatMessage[];
   input: string;
@@ -36,6 +37,7 @@ interface PlannerChatState {
   stageHistory: PlannerStageHistoryItem[];
   draftStructuredState: PlannerDraftStructuredState | null;
   setSelectedNodeId: (nodeId: string) => void;
+  setSelectedModelId: (modelId: string) => void;
   setConversationKey: (key: string) => void;
   setMessages: (messages: PlannerChatMessage[] | ((prev: PlannerChatMessage[]) => PlannerChatMessage[])) => void;
   setInput: (input: string) => void;
@@ -61,6 +63,7 @@ interface PlannerChatState {
 
 export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
   selectedNodeId: "planner",
+  selectedModelId: "",
   conversationKey: "",
   messages: [],
   input: "",
@@ -89,6 +92,7 @@ export const usePlannerChatStore = create<PlannerChatState>((set, get) => ({
   draftStructuredState: null,
 
   setSelectedNodeId: (selectedNodeId) => set({ selectedNodeId }),
+  setSelectedModelId: (selectedModelId) => set({ selectedModelId }),
   setConversationKey: (conversationKey) => set({ conversationKey }),
   setMessages: (messages) => set((state) => ({
     messages: typeof messages === "function" ? messages(state.messages) : messages,

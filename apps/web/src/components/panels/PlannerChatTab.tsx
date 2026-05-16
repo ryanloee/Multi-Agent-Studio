@@ -5,6 +5,7 @@ import { Send, Loader2, MessageCircle, Brain, Square } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { usePlannerChatStore } from "@/stores/plannerChatStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { api } from "@/lib/api";
 import { authHeaders } from "@/lib/auth";
 import { parsePlannerObservableContent } from "@/lib/plannerObservable";
@@ -18,6 +19,9 @@ const STAGE_LABELS: Record<PlannerStage, string> = {
   fill_dag: "DAG",
   fill_task_board: "Task Board",
   finalize_ready: "Ready Check",
+  generate_tasks: "Generating Plan",
+  compile_dag: "Compiling DAG",
+  finalize: "Finalizing",
 };
 
 function plannerChatUrl(): string {
@@ -41,6 +45,7 @@ export default function PlannerChatTab() {
   const currentWorkflowId = useWorkflowStore((s) => s.currentWorkflowId);
   const nodes = useWorkflowStore((s) => s.nodes);
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
+  const applyPlannerDagPreview = useWorkflowStore((s) => s.applyPlannerDagPreview);
   const setLifecyclePhase = useWorkflowStore((s) => s.setLifecyclePhase);
   const setBlockers = useWorkflowStore((s) => s.setBlockers);
   const setProjectSummary = useWorkflowStore((s) => s.setProjectSummary);
@@ -52,8 +57,10 @@ export default function PlannerChatTab() {
   const clearPlannerDraftState = useWorkflowStore((s) => s.clearPlannerDraftState);
 
   const selectedNodeId = usePlannerChatStore((s) => s.selectedNodeId);
+  const selectedModelId = usePlannerChatStore((s) => s.selectedModelId);
   const conversationKey = usePlannerChatStore((s) => s.conversationKey);
   const setSelectedNodeId = usePlannerChatStore((s) => s.setSelectedNodeId);
+  const setSelectedModelId = usePlannerChatStore((s) => s.setSelectedModelId);
   const setConversationKey = usePlannerChatStore((s) => s.setConversationKey);
   const messages = usePlannerChatStore((s) => s.messages);
   const setMessages = usePlannerChatStore((s) => s.setMessages);
@@ -102,6 +109,10 @@ export default function PlannerChatTab() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const liveThinkingRef = useRef<HTMLDivElement>(null);
   const liveReplyRef = useRef<HTMLDivElement>(null);
+
+  // Get models from settings store
+  const models = useSettingsStore((s) => s.settings.models);
+  const loadSettings = useSettingsStore((s) => s.loadFromServer);
 
   // Build node options for the selector
   const nodeOptions = (() => {
@@ -163,6 +174,13 @@ export default function PlannerChatTab() {
     setMessages,
   ]);
 
+  // Load models from settings if empty
+  useEffect(() => {
+    if (models.length === 0) {
+      void loadSettings();
+    }
+  }, [models.length, loadSettings]);
+
   // Auto-scroll
   useEffect(() => {
     if (scrollRef.current) {
@@ -203,6 +221,11 @@ export default function PlannerChatTab() {
     beginStream(controller);
     clearPlannerDraftState();
 
+    // Parse selected model to get provider and model_id
+    const modelParts = selectedModelId.split("/", 2);
+    const modelProvider = modelParts.length > 1 ? modelParts[0] : "";
+    const modelId = modelParts.length > 1 ? modelParts[1] : selectedModelId;
+
     try {
       const response = await fetch(
         plannerChatUrl(),
@@ -215,6 +238,8 @@ export default function PlannerChatTab() {
             node_id: selectedNodeId,
             thinking_level: thinkingLevel,
             alignment_max_attempts: alignmentMaxAttempts,
+            model_provider: modelProvider,
+            model_id: modelId,
             history: [],  // Backend loads from DB, no need to send history
           }),
           signal: controller.signal,
@@ -388,7 +413,9 @@ export default function PlannerChatTab() {
                 }
                 return updated;
               });
-              if (!event.draft && currentWorkflowId) {
+              if (event.draft && event.dag) {
+                applyPlannerDagPreview(event.dag);
+              } else if (!event.draft && currentWorkflowId) {
                 const updated = await api.getWorkflow(currentWorkflowId);
                 loadWorkflow(updated);
               }
@@ -439,6 +466,7 @@ export default function PlannerChatTab() {
     currentWorkflowId,
     streaming,
     selectedNodeId,
+    selectedModelId,
     thinkingLevel,
     beginStream,
     finishStream,
@@ -447,6 +475,7 @@ export default function PlannerChatTab() {
     recordStreamEvent,
     recordPlannerToolCall,
     loadWorkflow,
+    applyPlannerDagPreview,
     setLifecyclePhase,
     setBlockers,
     setProjectSummary,
@@ -475,6 +504,26 @@ export default function PlannerChatTab() {
   // Find the display name for the selected node
   const selectedLabel = nodeOptions.find((o) => o.id === selectedNodeId)?.label || selectedNodeId;
 
+  // Build model options grouped by provider
+  const modelOptions = (() => {
+    const grouped: Record<string, { label: string; models: typeof models }> = {};
+    const providerOrder: string[] = [];
+
+    for (const model of models) {
+      const providerKey = `${model.format}:${model.base_url}`;
+      if (!grouped[providerKey]) {
+        grouped[providerKey] = {
+          label: `${model.format.toUpperCase()} - ${model.base_url.replace(/^https?:\/\//, "").split("/")[0]}`,
+          models: [],
+        };
+        providerOrder.push(providerKey);
+      }
+      grouped[providerKey].models.push(model);
+    }
+
+    return { grouped, providerOrder };
+  })();
+
   return (
     <div className="flex flex-col h-full">
       {/* Node selector + header */}
@@ -490,6 +539,28 @@ export default function PlannerChatTab() {
               {opt.label}
             </option>
           ))}
+        </select>
+        <select
+          value={selectedModelId}
+          onChange={(e) => setSelectedModelId(e.target.value)}
+          disabled={streaming}
+          className="text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400 max-w-[180px]"
+          title="选择模型"
+        >
+          <option value="">默认模型</option>
+          {modelOptions.providerOrder.map((providerKey) => {
+            const group = modelOptions.grouped[providerKey];
+            if (!group || group.models.length === 0) return null;
+            return (
+              <optgroup key={providerKey} label={group.label}>
+                {group.models.map((m) => (
+                  <option key={m.id} value={`${m.format}/${m.default_model || m.name}`}>
+                    {m.name || m.default_model}
+                  </option>
+                ))}
+              </optgroup>
+            );
+          })}
         </select>
         <span className="text-[10px] text-gray-400 truncate">
           {messages.length > 0 ? `${messages.length} messages` : t("planner.inputHint")}
