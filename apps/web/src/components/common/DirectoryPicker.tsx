@@ -230,14 +230,14 @@ export default function DirectoryPicker({
             <div className="flex items-center gap-2 px-4 py-3 border-b border-gray-100">
               <FolderSearch size={16} className="text-blue-500" />
               <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold text-gray-800">选择工作目录</div>
+                <div className="text-sm font-semibold text-gray-800">{t("dirPicker.title")}</div>
                 <div className="text-xs text-gray-500 truncate font-mono">{browserPath || "~"}</div>
               </div>
               <button
                 type="button"
                 onClick={() => setBrowserOpen(false)}
                 className="p-1 rounded hover:bg-gray-100 text-gray-500"
-                aria-label="关闭"
+                aria-label={t("dirPicker.close")}
               >
                 <X size={16} />
               </button>
@@ -272,7 +272,7 @@ export default function DirectoryPicker({
               ))}
               {browserEntries.length === 0 && !browsing && (
                 <div className="px-3 py-6 text-center text-xs text-gray-400">
-                  没有可进入的子目录
+                  {t("dirPicker.noSubdirs")}
                 </div>
               )}
             </div>
@@ -284,7 +284,7 @@ export default function DirectoryPicker({
                 disabled={browsing || !browserPath}
                 className="px-3 py-1.5 rounded border border-gray-200 bg-white text-xs text-gray-600 hover:bg-gray-100 disabled:opacity-50"
               >
-                {browsing ? "读取中..." : "刷新"}
+                {browsing ? t("dirPicker.loading") : t("dirPicker.refresh")}
               </button>
               <div className="flex-1" />
               <button
@@ -292,7 +292,7 @@ export default function DirectoryPicker({
                 onClick={() => setBrowserOpen(false)}
                 className="px-3 py-1.5 rounded border border-gray-200 bg-white text-xs text-gray-600 hover:bg-gray-100"
               >
-                取消
+                {t("dirPicker.cancel")}
               </button>
               <button
                 type="button"
@@ -300,7 +300,7 @@ export default function DirectoryPicker({
                 disabled={!browserPath}
                 className="px-3 py-1.5 rounded bg-blue-600 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
               >
-                选择此目录
+                {t("dirPicker.selectDir")}
               </button>
             </div>
           </div>

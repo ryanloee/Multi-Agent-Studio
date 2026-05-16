@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import platform
 import shlex
 import shutil
@@ -314,15 +315,14 @@ class LocalSandbox:
         )
 
     async def sync_back(self, sandbox_id: str, target_dir: str) -> bool:
-        """Sync changes from the sandbox back to *target_dir* using git diff/apply.
+        """Sync sandbox workspace changes back to *target_dir*.
 
-        Computes ``git diff HEAD`` inside the sandbox workspace, then applies
-        that patch to *target_dir*.  Returns ``True`` on success, ``False`` on
-        failure (or if there is nothing to sync).
+        Strategy: compare files by mtime/size and copy changed/new files directly.
+        Skips MAS-internal directories (.mas, .agent, .workflow, .git, sandbox-meta).
+        Falls back to full copy if comparison fails.
         """
         state = self._state(sandbox_id)
         workspace = state.workspace_dir
-        shell = self._shell_prefix()
 
         # Debounce: skip if synced recently
         now = time.monotonic()
@@ -336,63 +336,22 @@ class LocalSandbox:
                 f"Cannot sync_back: sandbox workspace does not exist: {workspace}"
             )
 
-        # 1. Compute diff inside the sandbox
-        #    "git add -A" stages new untracked files so they appear in the diff.
-        #    "git diff --cached HEAD" then captures ALL changes (modified + new).
-        def _get_diff() -> str:
-            subprocess.run(
-                [*shell, "git add -A -f"],
-                cwd=str(workspace),
-                capture_output=True,
-            )
-            result = subprocess.run(
-                [*shell, "git diff --cached HEAD"],
-                cwd=str(workspace),
-                capture_output=True,
-            )
-            return result.stdout.decode("utf-8", errors="replace")
-
-        diff_text = await asyncio.to_thread(_get_diff)
-        if not diff_text.strip():
-            logger.info("sync_back: no diff for sandbox %s, nothing to sync", sandbox_id)
-            return True
-
-        # 2. Write diff to a temp file
-        import tempfile
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".patch", delete=False, prefix="sync_back_",
-        ) as tmp:
-            tmp.write(diff_text)
-            tmp_path = tmp.name
+        target = Path(target_dir)
+        target.mkdir(parents=True, exist_ok=True)
 
         try:
-            # 3. Apply the patch in the target directory
-            posix_tmp = self._to_posix(Path(tmp_path))
-
-            def _apply_patch() -> int:
-                result = subprocess.run(
-                    [*shell, f"git apply {shlex.quote(posix_tmp)}"],
-                    cwd=str(target_dir),
-                    capture_output=True,
-                )
-                return result.returncode
-
-            rc = await asyncio.to_thread(_apply_patch)
-            if rc == 0:
-                logger.info("sync_back: applied patch to %s", target_dir)
-                _last_sync_back[sandbox_id] = time.monotonic()
-                return True
-            else:
-                logger.warning("sync_back: git apply failed (rc=%d) for %s", rc, target_dir)
-                try:
-                    await asyncio.to_thread(_copy_workspace_fallback, workspace, Path(target_dir))
-                    logger.info("sync_back: copied workspace files to %s via fallback", target_dir)
-                    return True
-                except Exception as exc:
-                    logger.error("sync_back: fallback copy also failed for %s: %s", target_dir, exc)
-                    return False
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
+            copied, skipped = await asyncio.to_thread(
+                _sync_changed_files, workspace, target,
+            )
+            _last_sync_back[sandbox_id] = time.monotonic()
+            logger.info(
+                "sync_back: %s -> %s: %d files copied, %d skipped",
+                sandbox_id[:12], target_dir, copied, skipped,
+            )
+            return True
+        except Exception as exc:
+            logger.error("sync_back failed for %s -> %s: %s", sandbox_id[:12], target_dir, exc)
+            return False
 
     async def destroy(self, sandbox_id: str) -> None:
         """Remove sandbox directories and kill any remaining processes."""
@@ -632,23 +591,44 @@ def _make_tar_gz(source_dir: str, output_path: str) -> None:
             tar.add(str(file), arcname=file.relative_to(source.parent))
 
 
-def _copy_workspace_fallback(source: Path, target: Path) -> None:
-    """Fallback sync for non-git target directories.
+def _sync_changed_files(source: Path, target: Path) -> tuple[int, int]:
+    """Copy changed/new files from sandbox workspace to target directory.
 
-    Copies user-visible workspace files while leaving MAS runtime metadata and
-    agent scratch directories alone.
+    Skips MAS-internal directories. Only copies files that are new or modified
+    (by size + mtime comparison).
+
+    Returns (copied_count, skipped_count).
     """
-    target.mkdir(parents=True, exist_ok=True)
-    skip_dirs = {".git", ".agent", ".workflow", ".mas", "sandbox-meta"}
-    for item in source.iterdir():
-        if item.name in skip_dirs:
-            continue
-        dest = target / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest, dirs_exist_ok=True)
-        else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, dest)
+    skip_dirs = {".git", ".agent", ".workflow", ".mas", "sandbox-meta", "node_modules"}
+    copied = 0
+    skipped = 0
+
+    for root, dirs, files in os.walk(source):
+        # Skip internal directories
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+
+        rel_root = Path(root).relative_to(source)
+        target_root = target / rel_root
+
+        for fname in files:
+            src_file = Path(root) / fname
+            dst_file = target_root / fname
+
+            try:
+                src_stat = src_file.stat()
+                if dst_file.exists():
+                    dst_stat = dst_file.stat()
+                    # Skip if same size and not newer
+                    if src_stat.st_size == dst_stat.st_size and src_stat.st_mtime <= dst_stat.st_mtime:
+                        skipped += 1
+                        continue
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src_file), str(dst_file))
+                copied += 1
+            except OSError:
+                skipped += 1
+
+    return copied, skipped
 
 
 # ---------------------------------------------------------------------------

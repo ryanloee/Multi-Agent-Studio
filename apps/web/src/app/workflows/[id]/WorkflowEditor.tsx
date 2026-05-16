@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams } from "next/navigation";
+import { PanelLeftClose, PanelLeftOpen, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { api } from "@/lib/api";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -19,24 +20,17 @@ import OutputPanel from "@/components/panels/OutputPanel";
 import ApprovalModal from "@/components/panels/ApprovalModal";
 import DirectoryPicker from "@/components/common/DirectoryPicker";
 
-// ---------------------------------------------------------------------------
-// WorkflowEditor — three-column layout with toolbar
-//
-// Layout:
-// ┌──────────────────────────────────────────────┐
-// │ Toolbar (h-12)                               │
-// ├──────┬────────────────────┬──────────────────┤
-// │ Side │  FlowCanvas        │  ConfigPanel     │
-// │ 240px│  (flex-1)          │  (w-320px)       │
-// │      ├────────────────────┤                  │
-// │      │  OutputPanel       │                  │
-// │      │  (h-300px, 折36px) │                  │
-// └──────┴────────────────────┴──────────────────┘
-// ---------------------------------------------------------------------------
+// Collapsed rail width (px) — just enough for the toggle button
+const RAIL = 32;
+
 export default function WorkflowEditor() {
   const params = useParams();
   const workflowId = params.id as string;
   const t = useLocaleStore((s) => s.t);
+
+  // ---- Panel collapse state ----
+  const [leftOpen, setLeftOpen] = useState(true);
+  const [rightOpen, setRightOpen] = useState(true);
 
   // ---- Local state ----
   const [workflowName, setWorkflowName] = useState(t("wfEditor.untitled"));
@@ -146,7 +140,6 @@ export default function WorkflowEditor() {
 
   // Auto-save when nodes or edges change (debounced 2s)
   useEffect(() => {
-    // Don't auto-save during initial load
     if (loading) return;
     triggerAutoSave();
     return () => {
@@ -184,7 +177,6 @@ export default function WorkflowEditor() {
   // ---- Cleanup on unmount ----
   useEffect(() => {
     return () => {
-      // Reset stores when leaving the editor
       setRunId(null);
       setStatus("idle");
       clearEvents();
@@ -237,22 +229,72 @@ export default function WorkflowEditor() {
 
       {/* Body: LeftPanel + Canvas area + ConfigPanel */}
       <div className="flex flex-1 overflow-hidden">
-        {/* Left: LeftPanel (248px, tabs: 节点库 | 任务) */}
-        <LeftPanel workflowId={workflowId} />
+        {/* Left rail + panel */}
+        {leftOpen ? (
+          <LeftPanel workflowId={workflowId} />
+        ) : (
+          <div
+            className="flex flex-col items-center pt-2 border-r border-gray-200 bg-white"
+            style={{ width: RAIL }}
+          >
+            <button
+              onClick={() => setLeftOpen(true)}
+              className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
+              title={t("panel.openLeft")}
+            >
+              <PanelRightOpen size={16} />
+            </button>
+          </div>
+        )}
 
         {/* Center: Canvas + OutputPanel */}
-        <div className="flex-1 flex flex-col overflow-hidden">
+        <div className="flex-1 flex flex-col overflow-hidden relative">
+          {/* Collapse toggles on canvas edges */}
+          {leftOpen && (
+            <button
+              onClick={() => setLeftOpen(false)}
+              className="absolute top-2 left-0 z-10 p-1 rounded-r hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors bg-white border border-l-0 border-gray-200"
+              title={t("panel.closeLeft")}
+            >
+              <PanelLeftClose size={14} />
+            </button>
+          )}
+          {rightOpen && (
+            <button
+              onClick={() => setRightOpen(false)}
+              className="absolute top-2 right-0 z-10 p-1 rounded-l hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors bg-white border border-r-0 border-gray-200"
+              title={t("panel.closeRight")}
+            >
+              <PanelRightClose size={14} />
+            </button>
+          )}
+
           {/* Canvas (flex-1) */}
           <div className="flex-1 overflow-hidden">
             <FlowCanvas />
           </div>
 
-          {/* Bottom: OutputPanel (collapsible, h-300 expanded / h-36 collapsed) */}
+          {/* Bottom: OutputPanel (collapsible) */}
           <OutputPanel />
         </div>
 
-        {/* Right: ConfigPanel (w-320px) */}
-        <ConfigPanel />
+        {/* Right rail + panel */}
+        {rightOpen ? (
+          <ConfigPanel />
+        ) : (
+          <div
+            className="flex flex-col items-center pt-2 border-l border-gray-200 bg-white"
+            style={{ width: RAIL }}
+          >
+            <button
+              onClick={() => setRightOpen(true)}
+              className="p-1 rounded hover:bg-gray-100 text-gray-400 hover:text-gray-600 transition-colors"
+              title={t("panel.openRight")}
+            >
+              <PanelLeftOpen size={16} />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Human-in-the-Loop Approval Modal */}
@@ -264,30 +306,30 @@ export default function WorkflowEditor() {
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-gray-950/45 backdrop-blur-[2px] p-6">
           <div className="w-full max-w-xl rounded-2xl border border-gray-200 bg-white p-6 shadow-2xl">
             <div className="mb-4">
-              <h2 className="text-lg font-semibold text-gray-900">先设置工作目录</h2>
+              <h2 className="text-lg font-semibold text-gray-900">{t("wfEditor.setupDir")}</h2>
               <p className="mt-1 text-sm leading-relaxed text-gray-500">
-                进入任何工作流都先绑定项目目录。这样 Planner 的评估、节点执行和产物同步才有明确上下文。
+                {t("wfEditor.setupDirDesc")}
               </p>
             </div>
             <DirectoryPicker
               value={workspaceDraft}
               onChange={setWorkspaceDraft}
-              placeholder="输入或浏览项目目录"
-              label="工作目录"
+              placeholder={t("wfEditor.dirPlaceholder")}
+              label={t("wfEditor.workDir")}
             />
             <div className="mt-5 flex items-center justify-end gap-3">
               <button
                 onClick={() => window.history.back()}
                 className="px-4 py-2 text-sm font-medium text-gray-500 hover:text-gray-700"
               >
-                返回
+                {t("wfEditor.goBack")}
               </button>
               <button
                 onClick={() => void updateWorkspaceDirectory(workspaceDraft.trim())}
                 disabled={!workspaceDraft.trim()}
                 className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                保存并继续
+                {t("wfEditor.saveAndContinue")}
               </button>
             </div>
           </div>

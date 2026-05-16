@@ -8,12 +8,10 @@ import {
   Minimize2,
   Brain,
   Terminal,
-  Wrench,
+  Layers,
   Filter,
   X,
-  MessageSquare,
   MessageCircle,
-  ListTree,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -23,25 +21,21 @@ import { NODE_META, STATUS_COLORS } from "@/lib/constants";
 import type { RunStatus, NodeData } from "@/types/workflow";
 import LLMOutput from "./LLMOutput";
 import XtermStream from "./XtermStream";
-import ToolCallList from "./ToolCallList";
-import CommunicationPanel from "./CommunicationPanel";
+import EventsTab from "./EventsTab";
 import PlannerChatTab from "./PlannerChatTab";
-import TimelinePanel from "./TimelinePanel";
 
 // ---------------------------------------------------------------------------
-// Tab definitions — Chat tab is added dynamically when in auto mode
+// Tab definitions
 // ---------------------------------------------------------------------------
 const BASE_TABS = [
   { key: "llm", labelKey: "output.tab.llm", icon: Brain },
   { key: "shell", labelKey: "output.tab.shell", icon: Terminal },
-  { key: "tools", labelKey: "output.tab.tools", icon: Wrench },
-  { key: "comm", labelKey: "output.tab.comm", icon: MessageSquare },
-  { key: "timeline", labelKey: "output.tab.timeline", icon: ListTree },
+  { key: "events", labelKey: "output.tab.events", icon: Layers },
 ] as const;
 
 const CHAT_TAB = { key: "chat", labelKey: "output.tab.chat", icon: MessageCircle } as const;
 
-type TabKey = "llm" | "shell" | "tools" | "comm" | "timeline" | "chat";
+type TabKey = "llm" | "shell" | "events" | "chat";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -80,7 +74,7 @@ function StatusDot({ status }: { status: RunStatus }) {
 }
 
 // ---------------------------------------------------------------------------
-// OutputPanel — collapsible bottom panel with LLM / Shell / Tools tabs
+// OutputPanel — collapsible bottom panel with Agent / Shell / Events tabs
 // ---------------------------------------------------------------------------
 export default function OutputPanel() {
   const [expanded, setExpanded] = useState(false);
@@ -111,8 +105,6 @@ export default function OutputPanel() {
   const hasRunData = runStatus !== "idle";
 
   // Single source of truth for the active filter node.
-  // Syncs from selectedRunNodeId (canvas clicks) but can also be changed
-  // directly via the dropdown.
   const [filterNodeId, setFilterNodeId] = useState<string>("");
   useEffect(() => {
     if (selectedRunNodeId) {
@@ -131,7 +123,7 @@ export default function OutputPanel() {
     }
   }, [isRunActive, events.length]);
 
-  // Auto-switch to LLM tab when LLM events first appear during a run
+  // Auto-switch to Agent tab when LLM events first appear during a run
   const hasLLMRef = useRef(false);
   useEffect(() => {
     if (!hasLLMRef.current && activeTab !== "llm") {
@@ -152,8 +144,6 @@ export default function OutputPanel() {
     }
   }, [runStatus]);
 
-  // Effective nodeId: prefer selectedRunNodeId during/after a run,
-  // otherwise fall back to the manual dropdown filter
   // Build node filter options
   const nodeOptions = useMemo(
     () => [
@@ -175,7 +165,6 @@ export default function OutputPanel() {
 
   const handleTabChange = useCallback((tab: TabKey) => {
     setActiveTab(tab);
-    // Auto-expand when switching tabs
     setExpanded(true);
   }, []);
 
@@ -249,7 +238,7 @@ export default function OutputPanel() {
                     className={`h-1.5 w-1.5 rounded-full ${
                       plannerThinkingEventCount > 0 ? "bg-blue-300" : "bg-amber-300"
                     } animate-pulse`}
-                    title={plannerThinkingEventCount > 0 ? "Planner 正在输出思考流" : "Planner 正在等待模型首包"}
+                    title={plannerThinkingEventCount > 0 ? t("output.plannerThinking") : t("output.plannerWaiting")}
                   />
                 )}
               </button>
@@ -342,9 +331,7 @@ export default function OutputPanel() {
           <div className={`flex-1 overflow-hidden ${activeTab === "shell" ? "bg-[#1e1e1e]" : ""}`}>
             {activeTab === "llm" && <LLMOutput nodeId={filterNodeId} />}
             {activeTab === "shell" && <XtermStream nodeId={filterNodeId} />}
-            {activeTab === "tools" && <ToolCallList nodeId={filterNodeId} />}
-            {activeTab === "comm" && <CommunicationPanel nodeId={filterNodeId} />}
-            {activeTab === "timeline" && <TimelinePanel nodeId={filterNodeId} />}
+            {activeTab === "events" && <EventsTab nodeId={filterNodeId} />}
             {activeTab === "chat" && <PlannerChatTab />}
           </div>
         </>

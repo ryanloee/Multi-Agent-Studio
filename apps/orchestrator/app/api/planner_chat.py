@@ -259,7 +259,7 @@ async def _call_llm_stream(
             elif tool_choice_mode == "auto":
                 body["tool_choice"] = {"type": "auto"}
 
-    timeout = httpx.Timeout(connect=15, read=120, write=30, pool=15)
+    timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -527,7 +527,14 @@ def _planner_alignment_tools() -> list[dict]:
 # New simplified planner: LLM outputs task list, compiler builds DAG
 # ---------------------------------------------------------------------------
 
-PLANNER_TASK_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
+PLANNER_TASK_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。你负责将用户目标拆解为一组协作任务，每个任务由一个专职 agent 独立执行。所有任务完成后，整体目标必须达成。
+
+规划原则：
+- 像分配团队工作一样思考：每个人负责一块，各司其职，互不重复，最后拼在一起能交付完整结果。
+- 只拆必要的步骤，不为了流程而加流程。改一个按钮颜色只需要一个 coder，不需要 explore → design → review 全套。
+- 并行能加速就并行，有依赖就串行。两个 coder 同时改不冲突的文件可以直接并行，改同一文件则必须串行。
+- 每个 prompt 要写得让执行 agent 拿到就能干活：明确目标、相关上下文、具体要求、什么是完成。
+- 所有任务的产出拼起来要能完整交付用户目标，不能漏掉关键环节。
 
 一次性输出一个 `planner-tasks` fenced JSON 代码块，不要在代码块外输出其他结构化数据。你可以在代码块前写一段简短的自然语言说明。
 
@@ -587,18 +594,15 @@ PLANNER_TASK_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
 }
 ```
 
-硬性规则：
+格式规则：
 - 任务类型只允许 explore / design / coder / merge / review / shell。
 - 不要生成 human/人工节点，不要生成顶级 plan/planner 节点。
 - 每个任务必须有：id（唯一 snake_case）、type、label、prompt、depends_on（任务 id 列表）。
 - 不要生成 edges 数组、坐标、React Flow 字段——边由 depends_on 自动推导。
-- 两个及以上并行 coder 后必须有 merge 任务。
-- 关键 coder/merge 结果后必须有 review 任务。
-- 末尾必须有 shell/test 验证任务。
-- 不确定第三方服务时，用 design 任务给下游 coder 明确方案。
 - target_files 路径必须来自项目文件结构中的实际路径。
-- prompt 必须可执行：目标、上下文、具体要求、产出格式、验收标准。
 - task_object 和 project_summary 为可选字段，不输出时系统自动填充默认值。
+
+重要：请确保 planner-tasks JSON 代码块完整输出，JSON 必须完整闭合。
 """
 
 
@@ -2369,7 +2373,7 @@ async def planner_chat(
             body.thinking_level,
             tools=None,
             tool_choice_mode="auto",
-            max_tokens=10000,
+            max_tokens=32768,
             model_provider=body.model_provider,
             model_id_override=body.model_id,
         ):
@@ -2415,7 +2419,7 @@ async def planner_chat(
                 body.thinking_level,
                 tools=None,
                 tool_choice_mode="auto",
-                max_tokens=10000,
+                max_tokens=32768,
                 model_provider=body.model_provider,
                 model_id_override=body.model_id,
             ):

@@ -18,14 +18,26 @@ export const translations: Record<Locale, Record<string, string>> = {
     "toolbar.cancelShortcut": "取消",
     "toolbar.appTitle": "Multi-Agent Studio",
     "toolbar.shortcutHint": "Ctrl+S / Ctrl+Enter",
+    "toolbar.runFailed": "启动工作流失败",
+    "toolbar.saved": "已保存",
+    "toolbar.setDirFirst": "请先设置工作目录",
 
     // ─── Sidebar ───
     "sidebar.title": "节点库",
     "sidebar.dragToCanvas": "拖拽到画布",
 
     // ─── LeftPanel ───
+    "leftPanel.overview": "概览",
     "leftPanel.tasks": "任务",
     "leftPanel.sharedDoc": "项目文档",
+    "leftPanel.goal": "目标 / 问题",
+    "leftPanel.noGoal": "还没有明确的任务目标。可以先在 Planner 中描述要处理的项目、问题或需求。",
+    "leftPanel.successCriteria": "验收标准",
+    "leftPanel.constraints": "约束条件",
+    "leftPanel.openQuestions": "待确认问题",
+    "leftPanel.blockers": "阻塞项",
+    "leftPanel.plannerTasks": "Planner 规划任务",
+    "leftPanel.node": "节点：",
 
     // ─── SharedDoc ───
     "sharedDoc.placeholder": "在这里编写项目文档、架构决策、API 设计等...\n\n此文档对 Planner 和所有 Worker 可见。",
@@ -39,6 +51,31 @@ export const translations: Record<Locale, Record<string, string>> = {
     // ─── TaskBoard ───
     "taskBoard.viewTopology": "拓扑",
     "taskBoard.viewFlat": "列表",
+
+    // ─── Task ───
+    "task.pending": "未开始",
+    "task.assigned": "已分配",
+    "task.running": "进行中",
+    "task.completed": "成功",
+    "task.failed": "失败",
+    "task.reassignNode": "重新分配节点",
+    "task.selectNode": "选择执行节点...",
+    "task.assignAndRun": "分配并执行",
+    "task.cancel": "取消",
+    "task.assignNode": "分配节点",
+    "task.errorInfo": "错误信息",
+    "task.retryCount": "重试",
+    "task.times": "次",
+    "task.targetFiles": "目标文件",
+    "task.interfaceContract": "接口契约",
+    "task.contextDesc": "上下文说明",
+    "task.titlePlaceholder": "任务标题...",
+    "task.descPlaceholder": "任务描述（可选）...",
+    "task.autoAssign": "自动分配节点",
+    "task.create": "创建",
+    "task.tasksComplete": "任务完成",
+    "task.failedCount": "失败",
+    "task.newTask": "新任务",
 
     // ─── ConfigPanel ───
     "config.label": "标签",
@@ -54,6 +91,18 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.childModelsDesc": "预先指定 Planner 创建的各类子节点默认模型。任务未显式声明模型时，优先使用这里的配置。",
     "config.workspaceDirectory": "工作区目录",
     "config.workspaceDirectoryPlaceholder": "例如: /path/to/project 或 C:\\workspace",
+    "config.noModelHint": "当前节点未单独指定模型，运行时使用默认模型。",
+    "config.workflowStatusDesc": "当前工作流的执行阶段、阻塞项和基础可运行性提示。",
+    "config.phase": "阶段: ",
+    "config.dagStatus": "DAG 校验状态: ",
+    "config.dagReady": "已形成可编辑结构",
+    "config.dagIncomplete": "仍需补充可执行节点",
+    "config.workDirLabel": "工作目录: ",
+    "config.dirSet": "已设置",
+    "config.dirNotSet": "未设置",
+    "config.blockers": "阻塞项",
+    "config.noBlockers": "当前没有已知阻塞项。",
+    "config.childModelFallback": "未单独指定时，将回退到 Planner/默认模型：",
 
     // ─── Edge Config ───
     "config.edgeTitle": "连线配置",
@@ -73,11 +122,9 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.modeAutoHint": "自动模式：输入目标，Planner 自动规划并构建工作流 DAG",
 
     // ─── OutputPanel ───
-    "output.tab.llm": "LLM",
+    "output.tab.llm": "Agent",
     "output.tab.shell": "终端",
-    "output.tab.tools": "工具",
-    "output.tab.comm": "通讯",
-    "output.tab.timeline": "时间线",
+    "output.tab.events": "事件",
     "output.tab.chat": "Chat",
     "output.filter.allNodes": "所有节点",
     "output.collapse": "收起面板",
@@ -85,23 +132,21 @@ export const translations: Record<Locale, Record<string, string>> = {
     "output.fullscreen": "全屏展开",
     "output.exitFullscreen": "退出全屏",
     "output.clearNodeFilter": "清除节点筛选",
+    "output.plannerThinking": "Planner 正在输出思考流",
+    "output.plannerWaiting": "Planner 正在等待模型首包",
+
+    // ─── EventsTab ───
+    "events.filterAll": "全部",
+    "events.filterLlm": "LLM",
+    "events.filterTool": "工具",
+    "events.filterShell": "Shell",
+    "events.filterComm": "通信",
+    "events.filterStatus": "状态",
+    "events.noEvents": "暂无事件",
 
     // ─── PlanNode ───
     "planNode.childTasks": "创建了 {n} 个子任务",
     "planNode.readonly": "规划模式",
-
-    // ─── CommunicationPanel ───
-    "comm.selectNode": "选择一个节点查看通讯记录",
-    "comm.noRecords": "暂无通讯记录",
-    "comm.receivedLlm": "收到 LLM 输出",
-    "comm.sentLlm": "发送 LLM 输出",
-    "comm.receivedToolCall": "收到工具调用",
-    "comm.sentToolCall": "调用工具",
-    "comm.receivedToolResult": "收到工具结果",
-    "comm.sentToolResult": "返回工具结果",
-    "comm.createdChild": "创建子任务",
-    "comm.receivedChild": "子任务已创建",
-    "comm.childCompleted": "子任务完成",
 
     // ─── ApprovalModal ───
     "approval.title": "需要人工审批",
@@ -112,13 +157,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "approval.reject": "拒绝",
     "approval.approve": "批准",
 
-    // ─── ToolCallList ───
-    "tools.noCalls": "暂无工具调用",
-    "tools.call": "调用",
-    "tools.result": "结果",
-
     // ─── LLMOutput ───
     "llm.waiting": "等待 LLM 输出...",
+    "llm.thinking": "思考片段",
+    "llm.toolCall": "🔧 调用",
+    "llm.statusBusy": "⏳ 思考中",
+    "llm.statusRetry": "🔄 重试中",
+    "llm.statusIdle": "✅ 完成",
+    "llm.permissionRequest": "🔒 权限请求：",
 
     // ─── CommandEditor ───
     "command.label": "命令",
@@ -161,6 +207,18 @@ export const translations: Record<Locale, Record<string, string>> = {
     "wfEditor.loadFailed": "加载工作流失败",
     "wfEditor.retry": "重试",
     "wfEditor.untitled": "未命名工作流",
+    "wfEditor.setupDir": "先设置工作目录",
+    "wfEditor.setupDirDesc": "进入任何工作流都先绑定项目目录。这样 Planner 的评估、节点执行和产物同步才有明确上下文。",
+    "wfEditor.dirPlaceholder": "输入或浏览项目目录",
+    "wfEditor.workDir": "工作目录",
+    "wfEditor.goBack": "返回",
+    "wfEditor.saveAndContinue": "保存并继续",
+
+    // ─── Panel ───
+    "panel.openLeft": "展开左面板",
+    "panel.closeLeft": "收起左面板",
+    "panel.openRight": "展开右面板",
+    "panel.closeRight": "收起右面板",
 
     // ─── NODE_META ───
     "node.coder.label": "编码器",
@@ -186,6 +244,12 @@ export const translations: Record<Locale, Record<string, string>> = {
     "workflow.goalLabel": "目标",
     "workflow.goalPlaceholder": "描述你想要实现的目标...",
 
+    // ─── Canvas ───
+    "canvas.autoMode": "自动规划模式",
+    "canvas.autoModeDesc": "在底部面板的 Chat 标签页中与规划器对话，描述你的目标，规划器会自动构建工作流。",
+    "canvas.manualMode": "从左侧节点库拖拽节点到此处",
+    "canvas.manualModeDesc": "先拖一个「规划器」作为起点，再拖「编码器」「审查器」等节点，用连线把它们串起来，就是一个自动化工作流。",
+
     // ─── Planner Chat ───
     "planner.startConversation": "开始对话",
     "planner.currentPlan": "当前方案",
@@ -194,6 +258,66 @@ export const translations: Record<Locale, Record<string, string>> = {
     "planner.inputPlaceholder": "描述你想要的修改，或说「运行」开始执行...",
     "planner.inputHint": "按 Enter 发送，Shift+Enter 换行。可以说「加一个审查步骤」或「让编码和探索并行执行」来修改工作流。",
     "planner.planPreview": "工作流预览",
+    "planner.selectModel": "选择模型",
+    "planner.defaultModel": "默认模型",
+    "planner.thinkingLevel": "思考等级",
+    "planner.thinkingOff": "不思考",
+    "planner.thinkingLow": "轻思考",
+    "planner.thinkingMedium": "中度思考",
+    "planner.thinkingHigh": "高度思考",
+    "planner.dagFixCount": "DAG 对齐修复次数",
+    "planner.dagFixN": "修复 {n} 次",
+    "planner.stop": "停止",
+    "planner.stopTooltip": "停止本轮 Planner 输出",
+    "planner.thisRoundThinking": "本轮思考内容",
+    "planner.waitingForModel": "正在思考和生成回复，已等待",
+    "planner.seconds": "s",
+    "planner.planTrace": "规划轨迹",
+    "planner.currentStage": "当前阶段：",
+    "planner.waiting": "等待中",
+    "planner.attempt": "尝试",
+    "planner.waitingForTrace": "正在等待模型输出本轮规划轨迹。",
+    "planner.liveThinking": "实时思考内容",
+    "planner.waitingForThinking": "正在等待模型思考内容。",
+    "planner.liveReply": "实时回复内容",
+    "planner.dagUpdates": "DAG 更新事件：",
+    "planner.timesSuffix": "次。",
+    "planner.toolCalls": "工具调用：",
+    "planner.recentCall": "，最近调用",
+    "planner.noParams": "无参数",
+    "planner.waitingForSubmit": "，正在等待 planner_submit_turn。",
+    "planner.streamEvents": "流事件：",
+    "planner.recentSuffix": "，最近：",
+    "planner.none": "无",
+    "planner.planProgress": "规划进度",
+    "planner.ordinal": "第",
+    "planner.receivedFields": "已接收字段：",
+    "planner.missingFields": "缺失字段：",
+    "planner.requestFailed": "请求失败: ",
+    "planner.evalFailed": "项目评估失败: ",
+    "planner.canvasUpdated": "已更新工作流画布，请在左侧任务对象和中间画布查看规划结果。",
+    "planner.noContent": "本轮 Planner 已完成，但没有收到可展示正文；如果画布没有变化，请让 Planner 重新生成更简洁的 DAG。",
+    "planner.stopped": "已停止本轮 Planner 输出。",
+    "planner.connectionFailed": "连接失败: ",
+
+    // ─── Planner Chat (extended keys) ───
+    "planner.dagUpdateCount": "DAG 更新事件",
+    "planner.times": "次",
+    "planner.recent": "，最近：",
+    "planner.traceLabel": "规划轨迹",
+    "planner.thinkingContent": "本轮思考内容",
+    "planner.thinkingAndGenerating": "正在思考和生成回复，已等待",
+    "planner.stopTitle": "停止",
+    "planner.contractError": "契约校验不通过：",
+    "planner.contractErrorRestart": "契约校验不通过，请重新描述需求。",
+    "planner.assessFailed": "项目评估失败: ",
+    "planner.dagUpdated": "已更新工作流画布。",
+    "planner.noVisibleContent": "本轮 Planner 已完成，但没有可展示的正文。",
+    "planner.streamStopped": "已停止本轮 Planner 输出。",
+    "planner.dagFixTitle": "DAG 对齐修复次数",
+    "planner.planningProgress": "规划进度",
+    "planner.attemptN": "第",
+    "planner.separator": "；",
 
     // ─── Settings ───
     "settings.title": "设置",
@@ -253,6 +377,13 @@ export const translations: Record<Locale, Record<string, string>> = {
     "dirPicker.pathNotDir": "路径不是目录",
     "dirPicker.pathInvalid": "路径格式无效",
     "dirPicker.pathNoPermission": "当前用户无写入权限",
+    "dirPicker.title": "选择工作目录",
+    "dirPicker.close": "关闭",
+    "dirPicker.noSubdirs": "没有可进入的子目录",
+    "dirPicker.loading": "读取中...",
+    "dirPicker.refresh": "刷新",
+    "dirPicker.cancel": "取消",
+    "dirPicker.selectDir": "选择此目录",
   },
 
   en: {
@@ -272,14 +403,26 @@ export const translations: Record<Locale, Record<string, string>> = {
     "toolbar.cancelShortcut": "Cancel",
     "toolbar.appTitle": "Multi-Agent Studio",
     "toolbar.shortcutHint": "Ctrl+S / Ctrl+Enter",
+    "toolbar.runFailed": "Failed to start workflow",
+    "toolbar.saved": "Saved",
+    "toolbar.setDirFirst": "Please set workspace directory first",
 
     // ─── Sidebar ───
     "sidebar.title": "Nodes",
     "sidebar.dragToCanvas": "Drag to canvas",
 
     // ─── LeftPanel ───
+    "leftPanel.overview": "Overview",
     "leftPanel.tasks": "Tasks",
     "leftPanel.sharedDoc": "Project Doc",
+    "leftPanel.goal": "Goal / Problem",
+    "leftPanel.noGoal": "No goal defined yet. Describe your project, problem, or requirement in the Planner.",
+    "leftPanel.successCriteria": "Success Criteria",
+    "leftPanel.constraints": "Constraints",
+    "leftPanel.openQuestions": "Open Questions",
+    "leftPanel.blockers": "Blockers",
+    "leftPanel.plannerTasks": "Planner Tasks",
+    "leftPanel.node": "Node: ",
 
     // ─── SharedDoc ───
     "sharedDoc.placeholder": "Write project docs, architecture decisions, API designs here...\n\nThis document is visible to Planner and all Workers.",
@@ -293,6 +436,31 @@ export const translations: Record<Locale, Record<string, string>> = {
     // ─── TaskBoard ───
     "taskBoard.viewTopology": "Topology",
     "taskBoard.viewFlat": "List",
+
+    // ─── Task ───
+    "task.pending": "Pending",
+    "task.assigned": "Assigned",
+    "task.running": "Running",
+    "task.completed": "Completed",
+    "task.failed": "Failed",
+    "task.reassignNode": "Reassign Node",
+    "task.selectNode": "Select execution node...",
+    "task.assignAndRun": "Assign & Run",
+    "task.cancel": "Cancel",
+    "task.assignNode": "Assign Node",
+    "task.errorInfo": "Error",
+    "task.retryCount": "retry",
+    "task.times": "times",
+    "task.targetFiles": "Target Files",
+    "task.interfaceContract": "Interface Contract",
+    "task.contextDesc": "Context",
+    "task.titlePlaceholder": "Task title...",
+    "task.descPlaceholder": "Task description (optional)...",
+    "task.autoAssign": "Auto-assign node",
+    "task.create": "Create",
+    "task.tasksComplete": "tasks complete",
+    "task.failedCount": "failed",
+    "task.newTask": "New Task",
 
     // ─── ConfigPanel ───
     "config.label": "Label",
@@ -308,6 +476,18 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.childModelsDesc": "Predefine the default model for each child worker type created by the Planner. If a task does not explicitly declare a model, this mapping is used first.",
     "config.workspaceDirectory": "Workspace Directory",
     "config.workspaceDirectoryPlaceholder": "e.g. /path/to/project or C:\\workspace",
+    "config.noModelHint": "No model specified for this node. The default model will be used at runtime.",
+    "config.workflowStatusDesc": "Current execution phase, blockers, and basic runnability.",
+    "config.phase": "Phase: ",
+    "config.dagStatus": "DAG validation: ",
+    "config.dagReady": "Ready",
+    "config.dagIncomplete": "Needs more nodes",
+    "config.workDirLabel": "Workspace: ",
+    "config.dirSet": "Set",
+    "config.dirNotSet": "Not set",
+    "config.blockers": "Blockers",
+    "config.noBlockers": "No known blockers.",
+    "config.childModelFallback": "Falls back to Planner/default model when not specified: ",
 
     // ─── Edge Config ───
     "config.edgeTitle": "Edge Configuration",
@@ -327,34 +507,31 @@ export const translations: Record<Locale, Record<string, string>> = {
     "config.modeAutoHint": "Auto mode: describe your goal, Planner automatically designs and builds the workflow DAG",
 
     // ─── OutputPanel ───
-    "output.tab.llm": "LLM",
+    "output.tab.llm": "Agent",
     "output.tab.shell": "Shell",
-    "output.tab.tools": "Tools",
-    "output.tab.comm": "Comm",
-    "output.tab.timeline": "Timeline",
+    "output.tab.events": "Events",
+    "output.tab.chat": "Chat",
     "output.filter.allNodes": "All Nodes",
     "output.collapse": "Collapse panel",
     "output.expand": "Expand panel",
     "output.fullscreen": "Fullscreen",
     "output.exitFullscreen": "Exit fullscreen",
     "output.clearNodeFilter": "Clear node filter",
+    "output.plannerThinking": "Planner is streaming thinking",
+    "output.plannerWaiting": "Planner waiting for first token",
+
+    // ─── EventsTab ───
+    "events.filterAll": "All",
+    "events.filterLlm": "LLM",
+    "events.filterTool": "Tools",
+    "events.filterShell": "Shell",
+    "events.filterComm": "Comm",
+    "events.filterStatus": "Status",
+    "events.noEvents": "No events",
 
     // ─── PlanNode ───
     "planNode.childTasks": "{n} child task(s) created",
     "planNode.readonly": "Planning mode",
-
-    // ─── CommunicationPanel ───
-    "comm.selectNode": "Select a node to view communication records",
-    "comm.noRecords": "No communication records",
-    "comm.receivedLlm": "Received LLM output",
-    "comm.sentLlm": "Sent LLM output",
-    "comm.receivedToolCall": "Received tool call",
-    "comm.sentToolCall": "Called tool",
-    "comm.receivedToolResult": "Received tool result",
-    "comm.sentToolResult": "Returned tool result",
-    "comm.createdChild": "Created child task",
-    "comm.receivedChild": "Child task created",
-    "comm.childCompleted": "Child task completed",
 
     // ─── ApprovalModal ───
     "approval.title": "Human Approval Required",
@@ -365,13 +542,14 @@ export const translations: Record<Locale, Record<string, string>> = {
     "approval.reject": "Reject",
     "approval.approve": "Approve",
 
-    // ─── ToolCallList ───
-    "tools.noCalls": "No tool calls yet",
-    "tools.call": "Call",
-    "tools.result": "Result",
-
     // ─── LLMOutput ───
     "llm.waiting": "Waiting for LLM output...",
+    "llm.thinking": "Thinking",
+    "llm.toolCall": "🔧 Call",
+    "llm.statusBusy": "⏳ Thinking",
+    "llm.statusRetry": "🔄 Retrying",
+    "llm.statusIdle": "✅ Done",
+    "llm.permissionRequest": "🔒 Permission: ",
 
     // ─── CommandEditor ───
     "command.label": "Command",
@@ -414,6 +592,18 @@ export const translations: Record<Locale, Record<string, string>> = {
     "wfEditor.loadFailed": "Failed to load workflow",
     "wfEditor.retry": "Retry",
     "wfEditor.untitled": "Untitled Workflow",
+    "wfEditor.setupDir": "Set Workspace Directory",
+    "wfEditor.setupDirDesc": "Bind a project directory for every workflow. This gives Planner, node execution, and artifact sync a clear context.",
+    "wfEditor.dirPlaceholder": "Enter or browse project directory",
+    "wfEditor.workDir": "Workspace",
+    "wfEditor.goBack": "Go Back",
+    "wfEditor.saveAndContinue": "Save & Continue",
+
+    // ─── Panel ───
+    "panel.openLeft": "Open left panel",
+    "panel.closeLeft": "Close left panel",
+    "panel.openRight": "Open right panel",
+    "panel.closeRight": "Close right panel",
 
     // ─── NODE_META ───
     "node.coder.label": "Coder",
@@ -439,6 +629,12 @@ export const translations: Record<Locale, Record<string, string>> = {
     "workflow.goalLabel": "Goal",
     "workflow.goalPlaceholder": "Describe what you want to achieve...",
 
+    // ─── Canvas ───
+    "canvas.autoMode": "Auto Planning Mode",
+    "canvas.autoModeDesc": "Chat with the Planner in the bottom Chat tab. Describe your goal and the Planner will build the workflow.",
+    "canvas.manualMode": "Drag nodes from the left panel onto the canvas",
+    "canvas.manualModeDesc": "Start with a Planner node, then drag Coders, Reviewers, etc. Connect them to build your workflow.",
+
     // ─── Planner Chat ───
     "planner.startConversation": "Start Conversation",
     "planner.currentPlan": "Current Plan",
@@ -447,6 +643,66 @@ export const translations: Record<Locale, Record<string, string>> = {
     "planner.inputPlaceholder": "Describe changes, or say 'run' to execute...",
     "planner.inputHint": "Press Enter to send, Shift+Enter for new line. Say 'add a review step' or 'run coder and explorer in parallel' to modify the workflow.",
     "planner.planPreview": "Workflow Preview",
+    "planner.selectModel": "Select Model",
+    "planner.defaultModel": "Default Model",
+    "planner.thinkingLevel": "Thinking Level",
+    "planner.thinkingOff": "Off",
+    "planner.thinkingLow": "Low",
+    "planner.thinkingMedium": "Medium",
+    "planner.thinkingHigh": "High",
+    "planner.dagFixCount": "DAG Fix Attempts",
+    "planner.dagFixN": "Fix {n} times",
+    "planner.stop": "Stop",
+    "planner.stopTooltip": "Stop current Planner output",
+    "planner.thisRoundThinking": "This Round's Thinking",
+    "planner.waitingForModel": "Thinking and generating, waited",
+    "planner.seconds": "s",
+    "planner.planTrace": "Plan Trace",
+    "planner.currentStage": "Current Stage: ",
+    "planner.waiting": "Waiting",
+    "planner.attempt": "attempt",
+    "planner.waitingForTrace": "Waiting for model to output plan trace.",
+    "planner.liveThinking": "Live Thinking",
+    "planner.waitingForThinking": "Waiting for thinking output.",
+    "planner.liveReply": "Live Reply",
+    "planner.dagUpdates": "DAG update events: ",
+    "planner.timesSuffix": "times.",
+    "planner.toolCalls": "Tool calls: ",
+    "planner.recentCall": ", recent call ",
+    "planner.noParams": "no params",
+    "planner.waitingForSubmit": ", waiting for planner_submit_turn.",
+    "planner.streamEvents": "Stream events: ",
+    "planner.recentSuffix": ", recent: ",
+    "planner.none": "none",
+    "planner.planProgress": "Plan Progress",
+    "planner.ordinal": "#",
+    "planner.receivedFields": "Received fields: ",
+    "planner.missingFields": "Missing fields: ",
+    "planner.requestFailed": "Request failed: ",
+    "planner.evalFailed": "Project eval failed: ",
+    "planner.canvasUpdated": "Workflow canvas updated. Check the overview panel and canvas for results.",
+    "planner.noContent": "Planner finished this round but no visible content was received. If the canvas hasn't changed, ask the Planner to regenerate a simpler DAG.",
+    "planner.stopped": "Stopped current Planner output.",
+    "planner.connectionFailed": "Connection failed: ",
+
+    // ─── Planner Chat (extended keys) ───
+    "planner.dagUpdateCount": "DAG update events",
+    "planner.times": "times",
+    "planner.recent": ", recent: ",
+    "planner.traceLabel": "Plan Trace",
+    "planner.thinkingContent": "This Round's Thinking",
+    "planner.thinkingAndGenerating": "Thinking and generating, waited",
+    "planner.stopTitle": "Stop",
+    "planner.contractError": "Contract validation failed: ",
+    "planner.contractErrorRestart": "Contract validation failed, please re-describe your requirements.",
+    "planner.assessFailed": "Project assessment failed: ",
+    "planner.dagUpdated": "Workflow canvas updated.",
+    "planner.noVisibleContent": "Planner finished this round but no visible content was received.",
+    "planner.streamStopped": "Stopped current Planner output.",
+    "planner.dagFixTitle": "DAG Fix Attempts",
+    "planner.planningProgress": "Plan Progress",
+    "planner.attemptN": "#",
+    "planner.separator": "; ",
 
     // ─── Settings ───
     "settings.title": "Settings",
@@ -506,5 +762,12 @@ export const translations: Record<Locale, Record<string, string>> = {
     "dirPicker.pathNotDir": "Path is not a directory",
     "dirPicker.pathInvalid": "Invalid path format",
     "dirPicker.pathNoPermission": "No write permission",
+    "dirPicker.title": "Select Workspace Directory",
+    "dirPicker.close": "Close",
+    "dirPicker.noSubdirs": "No subdirectories to browse",
+    "dirPicker.loading": "Loading...",
+    "dirPicker.refresh": "Refresh",
+    "dirPicker.cancel": "Cancel",
+    "dirPicker.selectDir": "Select This Directory",
   },
 };

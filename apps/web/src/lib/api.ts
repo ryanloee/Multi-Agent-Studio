@@ -434,17 +434,4 @@ export const api = {
   /** Load persisted chat history for a workflow + node */
   getChatHistory: (workflowId: string, nodeId: string = "planner"): Promise<import("@/types/settings").ChatHistoryItem[]> =>
     request<import("@/types/settings").ChatHistoryItem[]>(`/planner/history/${workflowId}?node_id=${nodeId}`),
-
-  // ---- Shared Document ----
-
-  /** Get or create the shared document for a workflow */
-  getSharedDoc: (workflowId: string): Promise<{ id: string; workflow_id: string; content: string; updated_by: string; created_at: string; updated_at: string }> =>
-    request(`/workflows/${workflowId}/shared-doc`),
-
-  /** Update the shared document */
-  updateSharedDoc: (workflowId: string, content: string, updatedBy: string = "user"): Promise<{ id: string; workflow_id: string; content: string; updated_by: string; created_at: string; updated_at: string }> =>
-    request(`/workflows/${workflowId}/shared-doc`, {
-      method: "PUT",
-      body: JSON.stringify({ content, updated_by: updatedBy }),
-    }),
 };

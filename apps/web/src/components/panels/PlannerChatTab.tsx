@@ -78,12 +78,6 @@ export default function PlannerChatTab() {
   const appendThinking = usePlannerChatStore((s) => s.appendThinking);
   const recordStreamEvent = usePlannerChatStore((s) => s.recordStreamEvent);
   const recordPlannerToolCall = usePlannerChatStore((s) => s.recordPlannerToolCall);
-  const streamEventCount = usePlannerChatStore((s) => s.streamEventCount);
-  const lastStreamEventType = usePlannerChatStore((s) => s.lastStreamEventType);
-  const lastStreamEventPreview = usePlannerChatStore((s) => s.lastStreamEventPreview);
-  const plannerToolCallCount = usePlannerChatStore((s) => s.plannerToolCallCount);
-  const lastPlannerToolName = usePlannerChatStore((s) => s.lastPlannerToolName);
-  const lastPlannerToolInputKeys = usePlannerChatStore((s) => s.lastPlannerToolInputKeys);
   const loadingHistory = usePlannerChatStore((s) => s.loadingHistory);
   const setLoadingHistory = usePlannerChatStore((s) => s.setLoadingHistory);
   const thinkingLevel = usePlannerChatStore((s) => s.thinkingLevel);
@@ -101,7 +95,6 @@ export default function PlannerChatTab() {
   const setDraftStructuredState = usePlannerChatStore((s) => s.setDraftStructuredState);
   const [waitingSeconds, setWaitingSeconds] = useState(0);
   const streamingChars = usePlannerChatStore((s) => s.streamingChars);
-  const dagUpdateCount = usePlannerChatStore((s) => s.dagUpdateCount);
   const observableTrace = usePlannerChatStore((s) => s.observableTrace);
   const thinkingContent = usePlannerChatStore((s) => s.thinkingContent);
   const thinkingEventCount = usePlannerChatStore((s) => s.thinkingEventCount);
@@ -248,7 +241,7 @@ export default function PlannerChatTab() {
 
       if (!response.ok) {
         const err = await response.text();
-        setMessages((prev) => [...prev, { role: "assistant", content: `请求失败: ${err}` }]);
+        setMessages((prev) => [...prev, { role: "assistant", content: `${t("planner.requestFailed")}${err}` }]);
         finishStream();
         return;
       }
@@ -319,10 +312,10 @@ export default function PlannerChatTab() {
               const progressLines = [
                 event.next_action ? String(event.next_action) : "",
                 Array.isArray(event.received_fields) && event.received_fields.length > 0
-                  ? `已接收字段：${event.received_fields.join(" / ")}`
+                  ? `${t("planner.receivedFields")}${event.received_fields.join(" / ")}`
                   : "",
                 Array.isArray(event.missing_fields) && event.missing_fields.length > 0
-                  ? `缺失字段：${event.missing_fields.join(" / ")}`
+                  ? `${t("planner.missingFields")}${event.missing_fields.join(" / ")}`
                   : "",
               ].filter(Boolean);
               setStageProgressItems(progressLines);
@@ -358,8 +351,8 @@ export default function PlannerChatTab() {
                 const updated = [...prev];
                 const last = updated[updated.length - 1];
                 const message = blockers.length > 0
-                  ? `Planner 返回了旧版整轮协议错误：${blockers.map((item: { message?: string }) => item.message).filter(Boolean).join("；")}`
-                  : "Planner 返回了旧版整轮协议错误，请确认后端服务已重启到最新代码。";
+                  ? `${t("planner.contractError")}${blockers.map((item: { message?: string }) => item.message).filter(Boolean).join(t("planner.separator") || "；")}`
+                  : t("planner.contractErrorRestart");
                 if (last?.role === "assistant") {
                   updated[updated.length - 1] = { ...last, content: message };
                 }
@@ -391,7 +384,7 @@ export default function PlannerChatTab() {
                 } catch (err) {
                   setMessages((prev) => [
                     ...prev,
-                    { role: "assistant", content: `项目评估失败: ${err instanceof Error ? err.message : String(err)}` },
+                    { role: "assistant", content: `${t("planner.assessFailed")}${err instanceof Error ? err.message : String(err)}` },
                   ]);
                 }
               } else if (action?.action === "set_ready") {
@@ -409,7 +402,7 @@ export default function PlannerChatTab() {
                 const updated = [...prev];
                 const last = updated[updated.length - 1];
                 if (last?.role === "assistant" && !last.content.trim()) {
-                  updated[updated.length - 1] = { ...last, content: "已更新工作流画布，请在左侧任务对象和中间画布查看规划结果。" };
+                  updated[updated.length - 1] = { ...last, content: t("planner.dagUpdated") };
                 }
                 return updated;
               });
@@ -441,7 +434,7 @@ export default function PlannerChatTab() {
           const parsed = parsePlannerObservableContent(assistantContent);
           updated[updated.length - 1] = {
             ...last,
-            content: parsed.visibleContent || plannerActionMessage || "本轮 Planner 已完成，但没有收到可展示正文；如果画布没有变化，请让 Planner 重新生成更简洁的 DAG。",
+            content: parsed.visibleContent || plannerActionMessage || t("planner.noVisibleContent"),
           };
         }
         return updated;
@@ -450,11 +443,11 @@ export default function PlannerChatTab() {
       if (err instanceof DOMException && err.name === "AbortError") {
         setMessages((prev) => {
           const last = prev[prev.length - 1];
-          if (last?.role === "assistant" && last.content === "已停止本轮 Planner 输出。") return prev;
-          return [...prev, { role: "assistant", content: "已停止本轮 Planner 输出。" }];
+          if (last?.role === "assistant" && last.content === t("planner.streamStopped")) return prev;
+          return [...prev, { role: "assistant", content: t("planner.streamStopped") }];
         });
       } else {
-        setMessages((prev) => [...prev, { role: "assistant", content: `连接失败: ${err}` }]);
+        setMessages((prev) => [...prev, { role: "assistant", content: `${t("planner.connectionFailed")}${err}` }]);
       }
     } finally {
       setCurrentStage(null);
@@ -545,9 +538,9 @@ export default function PlannerChatTab() {
           onChange={(e) => setSelectedModelId(e.target.value)}
           disabled={streaming}
           className="text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400 max-w-[180px]"
-          title="选择模型"
+          title={t("planner.selectModel")}
         >
-          <option value="">默认模型</option>
+          <option value="">{t("planner.defaultModel")}</option>
           {modelOptions.providerOrder.map((providerKey) => {
             const group = modelOptions.grouped[providerKey];
             if (!group || group.models.length === 0) return null;
@@ -570,35 +563,35 @@ export default function PlannerChatTab() {
           onChange={(e) => setThinkingLevel(e.target.value as "off" | "low" | "medium" | "high")}
           disabled={streaming}
           className="ml-auto text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400"
-          title="思考等级"
+          title={t("planner.thinkingLevel")}
         >
-          <option value="off">不思考</option>
-          <option value="low">轻思考</option>
-          <option value="medium">中度思考</option>
-          <option value="high">高度思考</option>
+          <option value="off">{t("planner.thinkingOff")}</option>
+          <option value="low">{t("planner.thinkingLow")}</option>
+          <option value="medium">{t("planner.thinkingMedium")}</option>
+          <option value="high">{t("planner.thinkingHigh")}</option>
         </select>
         <select
           value={alignmentMaxAttempts}
           onChange={(e) => setAlignmentMaxAttempts(Number(e.target.value))}
           disabled={streaming}
           className="text-[10px] border border-gray-200 rounded px-1.5 py-0.5 bg-white text-gray-600 focus:outline-none focus:ring-1 focus:ring-blue-400"
-          title="DAG 对齐修复次数"
+          title={t("planner.dagFixTitle")}
         >
-          <option value={1}>修复 1 次</option>
-          <option value={2}>修复 2 次</option>
-          <option value={3}>修复 3 次</option>
-          <option value={5}>修复 5 次</option>
-          <option value={8}>修复 8 次</option>
-          <option value={10}>修复 10 次</option>
+          <option value={1}>{t("planner.dagFixN").replace("{n}", "1")}</option>
+          <option value={2}>{t("planner.dagFixN").replace("{n}", "2")}</option>
+          <option value={3}>{t("planner.dagFixN").replace("{n}", "3")}</option>
+          <option value={5}>{t("planner.dagFixN").replace("{n}", "5")}</option>
+          <option value={8}>{t("planner.dagFixN").replace("{n}", "8")}</option>
+          <option value={10}>{t("planner.dagFixN").replace("{n}", "10")}</option>
         </select>
         {streaming && (
           <button
             onClick={stopStream}
             className="inline-flex items-center gap-1 rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[10px] font-medium text-red-600 hover:bg-red-100"
-            title="停止本轮 Planner 输出"
+            title={t("planner.stopTitle")}
           >
             <Square size={9} />
-            停止
+            {t("planner.stop")}
           </button>
         )}
         {loadingHistory && <Loader2 size={10} className="animate-spin text-gray-400" />}
@@ -634,7 +627,7 @@ export default function PlannerChatTab() {
               {msg.role === "assistant" && msg.thinking?.trim() && (
                 <details className="mt-2 rounded border border-slate-200 bg-slate-50 px-2 py-1.5 text-[10px] text-slate-700">
                   <summary className="cursor-pointer select-none font-medium text-slate-700">
-                    本轮思考内容
+                    {t("planner.thinkingContent")}
                   </summary>
                   <div className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap rounded bg-white px-2 py-1 font-mono leading-relaxed">
                     {msg.thinking.trim()}
@@ -650,24 +643,24 @@ export default function PlannerChatTab() {
               <div className="flex items-center gap-1.5">
                 <Brain size={11} />
                 <Loader2 size={10} className="animate-spin" />
-                正在思考和生成回复，已等待 {waitingSeconds}s
+                {t("planner.thinkingAndGenerating")}{waitingSeconds}s
               </div>
               <div className="mt-2 rounded-lg border border-blue-200 bg-white/70 px-2.5 py-2 text-[10px] leading-relaxed text-blue-800">
-                <div className="font-medium text-blue-700">规划轨迹</div>
+                <div className="font-medium text-blue-700">{t("planner.traceLabel")}</div>
                 <div className="mt-1 space-y-0.5">
                   <div>
-                    当前阶段：
+                    {t("planner.currentStage")}
                     <span className="ml-1 rounded-full bg-white px-1.5 py-0.5 font-medium text-blue-700">
-                      {currentStage ? STAGE_LABELS[currentStage] : "等待中"}
+                      {currentStage ? STAGE_LABELS[currentStage] : t("planner.waiting")}
                     </span>
-                    {stageAttempt > 0 ? ` · 尝试 ${stageAttempt}` : ""}
+                    {stageAttempt > 0 ? ` · ${t("planner.attempt")}${stageAttempt}` : ""}
                   </div>
                   {observableTrace.length > 0 ? (
                     observableTrace.map((line, index) => (
                       <div key={`${index}-${line}`}>- {line}</div>
                     ))
                   ) : (
-                    <div>正在等待模型输出本轮规划轨迹。</div>
+                    <div>{t("planner.waitingForTrace")}</div>
                   )}
                   {stageProgressItems.length > 0 && (
                     <div className="mt-2 rounded border border-blue-200 bg-white px-2 py-1.5 text-[10px] text-blue-800">
@@ -679,18 +672,18 @@ export default function PlannerChatTab() {
                   <div className="mt-2 rounded border border-slate-200 bg-slate-50 px-2 py-1.5 text-slate-700">
                     <details open={thinkingContent.length > 0}>
                       <summary className="cursor-pointer select-none font-medium text-slate-700">
-                        实时思考内容
+                        {t("planner.liveThinking")}
                       </summary>
                       <div
                         ref={liveThinkingRef}
                         className="mt-1 max-h-32 overflow-y-auto whitespace-pre-wrap rounded bg-white px-2 py-1 font-mono text-[10px] leading-relaxed text-slate-700"
                       >
-                        {thinkingContent.trim() ? thinkingContent : "正在等待模型思考内容。"}
+                        {thinkingContent.trim() ? thinkingContent : t("planner.waitingForThinking")}
                       </div>
                     </details>
                     {rawTextContent.trim() && (
                       <div className="mt-2 rounded bg-white px-2 py-1">
-                        <div className="mb-1 font-medium text-slate-700">实时回复内容</div>
+                        <div className="mb-1 font-medium text-slate-700">{t("planner.liveReply")}</div>
                         <div
                           ref={liveReplyRef}
                           className="max-h-24 overflow-y-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-slate-700"
@@ -700,23 +693,12 @@ export default function PlannerChatTab() {
                       </div>
                     )}
                   </div>
-                  <div>DAG 更新事件：{dagUpdateCount} 次。</div>
-                  <div>
-                    工具调用：{plannerToolCallCount} 次
-                    {lastPlannerToolName
-                      ? `，最近调用 ${lastPlannerToolName}(${lastPlannerToolInputKeys.join(", ") || "无参数"})`
-                      : "，正在等待 planner_submit_turn。"}
-                  </div>
-                  <div>
-                    流事件：{streamEventCount} 次，最近：{lastStreamEventType || "无"}
-                    {lastStreamEventPreview ? ` / ${lastStreamEventPreview}` : ""}
-                  </div>
                   {stageHistory.length > 0 && (
                     <div className="rounded border border-blue-100 bg-white px-2 py-1.5 text-[10px] text-blue-800">
-                      <div className="mb-1 font-medium text-blue-700">规划进度</div>
+                      <div className="mb-1 font-medium text-blue-700">{t("planner.planningProgress")}</div>
                       {stageHistory.slice(-5).map((item, index) => (
                         <div key={`${item.stage}-${item.attempt}-${index}`}>
-                          {STAGE_LABELS[item.stage]} · {item.status} · 第 {item.attempt} 次
+                          {STAGE_LABELS[item.stage]} · {item.status} · {t("planner.attemptN")} {item.attempt} {t("planner.times")}
                           {item.summary ? ` · ${item.summary}` : ""}
                         </div>
                       ))}

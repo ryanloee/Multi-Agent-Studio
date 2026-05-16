@@ -14,6 +14,7 @@ import "@xyflow/react/dist/style.css";
 
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
+import { useLocaleStore } from "@/stores/localeStore";
 import { nodeTypes } from "@/components/canvas/nodeTypes";
 import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow";
 import { NODE_META } from "@/lib/constants";
@@ -30,6 +31,7 @@ export default function FlowCanvas() {
   const focusNodeId = useWorkflowStore((s) => s.focusNodeId);
   const setFocusNode = useWorkflowStore((s) => s.setFocusNode);
   const mode = useWorkflowStore((s) => s.mode);
+  const t = useLocaleStore((s) => s.t);
 
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
   const allEvents = useRunStore((s) => s.events);
@@ -191,19 +193,19 @@ export default function FlowCanvas() {
             {mode === "auto" ? (
               <>
                 <p className="text-gray-500 text-base font-medium">
-                  自动规划模式
+                  {t("canvas.autoMode")}
                 </p>
                 <p className="text-gray-400 text-sm leading-relaxed">
-                  在底部面板的 Chat 标签页中与规划器对话，描述你的目标，规划器会自动构建工作流。
+                  {t("canvas.autoModeDesc")}
                 </p>
               </>
             ) : (
               <>
                 <p className="text-gray-500 text-base font-medium">
-                  从左侧节点库拖拽节点到此处
+                  {t("canvas.manualMode")}
                 </p>
                 <p className="text-gray-400 text-sm leading-relaxed">
-                  先拖一个「规划器」作为起点，再拖「编码器」「审查器」等节点，用连线把它们串起来，就是一个自动化工作流。
+                  {t("canvas.manualModeDesc")}
                 </p>
               </>
             )}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useMemo, useState, useCallback } from "react";
+import { useEffect, useRef, useMemo, useState } from "react";
 import { useRunStore } from "@/stores/runStore";
 import type { ShellStdoutEvent, ShellStderrEvent } from "@/types/events";
 
@@ -24,6 +24,10 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
   const fallbackRef = useRef<HTMLPreElement>(null);
 
   const [xtermReady, setXtermReady] = useState(false);
+
+  // Track how many events have been written to avoid full rewrites
+  const renderedCountRef = useRef(0);
+  const prevNodeIdRef = useRef(nodeId);
 
   const allEvents = useRunStore((s) => s.events);
   const events = useMemo(
@@ -112,19 +116,46 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
   }, []);
 
   // -----------------------------------------------------------------------
-  // Rebuild terminal content from current event history. This keeps the view
-  // correct after node switches, refresh restores, and late xterm initialisation.
+  // Write terminal content incrementally — only new events since last render
   // -----------------------------------------------------------------------
   useEffect(() => {
-    const text = events.map((ev) => ev.content).join("\n");
+    const nodeIdChanged = prevNodeIdRef.current !== nodeId;
+    prevNodeIdRef.current = nodeId;
+
+    if (nodeIdChanged) {
+      // Full rebuild on node filter change
+      renderedCountRef.current = 0;
+      const text = events.map((ev) => ev.content).join("\n");
+      if (termRef.current) {
+        termRef.current.clear();
+        if (text) termRef.current.write(text + "\n");
+        termRef.current.scrollToBottom();
+      } else if (fallbackRef.current) {
+        const pre = fallbackRef.current;
+        pre.textContent = text ? `${text}\n` : "";
+        pre.scrollTop = pre.scrollHeight;
+      }
+      renderedCountRef.current = events.length;
+      return;
+    }
+
+    // Incremental: write only new events
+    const prevCount = renderedCountRef.current;
+    if (events.length <= prevCount) return;
+
+    const newEvents = events.slice(prevCount);
+    renderedCountRef.current = events.length;
+
+    if (newEvents.length === 0) return;
+
+    const text = newEvents.map((ev) => ev.content).join("\n");
 
     if (termRef.current) {
-      termRef.current.clear();
-      if (text) termRef.current.write(text + "\n");
+      termRef.current.write(text + "\n");
       termRef.current.scrollToBottom();
     } else if (fallbackRef.current) {
       const pre = fallbackRef.current;
-      pre.textContent = text ? `${text}\n` : "";
+      pre.textContent += text + "\n";
       pre.scrollTop = pre.scrollHeight;
     }
   }, [events, xtermReady, nodeId]);

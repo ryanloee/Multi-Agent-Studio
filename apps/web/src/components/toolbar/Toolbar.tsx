@@ -137,7 +137,7 @@ export default function Toolbar({
       } catch {
         // ignore secondary fetch failure
       }
-      window.alert(err instanceof Error ? err.message : "启动工作流失败");
+      window.alert(err instanceof Error ? err.message : t("toolbar.runFailed"));
       setStatus("idle");
     } finally {
       setTriggering(false);
@@ -274,7 +274,7 @@ export default function Toolbar({
           ) : (
             <Save size={14} />
           )}
-          {saved ? t("toolbar.saved") || "已保存" : t("toolbar.save")}
+          {saved ? t("toolbar.saved") : t("toolbar.save")}
         </button>
 
         {/* Run / Cancel */}
@@ -291,7 +291,7 @@ export default function Toolbar({
             onClick={handleRun}
             disabled={triggering || nodes.length === 0}
             className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700 transition-all shadow-sm disabled:opacity-50"
-            title={hasWorkspaceDirectory ? t("toolbar.runShortcut") : "请先设置工作目录"}
+            title={hasWorkspaceDirectory ? t("toolbar.runShortcut") : t("toolbar.setDirFirst")}
           >
             {triggering ? (
               <Loader2 size={14} className="animate-spin" />

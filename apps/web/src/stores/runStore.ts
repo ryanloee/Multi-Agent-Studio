@@ -35,10 +35,139 @@ interface RunState {
 // ---------------------------------------------------------------------------
 // Helper: derive RunStatus from event content string
 // ---------------------------------------------------------------------------
+const VALID_RUN_STATUSES: RunStatus[] = [
+  "idle", "pending", "running", "paused", "cancelling", "cancelled", "completed", "failed",
+];
+
 function parseRunStatus(raw: string): RunStatus | null {
-  const valid: RunStatus[] = ["idle", "pending", "running", "paused", "cancelling", "cancelled", "completed", "failed"];
-  if (valid.includes(raw as RunStatus)) return raw as RunStatus;
-  return null;
+  return VALID_RUN_STATUSES.includes(raw as RunStatus) ? (raw as RunStatus) : null;
+}
+
+// ---------------------------------------------------------------------------
+// Event batching — coalesce rapid events into single state updates
+// ---------------------------------------------------------------------------
+const _eventIds = new Set<string>();
+let _pendingEvents: StreamEvent[] = [];
+let _flushRaf: number | null = null;
+const MAX_PENDING = 100;
+
+/** Apply a batch of events to the store in a single setState call */
+function _applyEvents(events: StreamEvent[]) {
+  if (events.length === 0) return;
+  const state = useRunStore.getState();
+
+  const newNodeStatuses = { ...state.nodeStatuses };
+  const newParentChildMap = { ...state.parentChildMap };
+  let newStatus = state.status;
+  let newProgressSummary = state.progressSummary;
+  let mutatedStatuses = false;
+  let mutatedParentChild = false;
+
+  for (const event of events) {
+    // -- status --
+    if (event.type === "status" && event.node_id) {
+      const parsed = parseRunStatus((event as StatusEvent).content);
+      if (parsed !== null) {
+        newNodeStatuses[event.node_id] = parsed;
+        mutatedStatuses = true;
+      }
+    }
+
+    // -- node lifecycle --
+    if (
+      event.node_id &&
+      (event.type === "node_started" ||
+        event.type === "node_completed" ||
+        event.type === "node_failed")
+    ) {
+      const map: Record<string, RunStatus> = {
+        node_started: "running",
+        node_completed: "completed",
+        node_failed: "failed",
+      };
+      newNodeStatuses[event.node_id] = map[event.type];
+      mutatedStatuses = true;
+    }
+
+    // -- run lifecycle --
+    if (event.type === "run_started") newStatus = "running";
+    if (event.type === "run_completed") newStatus = "completed";
+    if (event.type === "run_failed") newStatus = "failed";
+
+    // -- child_created --
+    if (event.type === "child_created") {
+      const ce = event as ChildCreatedEvent;
+      const parentId = event.node_id;
+      const childId = ce.child_node_id;
+      if (parentId && childId) {
+        const existing = newParentChildMap[parentId] ?? [];
+        newParentChildMap[parentId] = [...existing, childId];
+        mutatedParentChild = true;
+        if (!newNodeStatuses[childId]) {
+          newNodeStatuses[childId] = "pending";
+          mutatedStatuses = true;
+        }
+      }
+    }
+
+    // -- child_completed --
+    if (event.type === "child_completed") {
+      const ce = event as ChildCompletedEvent;
+      if (ce.child_node_id) {
+        newNodeStatuses[ce.child_node_id] = "completed";
+        mutatedStatuses = true;
+      }
+    }
+
+    // -- progress_summary --
+    if (event.type === "progress_summary") {
+      const ps = event as import("@/types/events").ProgressSummaryEvent;
+      newProgressSummary = { total: ps.total, completed: ps.completed, failed: ps.failed };
+    }
+
+    // -- infer running from activity events --
+    if (event.node_id) {
+      const cur = newNodeStatuses[event.node_id];
+      if (!cur || cur === "idle") {
+        newNodeStatuses[event.node_id] = "running";
+        mutatedStatuses = true;
+      }
+    }
+  }
+
+  useRunStore.setState({
+    events: [...state.events, ...events],
+    status: newStatus,
+    nodeStatuses: mutatedStatuses ? newNodeStatuses : state.nodeStatuses,
+    parentChildMap: mutatedParentChild ? newParentChildMap : state.parentChildMap,
+    progressSummary: newProgressSummary,
+  });
+}
+
+/** Flush the pending event buffer into the store */
+function _flushPending() {
+  if (_pendingEvents.length === 0) return;
+  const batch = _pendingEvents;
+  _pendingEvents = [];
+  _applyEvents(batch);
+}
+
+/** Schedule a batched flush on the next animation frame */
+function _scheduleFlush() {
+  if (_flushRaf === null) {
+    _flushRaf = requestAnimationFrame(() => {
+      _flushRaf = null;
+      _flushPending();
+    });
+  }
+  // Safety valve: if buffer grows too large, flush synchronously
+  if (_pendingEvents.length >= MAX_PENDING) {
+    if (_flushRaf !== null) {
+      cancelAnimationFrame(_flushRaf);
+      _flushRaf = null;
+    }
+    _flushPending();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -58,147 +187,52 @@ export const useRunStore = create<RunState>((set, get) => ({
   setStatus: (status) => set({ status }),
 
   addEvent: (event: StreamEvent) => {
-    const state = get();
-    if (event.event_id && state.events.some((existing) => existing.event_id === event.event_id)) {
-      return;
+    // O(1) dedup via Set
+    if (event.event_id) {
+      if (_eventIds.has(event.event_id)) return;
+      _eventIds.add(event.event_id);
     }
-
-    // Sync status events to nodeStatuses / global status
-    if (event.type === "status") {
-      const content = (event as StatusEvent).content;
-      const parsed = parseRunStatus(content);
-
-      if (parsed !== null) {
-        if (event.node_id) {
-          // Node-level status
-          set({
-            events: [...state.events, event],
-            nodeStatuses: { ...state.nodeStatuses, [event.node_id]: parsed },
-          });
-          return;
-        }
-      }
-    }
-
-    // Handle node lifecycle events (node_started, node_completed, node_failed)
-    if (
-      (event.type === "node_started" ||
-        event.type === "node_completed" ||
-        event.type === "node_failed") &&
-      event.node_id
-    ) {
-      const statusMap: Record<string, RunStatus> = {
-        node_started: "running",
-        node_completed: "completed",
-        node_failed: "failed",
-      };
-      set({
-        events: [...state.events, event],
-        nodeStatuses: {
-          ...state.nodeStatuses,
-          [event.node_id]: statusMap[event.type],
-        },
-      });
-      return;
-    }
-
-    // Handle run-level events
-    if (event.type === "run_started") {
-      set({ events: [...state.events, event], status: "running" });
-      return;
-    }
-    if (event.type === "run_completed") {
-      set({ events: [...state.events, event], status: "completed" });
-      return;
-    }
-    if (event.type === "run_failed") {
-      set({ events: [...state.events, event], status: "failed" });
-      return;
-    }
-
-    // Handle child_created — register parent-child relationship. The child is
-    // known to exist, but it should only become running after node/task events.
-    if (event.type === "child_created") {
-      const childEvent = event as ChildCreatedEvent;
-      const parentId = event.node_id;
-      const childId = childEvent.child_node_id;
-      if (parentId && childId) {
-        const existing = state.parentChildMap[parentId] ?? [];
-        set({
-          events: [...state.events, event],
-          parentChildMap: {
-            ...state.parentChildMap,
-            [parentId]: [...existing, childId],
-          },
-          nodeStatuses: {
-            ...state.nodeStatuses,
-            [childId]: state.nodeStatuses[childId] ?? "pending",
-          },
-        });
-        return;
-      }
-    }
-
-    // Handle child_completed — mark child as completed
-    if (event.type === "child_completed") {
-      const childEvent = event as ChildCompletedEvent;
-      const childId = childEvent.child_node_id;
-      if (childId) {
-        set({
-          events: [...state.events, event],
-          nodeStatuses: {
-            ...state.nodeStatuses,
-            [childId]: "completed",
-          },
-        });
-        return;
-      }
-    }
-
-    // Handle progress_summary
-    if (event.type === "progress_summary") {
-      const ps = event as import("@/types/events").ProgressSummaryEvent;
-      set({
-        events: [...state.events, event],
-        progressSummary: { total: ps.total, completed: ps.completed, failed: ps.failed },
-      });
-      return;
-    }
-
-    // Infer node running status from activity events
-    // (node_started may be missed if WS connected after it was published)
-    if (event.node_id) {
-      const currentStatus = state.nodeStatuses[event.node_id];
-      if (!currentStatus || currentStatus === "idle") {
-        set({
-          events: [...state.events, event],
-          nodeStatuses: {
-            ...state.nodeStatuses,
-            [event.node_id]: "running",
-          },
-        });
-        return;
-      }
-    }
-
-    // Default: just append the event
-    set({ events: [...state.events, event] });
+    _pendingEvents.push(event);
+    _scheduleFlush();
   },
 
   hydrateEvents: (events: StreamEvent[]) => {
-    set({ events: [], nodeStatuses: {}, parentChildMap: {}, progressSummary: null });
-    for (const event of events) {
-      get().addEvent(event);
+    // Reset batch state
+    _eventIds.clear();
+    _pendingEvents = [];
+    if (_flushRaf !== null) {
+      cancelAnimationFrame(_flushRaf);
+      _flushRaf = null;
     }
+    set({ events: [], nodeStatuses: {}, parentChildMap: {}, progressSummary: null });
+    // Register IDs and process immediately
+    const newEvents = events.filter((e) => {
+      if (e.event_id && _eventIds.has(e.event_id)) return false;
+      if (e.event_id) _eventIds.add(e.event_id);
+      return true;
+    });
+    _applyEvents(newEvents);
   },
 
   mergeEvents: (events: StreamEvent[]) => {
-    for (const event of events) {
-      get().addEvent(event);
-    }
+    // Dedup + register IDs, then process immediately (REST backfill)
+    const newEvents = events.filter((e) => {
+      if (e.event_id && _eventIds.has(e.event_id)) return false;
+      if (e.event_id) _eventIds.add(e.event_id);
+      return true;
+    });
+    _applyEvents(newEvents);
   },
 
-  clearEvents: () => set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {}, progressSummary: null }),
+  clearEvents: () => {
+    _eventIds.clear();
+    _pendingEvents = [];
+    if (_flushRaf !== null) {
+      cancelAnimationFrame(_flushRaf);
+      _flushRaf = null;
+    }
+    set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {}, progressSummary: null });
+  },
 
   setNodeStatus: (nodeId: string, status: RunStatus) => {
     set({ nodeStatuses: { ...get().nodeStatuses, [nodeId]: status } });

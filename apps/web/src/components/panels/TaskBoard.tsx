@@ -43,12 +43,12 @@ const STATUS_ICONS: Record<TaskStatus, LucideIcon> = {
   failed: XCircle,
 };
 
-const STATUS_LABELS: Record<TaskStatus, string> = {
-  pending: "未开始",
-  assigned: "已分配",
-  running: "进行中",
-  completed: "成功",
-  failed: "失败",
+const STATUS_LABEL_KEYS: Record<TaskStatus, string> = {
+  pending: "task.pending",
+  assigned: "task.assigned",
+  running: "task.running",
+  completed: "task.completed",
+  failed: "task.failed",
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +78,7 @@ const TaskLeaf = memo(function TaskLeaf({
   onAssign: (nodeId: string, nodeLabel: string, agentType: string, modelProvider: string, modelId: string, prompt: string) => void;
   workflowNodes: { id: string; label: string; agentType: string; modelProvider: string; modelId: string; prompt: string }[];
   nodeData?: { targetFiles?: string[]; interfaceContract?: string; contextSummary?: string };
+  t: (key: string) => string;
 }) {
   const [expanded, setExpanded] = useState(isSelected);
   const [editing, setEditing] = useState(false);
@@ -187,7 +188,7 @@ const TaskLeaf = memo(function TaskLeaf({
         <span
           className={`text-[9px] font-medium px-1.5 py-0.5 rounded-full ${config.bgColor} ${config.color} shrink-0`}
         >
-          {STATUS_LABELS[task.status]}
+          {t(STATUS_LABEL_KEYS[task.status])}
         </span>
 
         {task.retry_count > 0 && (
@@ -212,7 +213,7 @@ const TaskLeaf = memo(function TaskLeaf({
             <button
               onClick={(e) => { e.stopPropagation(); setAssigning(true); }}
               className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-blue-500"
-              title="重新分配节点"
+              title={t("task.reassignNode")}
             >
               <ArrowRightLeft size={9} />
             </button>
@@ -228,7 +229,7 @@ const TaskLeaf = memo(function TaskLeaf({
             onChange={(e) => setSelectedAssignNode(e.target.value)}
             className="w-full text-[10px] border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
           >
-            <option value="">选择执行节点...</option>
+            <option value="">{t("task.selectNode")}</option>
             {workflowNodes.map((node) => (
               <option key={node.id} value={node.id}>
                 {node.label} ({node.agentType})
@@ -241,13 +242,13 @@ const TaskLeaf = memo(function TaskLeaf({
               disabled={!selectedAssignNode}
               className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40"
             >
-              <Play size={9} /> 分配并执行
+              <Play size={9} /> {t("task.assignAndRun")}
             </button>
             <button
               onClick={() => { setAssigning(false); setSelectedAssignNode(""); }}
               className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-500 hover:bg-gray-200"
             >
-              <X size={9} /> 取消
+              <X size={9} /> {t("task.cancel")}
             </button>
           </div>
         </div>
@@ -260,7 +261,7 @@ const TaskLeaf = memo(function TaskLeaf({
             onClick={(e) => { e.stopPropagation(); setAssigning(true); }}
             className="flex items-center gap-1 text-[10px] text-gray-400 hover:text-blue-500"
           >
-            <ArrowRightLeft size={9} /> 分配节点
+            <ArrowRightLeft size={9} /> {t("task.assignNode")}
           </button>
         </div>
       )}
@@ -306,7 +307,7 @@ const TaskLeaf = memo(function TaskLeaf({
             <div className="text-[10px] bg-red-50 border border-red-100 rounded p-1.5">
               <div className="flex items-center gap-1 mb-0.5 font-medium text-red-600">
                 <AlertTriangle size={10} />
-                错误信息 {task.retry_count > 0 && `(重试 ${task.retry_count} 次)`}
+                {t("task.errorInfo")} {task.retry_count > 0 && `(${t("task.retryCount")} ${task.retry_count} ${t("task.times")})`}
               </div>
               <div className="text-red-700 max-h-20 overflow-y-auto whitespace-pre-wrap text-[9px]">
                 {task.last_error}
@@ -321,7 +322,7 @@ const TaskLeaf = memo(function TaskLeaf({
                 <div className="text-[10px]">
                   <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
                     <FileText size={10} className="text-orange-500" />
-                    目标文件
+                    {t("task.targetFiles")}
                   </div>
                   <div className="flex flex-wrap gap-1">
                     {nodeData.targetFiles.map((f) => (
@@ -336,7 +337,7 @@ const TaskLeaf = memo(function TaskLeaf({
                 <div className="text-[10px]">
                   <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
                     <GitBranch size={10} className="text-indigo-500" />
-                    接口契约
+                    {t("task.interfaceContract")}
                   </div>
                   <div className="text-gray-600 bg-indigo-50/60 rounded p-1.5 max-h-20 overflow-y-auto whitespace-pre-wrap text-[9px]">
                     {nodeData.interfaceContract}
@@ -347,7 +348,7 @@ const TaskLeaf = memo(function TaskLeaf({
                 <div className="text-[10px]">
                   <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
                     <Info size={10} className="text-teal-500" />
-                    上下文说明
+                    {t("task.contextDesc")}
                   </div>
                   <div className="text-gray-600 bg-teal-50/60 rounded p-1.5 max-h-20 overflow-y-auto whitespace-pre-wrap text-[9px]">
                     {nodeData.contextSummary}
@@ -475,9 +476,11 @@ const TaskLeaf = memo(function TaskLeaf({
 function NewTaskForm({
   onCreate,
   workflowNodes,
+  t,
 }: {
   onCreate: (title: string, description: string, nodeId?: string, nodeLabel?: string) => void;
   workflowNodes: { id: string; label: string; agentType: string; modelProvider: string; modelId: string; prompt: string }[];
+  t: (key: string) => string;
 }) {
   const [title, setTitle] = useState("");
   const [desc, setDesc] = useState("");
@@ -499,14 +502,14 @@ function NewTaskForm({
         type="text"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
-        placeholder="任务标题..."
+        placeholder={t("task.titlePlaceholder")}
         className="w-full text-[11px] border border-gray-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-400"
         onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
       />
       <textarea
         value={desc}
         onChange={(e) => setDesc(e.target.value)}
-        placeholder="任务描述（可选）..."
+        placeholder={t("task.descPlaceholder")}
         rows={2}
         className="w-full text-[10px] border border-gray-200 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-blue-400 resize-y"
       />
@@ -516,7 +519,7 @@ function NewTaskForm({
           onChange={(e) => setNodeId(e.target.value)}
           className="flex-1 text-[10px] border border-gray-200 rounded px-2 py-1 bg-white focus:outline-none focus:ring-1 focus:ring-blue-400"
         >
-          <option value="">自动分配节点</option>
+          <option value="">{t("task.autoAssign")}</option>
           {workflowNodes.map((node) => (
             <option key={node.id} value={node.id}>
               {node.label} ({node.agentType})
@@ -528,7 +531,7 @@ function NewTaskForm({
           disabled={!title.trim()}
           className="flex items-center gap-1 text-[10px] px-2.5 py-1 rounded bg-blue-500 text-white hover:bg-blue-600 disabled:opacity-40 shrink-0"
         >
-          <Plus size={10} /> 创建
+          <Plus size={10} /> {t("task.create")}
         </button>
       </div>
     </div>
@@ -821,10 +824,10 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
         <div className="px-3 py-2 border-b border-gray-100 shrink-0">
           <div className="flex items-center justify-between mb-1">
             <span className="text-[10px] text-gray-500">
-              {progressSummary.completed}/{progressSummary.total} 任务完成
+              {progressSummary.completed}/{progressSummary.total} {t("task.tasksComplete")}
             </span>
             <span className="text-[10px] text-gray-400">
-              {progressSummary.failed > 0 && `${progressSummary.failed} 失败`}
+              {progressSummary.failed > 0 && `${progressSummary.failed} ${t("task.failedCount")}`}
             </span>
           </div>
           <div className="h-1.5 bg-gray-200 rounded-full overflow-hidden flex">
@@ -854,7 +857,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
               viewMode === "topology" ? "bg-white text-gray-800 shadow-sm" : "text-gray-500 hover:text-gray-700"
             }`}
           >
-            {t("taskBoard.viewTopology") || "拓扑"}
+            {t("taskBoard.viewTopology")}
           </button>
           <button
             onClick={() => setViewMode("flat")}
@@ -862,7 +865,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
               viewMode === "flat" ? "bg-white text-gray-800 shadow-sm" : "text-gray-500 hover:text-gray-700"
             }`}
           >
-            {t("taskBoard.viewFlat") || "列表"}
+            {t("taskBoard.viewFlat")}
           </button>
         </div>
 
@@ -877,7 +880,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
                   : "bg-gray-100 text-gray-500 hover:bg-gray-200"
               }`}
             >
-              {status === "all" ? "All" : STATUS_LABELS[status]}
+              {status === "all" ? "All" : t(STATUS_LABEL_KEYS[status])}
               {statusCounts[status] ? ` (${statusCounts[status]})` : ""}
             </button>
           )
@@ -888,7 +891,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
           className="flex items-center gap-1 text-[10px] font-medium px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors"
         >
           <Plus size={10} />
-          新任务
+          {t("task.newTask")}
         </button>
       </div>
 
@@ -897,6 +900,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
         <NewTaskForm
           onCreate={handleCreateTask}
           workflowNodes={workflowNodes}
+          t={t}
         />
       )}
 
@@ -905,7 +909,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
         {filteredTasks.length === 0 ? (
           <div className="text-center py-8">
             <p className="text-xs text-gray-400">
-              {filterStatus === "all" ? "No tasks yet" : `No ${STATUS_LABELS[filterStatus]} tasks`}
+              {filterStatus === "all" ? "No tasks yet" : `No ${t(STATUS_LABEL_KEYS[filterStatus])} tasks`}
             </p>
           </div>
         ) : viewMode === "topology" ? (
@@ -933,6 +937,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
               }
               workflowNodes={workflowNodes}
               nodeData={task.assigned_node_id ? nodeDataMap[task.assigned_node_id] : undefined}
+              t={t}
             />
           ))
         )}

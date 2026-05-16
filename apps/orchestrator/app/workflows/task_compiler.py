@@ -59,11 +59,11 @@ def compile_task_list_to_dag(
             if dep not in task_ids:
                 missing_deps.append(f"{task['id']} depends on missing '{dep}'")
 
-    # Step 3: Auto-insert structural nodes
-    if auto_add_structural:
-        normalized = _auto_add_merge_nodes(normalized)
-        normalized = _auto_add_review_node(normalized, title, objective)
-        normalized = _auto_add_shell_node(normalized, title, objective)
+    # Step 3: Auto-insert structural nodes only for complex task lists
+    if auto_add_structural and len(normalized) >= 5:
+        _ensure_merge_after_parallel(normalized)
+        if not any(t["type"] == "shell" for t in normalized):
+            normalized = _auto_add_shell_node(normalized, title, objective)
 
     # Step 4: Build edges from depends_on
     edges: list[dict] = []
@@ -180,32 +180,31 @@ def _validate_and_normalize(tasks: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
-def _auto_add_merge_nodes(tasks: list[dict]) -> list[dict]:
-    """Insert merge nodes after groups of 2+ parallel coders."""
+def _ensure_merge_after_parallel(tasks: list[dict]) -> None:
+    """Only insert a merge node if 2+ parallel coders share the same deps AND
+    no existing node (of any type) depends on all of them.  Mutates tasks in-place."""
     coder_tasks = [t for t in tasks if t["type"] == "coder"]
     if len(coder_tasks) < 2:
-        return tasks
+        return
 
-    # Group coders by their shared dependencies (parallel siblings)
     dep_groups: dict[tuple[str, ...], list[dict]] = {}
     for coder in coder_tasks:
         dep_key = tuple(sorted(coder.get("depends_on", [])))
         dep_groups.setdefault(dep_key, []).append(coder)
 
-    result = list(tasks)
     for dep_key, group in dep_groups.items():
         if len(group) < 2:
             continue
         coder_ids = {t["id"] for t in group}
-        # Check if a merge node already depends on all of them
-        has_merge = any(
-            t["type"] == "merge" and coder_ids.issubset(set(t.get("depends_on", [])))
-            for t in result
+        # Already have something that collects all parallel outputs? Skip.
+        already_collected = any(
+            coder_ids.issubset(set(t.get("depends_on", [])))
+            for t in tasks
         )
-        if has_merge:
+        if already_collected:
             continue
-        merge_id = _unique_id(result, f"merge_{'_'.join(sorted(coder_ids)[:3])}")
-        merge_task: dict = {
+        merge_id = _unique_id(tasks, f"merge_{'_'.join(sorted(coder_ids)[:3])}")
+        tasks.append({
             "id": merge_id,
             "type": "merge",
             "label": "合并并行实现改动",
@@ -216,40 +215,8 @@ def _auto_add_merge_nodes(tasks: list[dict]) -> list[dict]:
                 "验收标准：所有上游改动已集成或明确列出阻塞冲突。"
             ),
             "depends_on": sorted(coder_ids),
-        }
-        result.append(merge_task)
-    return result
+        })
 
-
-def _auto_add_review_node(tasks: list[dict], title: str, objective: str) -> list[dict]:
-    """Add a review node if none exists."""
-    has_review = any(t["type"] == "review" for t in tasks)
-    if has_review:
-        return tasks
-
-    terminal_ids = _find_terminal_ids(tasks)
-    # Prefer merge/coder as review deps
-    review_deps: list[str] = []
-    for t in tasks:
-        if t["id"] in terminal_ids and t["type"] in ("merge", "coder"):
-            review_deps.append(t["id"])
-    if not review_deps:
-        review_deps = sorted(terminal_ids)[:3]
-
-    review_id = _unique_id(tasks, "review_implementation")
-    review_task: dict = {
-        "id": review_id,
-        "type": "review",
-        "label": "审查实现质量与风险",
-        "prompt": (
-            f"目标：审查「{title}」实现的正确性、安全性、边界条件和回归风险。\n"
-            f"背景：{objective}\n"
-            "产出格式：review_report。\n"
-            "验收标准：列出高风险问题或确认可以进入测试。"
-        ),
-        "depends_on": review_deps,
-    }
-    return tasks + [review_task]
 
 
 def _auto_add_shell_node(tasks: list[dict], title: str, objective: str) -> list[dict]:
