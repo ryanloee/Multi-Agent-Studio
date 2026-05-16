@@ -48,7 +48,7 @@ export default function PlannerChatTab() {
   const setPlannerDraftState = useWorkflowStore((s) => s.setPlannerDraftState);
   const setPlannerActionState = useWorkflowStore((s) => s.setPlannerActionState);
   const setPlannerSubStage = useWorkflowStore((s) => s.setPlannerSubStage);
-  const applyPlannerDagPreview = useWorkflowStore((s) => s.applyPlannerDagPreview);
+
   const clearPlannerDraftState = useWorkflowStore((s) => s.clearPlannerDraftState);
 
   const selectedNodeId = usePlannerChatStore((s) => s.selectedNodeId);
@@ -388,9 +388,7 @@ export default function PlannerChatTab() {
                 }
                 return updated;
               });
-              if (event.draft) {
-                if (event.dag) applyPlannerDagPreview(event.dag);
-              } else if (currentWorkflowId) {
+              if (!event.draft && currentWorkflowId) {
                 const updated = await api.getWorkflow(currentWorkflowId);
                 loadWorkflow(updated);
               }
@@ -456,7 +454,6 @@ export default function PlannerChatTab() {
     setPlannerDraftState,
     setPlannerActionState,
     setPlannerSubStage,
-    applyPlannerDagPreview,
     clearPlannerDraftState,
     setCurrentStage,
     setStageAttempt,
