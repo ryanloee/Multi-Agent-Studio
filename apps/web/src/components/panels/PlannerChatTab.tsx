@@ -328,7 +328,7 @@ export default function PlannerChatTab() {
             } else if (event.type === "planner_contract_error") {
               const blockers = Array.isArray(event.blockers) ? event.blockers : [];
               setBlockers(blockers);
-              setLifecyclePhase("blocked");
+              setLifecyclePhase("review");
               setMessages((prev) => {
                 const updated = [...prev];
                 const last = updated[updated.length - 1];
@@ -373,7 +373,7 @@ export default function PlannerChatTab() {
                 setLifecyclePhase("ready");
                 setBlockers([]);
               } else if (action?.action === "report_blocker") {
-                setLifecyclePhase("blocked");
+                setLifecyclePhase("review");
               } else if (action?.action === "update_dag") {
                 setLifecyclePhase("planning");
                 setBlockers([]);

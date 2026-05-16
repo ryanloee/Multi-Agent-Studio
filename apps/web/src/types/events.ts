@@ -24,9 +24,6 @@ export type StreamEventType =
   | "task_updated"
   | "task_message"
   | "worker_message"
-  | "planner_guidance"
-  | "task_blocked"
-  | "task_unblocked"
   | "artifact_created"
   | "progress_summary"
   | "agent_heartbeat"
@@ -252,9 +249,6 @@ export interface StreamEventMap {
   task_updated: StreamEvent;
   task_message: StreamEvent;
   worker_message: StreamEvent;
-  planner_guidance: StreamEvent;
-  task_blocked: StreamEvent;
-  task_unblocked: StreamEvent;
   artifact_created: ArtifactCreatedEvent;
   progress_summary: ProgressSummaryEvent;
   agent_heartbeat: AgentHeartbeatEvent;

@@ -76,16 +76,29 @@ class DisplaySettings(BaseModel):
     compact_mode: bool = Field(default=False, description="紧凑模式")
 
 
+class ModelStrategy(BaseModel):
+    """Per-role model assignments.  Value format: 'provider/model_id' or just 'model_id'."""
+    planner: str = Field(default="", description="Planner 模型")
+    design: str = Field(default="", description="Design 模型")
+    review: str = Field(default="", description="Review 模型")
+    merge: str = Field(default="", description="Merge 模型")
+    explore: str = Field(default="", description="Explore 模型")
+    coder: str = Field(default="", description="Coder 模型")
+    shell: str = Field(default="", description="Shell 模型")
+
+
 class SettingsResponse(BaseModel):
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     display: DisplaySettings = Field(default_factory=DisplaySettings)
     models: list[ModelEntry] = Field(default_factory=list)
+    model_strategy: ModelStrategy = Field(default_factory=ModelStrategy)
 
 
 class UpdateSettingsRequest(BaseModel):
     general: GeneralSettings | None = None
     display: DisplaySettings | None = None
     models: list[ModelEntry] | None = None
+    model_strategy: ModelStrategy | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +133,10 @@ async def update_settings(body: UpdateSettingsRequest) -> SettingsResponse:
         stored.setdefault("display", {}).update(body.display.model_dump(exclude_unset=True))
     if body.models is not None:
         stored["models"] = [m.model_dump() for m in body.models]
+    if body.model_strategy is not None:
+        stored.setdefault("model_strategy", {}).update(
+            body.model_strategy.model_dump(exclude_unset=True)
+        )
 
     _write_settings(stored)
 

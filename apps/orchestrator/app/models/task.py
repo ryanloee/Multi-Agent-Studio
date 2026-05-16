@@ -39,6 +39,8 @@ class Task(Base):
     progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     result_summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     dependencies: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(),
     )

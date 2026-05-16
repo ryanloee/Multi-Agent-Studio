@@ -22,13 +22,24 @@ export interface DisplaySettings {
   compact_mode: boolean;
 }
 
+export interface ModelStrategy {
+  planner: string;
+  design: string;
+  review: string;
+  merge: string;
+  explore: string;
+  coder: string;
+  shell: string;
+}
+
 export interface AppSettings {
   general: GeneralSettings;
   display: DisplaySettings;
   models: ModelEntry[];
+  model_strategy: ModelStrategy;
 }
 
-export type SettingsTab = "general" | "display" | "models";
+export type SettingsTab = "general" | "display" | "models" | "strategy";
 
 // ---------------------------------------------------------------------------
 // Path validation (from POST /api/settings/validate-path)

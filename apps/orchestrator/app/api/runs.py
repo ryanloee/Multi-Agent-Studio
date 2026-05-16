@@ -247,11 +247,9 @@ async def trigger_run(
     Steps:
     1. Look up workflow from DB to get DAG JSON, mode, and goal.
     2. Recover or validate DAG from planner chat history.
-    3. Compile DAG into execution layers via compiler.compile_dag().
-    4. Start DAG execution in the background via start_task_dag().
-    5. Persist run record to DB and return it.
+    3. Start DAG execution in the background via start_run().
+    4. Persist run record to DB and return it.
     """
-    from app.workflows.compiler import compile_dag
 
     engine = _require_engine()
 
@@ -317,7 +315,7 @@ async def trigger_run(
                 )
                 break
         if not saved_nodes and saw_unparsed_plan:
-            workflow.lifecycle_phase = "blocked"
+            workflow.lifecycle_phase = "review"
             workflow.blockers_json = [{
                 "code": "planner_dag_parse_failed",
                 "message": "Planner 曾输出结构化计划，但 JSON 不完整或无效，系统无法恢复画布节点。请让 Planner 重新生成更简洁的 DAG。",
@@ -331,7 +329,7 @@ async def trigger_run(
 
     blockers = _validate_run_request(workflow, saved_dag)
     if blockers:
-        workflow.lifecycle_phase = "blocked"
+        workflow.lifecycle_phase = "review"
         workflow.blockers_json = blockers
         await db.commit()
         raise HTTPException(status_code=400, detail=blockers[0]["message"])
@@ -342,7 +340,7 @@ async def trigger_run(
         global_config["_mode"] = "auto"
         global_config["_goal"] = goal
     else:
-        workflow.lifecycle_phase = "blocked"
+        workflow.lifecycle_phase = "review"
         workflow.blockers_json = [{
             "code": "dag_empty",
             "message": "当前只有 Planner 规划，没有形成可执行 DAG。请先在 Planner 中完成方案并进入 Ready。",
@@ -368,8 +366,8 @@ async def trigger_run(
     await db.commit()
     await db.refresh(run)
 
-    # 4. Start execution via LocalDAGExecutor (always task_dag mode)
-    await engine.start_task_dag(
+    # 4. Start execution via LocalDAGExecutor
+    await engine.start_run(
         run_id=str(run_id),
         dag_json=dag_json or {},
         global_config=global_config,

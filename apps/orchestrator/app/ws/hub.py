@@ -9,7 +9,8 @@ Features:
 import asyncio
 import json
 import logging
-from collections import deque
+import os
+import time
 from typing import Any
 
 from fastapi import WebSocket
@@ -21,8 +22,11 @@ logger = logging.getLogger(__name__)
 # Heartbeat interval in seconds
 _HEARTBEAT_INTERVAL = 30
 
-# Max buffered events per run (prevents unbounded memory growth)
-_MAX_BUFFER_SIZE = 500
+# Stale connection timeout in seconds (no pong received within this window)
+_STALE_TIMEOUT = 60
+
+# Cleanup grace period in seconds (time to wait before stopping subscriptions)
+_CLEANUP_GRACE_PERIOD = int(os.environ.get("MAS_WS_CLEANUP_GRACE", "5"))
 
 
 class WebSocketHub:
@@ -33,7 +37,8 @@ class WebSocketHub:
         self._connections: dict[str, list[WebSocket]] = {}  # run_id -> [ws]
         self._event_bus = event_bus
         self._heartbeat_tasks: dict[str, asyncio.Task] = {}  # run_id -> heartbeat task
-        self._event_buffer: dict[str, deque[dict]] = {}  # run_id -> buffered events
+        self._last_active: dict[WebSocket, float] = {}  # ws -> timestamp of last successful send
+        self._cleanup_locks: dict[str, asyncio.Lock] = {}  # run_id -> lock for cleanup race
 
     # ------------------------------------------------------------------
     # Event bus helpers
@@ -82,11 +87,28 @@ class WebSocketHub:
                 pass
 
     async def _heartbeat_loop(self, run_id: str) -> None:
-        """Send a ping to all WebSocket clients for *run_id* every 30 s."""
+        """Send a ping to all WebSocket clients for *run_id* every 30 s.
+
+        Tracks last successful send and removes stale connections that
+        haven't received a message within _STALE_TIMEOUT seconds.
+        """
         try:
             while True:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL)
-                await self.broadcast(run_id, {"type": "ping"})
+                now = time.monotonic()
+                stale: list[WebSocket] = []
+                for ws in list(self._connections.get(run_id, [])):
+                    last = self._last_active.get(ws, 0)
+                    if last > 0 and (now - last) > _STALE_TIMEOUT:
+                        stale.append(ws)
+                        continue
+                    try:
+                        await ws.send_text(json.dumps({"type": "ping"}))
+                        self._last_active[ws] = time.monotonic()
+                    except Exception:
+                        stale.append(ws)
+                for ws in stale:
+                    self.disconnect(ws, run_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -100,27 +122,24 @@ class WebSocketHub:
         """Accept a WebSocket connection and register it for *run_id*.
 
         On first connection for a run, also starts the event bus listener
-        and heartbeat task.  Flushes any buffered events to the new client.
+        and heartbeat task.  Late-connecting clients replay from the event
+        bus buffer (handled by InProcessEventBus.subscribe).
         """
         await websocket.accept()
-        if run_id not in self._connections:
+        is_first = run_id not in self._connections
+        if is_first:
             self._connections[run_id] = []
+        self._connections[run_id].append(websocket)
+        self._last_active[websocket] = time.monotonic()
+
+        if is_first:
             # First client -> start event bus subscription + heartbeat
             await self._start_listening(run_id)
             await self._start_heartbeat(run_id)
-        self._connections[run_id].append(websocket)
-
-        # Flush buffered events so late-connecting clients don't miss early ones
-        buffer = self._event_buffer.get(run_id)
-        if buffer:
-            logger.info(
-                "Flushing %d buffered events for run %s", len(buffer), run_id
-            )
-            for msg in buffer:
-                try:
-                    await websocket.send_text(json.dumps(msg))
-                except Exception:
-                    break
+            # Cancel any pending cleanup
+            if run_id in self._cleanup_locks:
+                async with self._cleanup_locks[run_id]:
+                    pass  # just acquire to block if cleanup is in flight
 
         logger.info(
             "WebSocket connected for run %s (%d clients)",
@@ -130,47 +149,73 @@ class WebSocketHub:
     def disconnect(self, websocket: WebSocket, run_id: str) -> None:
         """Remove a WebSocket connection. Stops event bus subscription and
         heartbeat when the last client disconnects."""
-        if run_id in self._connections:
-            try:
-                self._connections[run_id].remove(websocket)
-            except ValueError:
-                pass
-            if not self._connections[run_id]:
-                del self._connections[run_id]
-                # Schedule cleanup (cannot await in sync context)
-                asyncio.create_task(self._cleanup_run(run_id))
-                logger.info("Last client disconnected for run %s", run_id)
-            else:
-                logger.info(
-                    "WebSocket disconnected for run %s (%d remaining)",
-                    run_id, len(self._connections[run_id]),
-                )
+        conns = self._connections.get(run_id, [])
+        try:
+            conns.remove(websocket)
+        except ValueError:
+            pass
+        self._last_active.pop(websocket, None)
+
+        if not conns:
+            self._connections.pop(run_id, None)
+            # Schedule cleanup (cannot await in sync context)
+            task = asyncio.create_task(self._cleanup_run(run_id))
+            task.add_done_callback(
+                lambda t: logger.exception("Cleanup failed for run %s", run_id)
+                if (not t.cancelled() and t.exception()) else None
+            )
+            logger.info("Last client disconnected for run %s", run_id)
+        else:
+            logger.info(
+                "WebSocket disconnected for run %s (%d remaining)",
+                run_id, len(conns),
+            )
 
     async def _cleanup_run(self, run_id: str) -> None:
-        """Stop event bus listener and heartbeat when no clients remain."""
-        await self._stop_listening(run_id)
-        await self._stop_heartbeat(run_id)
-        self._event_buffer.pop(run_id, None)
+        """Stop event bus listener and heartbeat when no clients remain.
+
+        Uses a grace period and re-check to prevent race with new connect().
+        """
+        # Ensure a lock exists for this run_id
+        if run_id not in self._cleanup_locks:
+            self._cleanup_locks[run_id] = asyncio.Lock()
+
+        async with self._cleanup_locks[run_id]:
+            await asyncio.sleep(_CLEANUP_GRACE_PERIOD)  # grace period
+
+            # Check if someone reconnected during grace period
+            if run_id in self._connections and self._connections[run_id]:
+                logger.info("Client reconnected during cleanup grace period for run %s", run_id)
+                return
+
+            await self._stop_listening(run_id)
+            await self._stop_heartbeat(run_id)
+            self._cleanup_locks.pop(run_id, None)
 
     async def broadcast(self, run_id: str, message: dict[str, Any]) -> None:
-        """Send a JSON message to every WebSocket connected for *run_id*.
-
-        Also buffers events so late-connecting clients can replay them.
-        """
-        # Buffer for late-connecting clients
-        if run_id not in self._event_buffer:
-            self._event_buffer[run_id] = deque(maxlen=_MAX_BUFFER_SIZE)
-        self._event_buffer[run_id].append(message)
-
+        """Send a JSON message to every WebSocket connected for *run_id*."""
         if run_id not in self._connections:
             return
         data = json.dumps(message)
-        stale: list[WebSocket] = []
-        for ws in self._connections[run_id]:
+        now = time.monotonic()
+
+        async def _send(ws: WebSocket) -> bool:
             try:
                 await ws.send_text(data)
+                self._last_active[ws] = now
+                return True
             except Exception:
-                stale.append(ws)
+                return False
+
+        results = await asyncio.gather(
+            *[_send(ws) for ws in self._connections[run_id]],
+            return_exceptions=False,
+        )
+
+        # Remove stale connections
+        stale = [
+            ws for ws, ok in zip(self._connections[run_id], results) if not ok
+        ]
         for ws in stale:
             self.disconnect(ws, run_id)
 

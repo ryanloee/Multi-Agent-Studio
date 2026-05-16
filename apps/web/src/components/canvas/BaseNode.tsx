@@ -197,9 +197,7 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
     taskForNode ? s.artifacts.filter((artifact) => artifact.task_id === taskForNode.id).length : 0
   );
   const collaborationCount = taskMessages.filter((message) =>
-    message.message_type === "worker_question" ||
-    message.message_type === "planner_question" ||
-    message.message_type === "planner_answer"
+    message.message_type === "worker_question"
   ).length;
   const lastTaskMessage = taskMessages[taskMessages.length - 1];
   const detailText =
@@ -290,16 +288,7 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
               {nodeStatus}
             </span>
           )}
-          {/* Task-specific status: blocked (escalation) or progress */}
-          {taskForNode && taskForNode.status === "blocked" && (
-            <>
-              <span className="relative flex h-2 w-2">
-                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500" />
-              </span>
-              <span className="text-xs text-amber-600 font-medium">等待协助...</span>
-            </>
-          )}
+          {/* Task-specific progress */}
           {taskForNode && taskForNode.status === "running" && taskForNode.progress > 0 && (
             <span className="text-[10px] font-mono text-blue-500 ml-auto">
               {taskForNode.progress}%

@@ -147,13 +147,17 @@ function npmForProvider(provider: string, baseURL: string) {
 }
 
 function resolveProviderConfig(provider: string, baseURL: string) {
-  // Previously converted bigmodel Anthropic -> OpenAI compatible, but GLM
-  // keys often only have quota on the Anthropic endpoint. Keep original.
+  // The @ai-sdk/anthropic SDK appends /messages to baseURL.
+  // For GLM's Anthropic endpoint to work correctly, baseURL must end with /v1.
+  let resolvedURL = baseURL
+  if (provider === "anthropic" && resolvedURL && !resolvedURL.endsWith("/v1")) {
+    resolvedURL = resolvedURL.replace(/\/+$/, "") + "/v1"
+  }
   return {
     provider,
-    baseURL,
+    baseURL: resolvedURL,
     npm: npmForProvider(provider, baseURL),
-    note: "",
+    note: provider === "anthropic" && resolvedURL !== baseURL ? "appended_v1_for_anthropic_sdk" : "",
   }
 }
 

@@ -316,7 +316,7 @@ async def assess_workflow(
 
     workspace_directory = (workflow.workspace_directory or "").strip()
     if not workspace_directory:
-        workflow.lifecycle_phase = "blocked"
+        workflow.lifecycle_phase = "review"
         workflow.blockers_json = [{
             "code": "workspace_missing",
             "message": "未设置工作目录，无法进行项目评估。",
@@ -326,7 +326,7 @@ async def assess_workflow(
 
     workspace = Path(workspace_directory).expanduser()
     if not workspace.exists() or not workspace.is_dir():
-        workflow.lifecycle_phase = "blocked"
+        workflow.lifecycle_phase = "review"
         workflow.blockers_json = [{
             "code": "workspace_missing",
             "message": f"工作目录不存在或不可用: {workspace_directory}",

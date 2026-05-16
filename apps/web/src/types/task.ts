@@ -12,6 +12,8 @@ export interface Task {
   progress: number;
   result_summary: string;
   dependencies?: string;
+  retry_count: number;
+  last_error: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -45,7 +47,6 @@ export type TaskStatus =
   | "pending"
   | "assigned"
   | "running"
-  | "blocked"
   | "completed"
   | "failed";
 
@@ -63,8 +64,6 @@ export interface TaskMessage {
     | "user_edit"
     | "worker_question"
     | "worker_answer"
-    | "planner_question"
-    | "planner_answer"
     | "artifact_created";
   content: string;
   target_node_id?: string | null;
@@ -80,7 +79,6 @@ export const TASK_STATUS_CONFIG: Record<
   pending:   { color: "text-gray-400",  bgColor: "bg-gray-100",  label: "Pending",   icon: "○" },
   assigned:  { color: "text-blue-500",  bgColor: "bg-blue-100",  label: "Assigned",  icon: "◎" },
   running:   { color: "text-blue-600",  bgColor: "bg-blue-100",  label: "Running",   icon: "●" },
-  blocked:   { color: "text-amber-600", bgColor: "bg-amber-100", label: "Blocked",   icon: "⊘" },
   completed: { color: "text-green-600", bgColor: "bg-green-100", label: "Completed", icon: "✓" },
   failed:    { color: "text-red-600",   bgColor: "bg-red-100",   label: "Failed",    icon: "✗" },
 };

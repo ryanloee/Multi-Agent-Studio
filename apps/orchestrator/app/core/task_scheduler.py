@@ -22,11 +22,6 @@ from app.sandbox.provision import SandboxProvisioner
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Escalation protocol markers injected into worker prompts
-# ---------------------------------------------------------------------------
-
-ESCALATION_MARKER = "ESCALATE_TO_PLANNER:"
 PROGRESS_MARKER = "TASK_PROGRESS:"
 ASK_WORKER_MARKER = "ASK_WORKER:"
 BROADCAST_MARKER = "BROADCAST_TO_PEERS:"
@@ -39,7 +34,7 @@ class ManagedTask:
     run_id: str
     title: str
     description: str
-    status: str = "pending"  # pending | assigned | running | blocked | completed | failed
+    status: str = "pending"  # pending | assigned | running | completed | failed
     assigned_node_id: str | None = None
     assigned_worker_label: str | None = None
     worker_task: asyncio.Task | None = None
@@ -107,6 +102,10 @@ class TaskScheduler:
                             row.assigned_node_id = kwargs["assigned_node_id"]
                         if "assigned_worker_label" in kwargs:
                             row.assigned_worker_label = kwargs["assigned_worker_label"]
+                        if "retry_count" in kwargs:
+                            row.retry_count = kwargs["retry_count"]
+                        if "last_error" in kwargs:
+                            row.last_error = kwargs["last_error"]
                         await session.commit()
             except Exception:
                 logger.warning("Failed to update task %s in DB", task.db_id, exc_info=True)
@@ -124,7 +123,7 @@ class TaskScheduler:
         )
 
     # ------------------------------------------------------------------
-    # Worker execution with escalation support
+    # Worker execution
     # ------------------------------------------------------------------
 
     async def run_worker_task(
@@ -134,178 +133,99 @@ class TaskScheduler:
         global_config: dict,
         cancel_event: asyncio.Event,
         db_session=None,
-        planner_node: dict | None = None,
-        max_escalations: int = 3,
         layer_results: dict[str, Any] | None = None,
         workspace_directory: str | None = None,
         upstream_context: str = "",
         sandbox_id: str | None = None,
         destroy_owned_sandbox: bool = True,
     ) -> dict:
-        """Execute a worker node for a given task, handling escalations.
+        """Execute a worker node for a given task.
 
         The worker prompt is augmented with:
         - Task context (title + description)
-        - Escalation protocol (ESCALATE_TO_PLANNER: marker)
         - Progress reporting (TASK_PROGRESS: marker)
-
-        If the worker emits ESCALATE_TO_PLANNER:, the scheduler pauses
-        the task, asks the Planner for guidance, and resumes the worker
-        with the answer.
         """
-        escalation_count = 0
+        if cancel_event.is_set():
+            await self.update_task_status(task, "failed", db_session)
+            return {"state": "failed", "error": "cancelled"}
 
-        while escalation_count < max_escalations:
-            if cancel_event.is_set():
-                await self.update_task_status(task, "failed", db_session)
-                return {"state": "failed", "error": "cancelled"}
-
-            # Mark running
-            if task.status != "running":
-                await self.update_task_status(
-                    task, "running", db_session,
-                    assigned_node_id=worker_node.get("id", ""),
-                    assigned_worker_label=self._worker_label(worker_node),
-                )
-
-            runtime_context = await self._build_runtime_context(
-                task.run_id, worker_node.get("id", ""),
-            )
-            execution_node = dict(worker_node)
-            extra_context = upstream_context + runtime_context
-            if extra_context:
-                execution_node["prompt"] = worker_node.get("prompt", "") + extra_context
-
-            # Execute the node
-            shared_layer_results = layer_results if layer_results is not None else {}
-            result = await self._execute_node(
-                task.run_id, execution_node, shared_layer_results, global_config, cancel_event,
-                workspace_directory=workspace_directory,
-                upstream_context="",
-                sandbox_id=sandbox_id,
-                destroy_owned_sandbox=destroy_owned_sandbox,
+        # Mark running
+        if task.status != "running":
+            await self.update_task_status(
+                task, "running", db_session,
+                assigned_node_id=worker_node.get("id", ""),
+                assigned_worker_label=self._worker_label(worker_node),
             )
 
-            state = result.get("state", "failed")
-            raw_output = result.get("raw_output", "")
+        runtime_context = await self._build_runtime_context(
+            task.run_id, worker_node.get("id", ""),
+        )
+        execution_node = dict(worker_node)
+        extra_context = upstream_context + runtime_context
+        if extra_context:
+            execution_node["prompt"] = worker_node.get("prompt", "") + extra_context
 
-            logger.info(
-                "Worker %s execution result: state=%s, exit_code=%s, error=%s",
-                worker_node.get("id"), state,
-                result.get("exit_code"), result.get("error", "")[:200],
+        # Execute the node
+        shared_layer_results = layer_results if layer_results is not None else {}
+        result = await self._execute_node(
+            task.run_id, execution_node, shared_layer_results, global_config, cancel_event,
+            workspace_directory=workspace_directory,
+            upstream_context="",
+            sandbox_id=sandbox_id,
+            destroy_owned_sandbox=destroy_owned_sandbox,
+        )
+
+        state = result.get("state", "failed")
+        raw_output = result.get("raw_output", "")
+
+        logger.info(
+            "Worker %s execution result: state=%s, exit_code=%s, error=%s",
+            worker_node.get("id"), state,
+            result.get("exit_code"), result.get("error", "")[:200],
+        )
+
+        progress_pct = self._extract_progress(raw_output)
+        if progress_pct is not None:
+            await self.update_task_status(
+                task, task.status, db_session, progress=progress_pct,
             )
 
-            # Parse escalation marker from output
-            escalation_question = self._extract_escalation(raw_output)
-            progress_pct = self._extract_progress(raw_output)
+        for target_node_id, question in self._extract_worker_questions(raw_output):
+            await self._handle_worker_question(
+                task=task,
+                source_node_id=worker_node.get("id", ""),
+                target_node_id=target_node_id,
+                question=question,
+                global_config=global_config,
+                db_session=db_session,
+            )
 
-            if progress_pct is not None:
-                await self.update_task_status(
-                    task, task.status, db_session, progress=progress_pct,
-                )
-
-            if escalation_question and planner_node:
-                escalation_count += 1
-                logger.info(
-                    "Worker %s escalated (count=%d/%d): %s",
-                    worker_node.get("id"), escalation_count, max_escalations,
-                    escalation_question[:100],
-                )
-
-                # Record escalation message
-                await self._record_message(
-                    task, "worker", worker_node.get("id", ""),
-                    "planner_question", escalation_question, db_session,
-                )
-
-                # Mark blocked
-                await self.update_task_status(task, "blocked", db_session)
-                await self._emit(
-                    "task_blocked", task.run_id, worker_node.get("id", ""),
-                    task_id=task.db_id,
-                    content=escalation_question,
-                )
-
-                # Ask planner
-                answer = await self._planner_answer(
-                    escalation_question, task, planner_node,
-                    task.run_id, global_config, cancel_event,
-                    workspace_directory=workspace_directory,
-                )
-
-                # Record planner answer
-                await self._record_message(
-                    task, "planner", "planner",
-                    "planner_answer", answer, db_session,
-                )
-                await self._emit(
-                    "planner_guidance", task.run_id, worker_node.get("id", ""),
-                    task_id=task.db_id,
-                    content=answer,
-                )
-                await self.update_task_status(task, "running", db_session)
-                await self._emit(
-                    "task_unblocked", task.run_id, worker_node.get("id", ""),
-                    task_id=task.db_id,
-                    content="Planner guidance received",
-                )
-                worker_node = {
-                    **worker_node,
-                    "prompt": (
-                        worker_node.get("prompt", "")
-                        + "\n\n## Planner guidance for previous escalation\n"
-                        + answer
-                        + "\n\nContinue the task from this guidance. Do not repeat the escalation unless a new blocker appears.\n"
-                    ),
-                }
-
-                # Resume — continue the loop
-                continue
-
-            for target_node_id, question in self._extract_worker_questions(raw_output):
+        broadcast = self._extract_broadcast(raw_output)
+        if broadcast:
+            for target_node_id in self._broadcast_targets(
+                worker_node.get("id", ""), global_config,
+            ):
                 await self._handle_worker_question(
                     task=task,
                     source_node_id=worker_node.get("id", ""),
                     target_node_id=target_node_id,
-                    question=question,
+                    question=broadcast,
                     global_config=global_config,
                     db_session=db_session,
                 )
 
-            broadcast = self._extract_broadcast(raw_output)
-            if broadcast:
-                for target_node_id in self._broadcast_targets(
-                    worker_node.get("id", ""), global_config,
-                ):
-                    await self._handle_worker_question(
-                        task=task,
-                        source_node_id=worker_node.get("id", ""),
-                        target_node_id=target_node_id,
-                        question=broadcast,
-                        global_config=global_config,
-                        db_session=db_session,
-                    )
+        if state == "completed":
+            await self.update_task_status(
+                task, "completed", db_session,
+                progress=100, result_summary=self._summarize(raw_output),
+            )
+        else:
+            await self.update_task_status(
+                task, "failed", db_session,
+                result_summary=result.get("error", "execution failed"),
+            )
 
-            # No escalation — task is done
-            if state == "completed":
-                await self.update_task_status(
-                    task, "completed", db_session,
-                    progress=100, result_summary=self._summarize(raw_output),
-                )
-            else:
-                await self.update_task_status(
-                    task, "failed", db_session,
-                    result_summary=result.get("error", "execution failed"),
-                )
-
-            return result
-
-        # Exceeded max escalations
-        await self.update_task_status(
-            task, "failed", db_session,
-            result_summary=f"Exceeded maximum escalation limit ({max_escalations})",
-        )
-        return {"state": "failed", "error": "max_escalations_exceeded"}
+        return result
 
     # ------------------------------------------------------------------
     # Planner interaction for escalation answers
@@ -315,7 +235,7 @@ class TaskScheduler:
         """Aggregate all task statuses for a run into a dashboard summary.
 
         Returns: {"total": N, "completed": N, "failed": N, "running": N,
-                  "pending": N, "blocked": N, "tasks": [{id, title, status, ...}]}
+                  "pending": N, "tasks": [{id, title, status, ...}]}
         """
         try:
             from app.core.database import async_session_factory
@@ -327,7 +247,7 @@ class TaskScheduler:
                     select(TaskModel).where(TaskModel.run_id == _uuid.UUID(run_id))
                 )
                 rows = result.scalars().all()
-                counts = {"total": len(rows), "completed": 0, "failed": 0, "running": 0, "pending": 0, "blocked": 0, "assigned": 0}
+                counts = {"total": len(rows), "completed": 0, "failed": 0, "running": 0, "pending": 0, "assigned": 0}
                 task_summaries = []
                 for row in rows:
                     s = row.status or "pending"
@@ -342,62 +262,7 @@ class TaskScheduler:
                 return {**counts, "tasks": task_summaries}
         except Exception:
             logger.warning("Failed to get task dashboard for run %s", run_id, exc_info=True)
-            return {"total": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0, "blocked": 0, "assigned": 0, "tasks": []}
-
-    async def _planner_answer(
-        self,
-        question: str,
-        task: ManagedTask,
-        planner_node: dict,
-        run_id: str,
-        global_config: dict,
-        cancel_event: asyncio.Event,
-        workspace_directory: str | None = None,
-    ) -> str:
-        """Ask the planner a question and return its text response.
-
-        Creates a temporary worker-style execution with a focused prompt
-        so the planner can answer without re-doing its full plan.
-        """
-        escalation_prompt = (
-            f"A worker has escalated a question about task: {task.title}\n\n"
-            f"Worker question: {question}\n\n"
-            f"Task context: {task.description}\n\n"
-        )
-
-        # Inject task dashboard for global awareness
-        dashboard = await self.get_task_dashboard(run_id)
-        if dashboard["total"] > 0:
-            escalation_prompt += (
-                f"## 全局任务状态\n"
-                f"总计: {dashboard['total']} | 完成: {dashboard['completed']} | "
-                f"失败: {dashboard['failed']} | 运行中: {dashboard['running']} | "
-                f"等待: {dashboard['pending']}\n\n"
-            )
-
-        escalation_prompt += "Please provide a concise answer to help the worker continue."
-
-        # Build a temporary node for the planner to answer
-        answer_node = {
-            "id": f"{planner_node.get('id', 'planner')}_answer_{task.db_id}",
-            "agent_type": "coder",  # Use coder for quick answers (lighter)
-            "model_provider": planner_node.get("model_provider", "")
-            or (planner_node.get("data", {}).get("modelProvider", "")
-                if isinstance(planner_node.get("data"), dict) else ""),
-            "model_id": planner_node.get("model_id", "")
-            or (planner_node.get("data", {}).get("modelId", "")
-                if isinstance(planner_node.get("data"), dict) else ""),
-            "prompt": escalation_prompt,
-        }
-
-        result = await self._execute_node(
-            run_id, answer_node, {}, global_config, cancel_event,
-            workspace_directory=workspace_directory,
-        )
-
-        # Extract text from the answer
-        raw = result.get("raw_output", "")
-        return self._extract_answer_text(raw) or result.get("error", "No response from planner")
+            return {"total": 0, "completed": 0, "failed": 0, "running": 0, "pending": 0, "assigned": 0, "tasks": []}
 
     # ------------------------------------------------------------------
     # Worker collaboration and prompt context
@@ -666,28 +531,6 @@ class TaskScheduler:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _extract_escalation(raw_output: str) -> str | None:
-        """Check if worker output contains an escalation marker."""
-        if not raw_output:
-            return None
-        for line in raw_output.split("\n"):
-            line = line.strip()
-            if ESCALATION_MARKER in line:
-                idx = line.index(ESCALATION_MARKER)
-                question = line[idx + len(ESCALATION_MARKER):].strip()
-                placeholder_questions = {
-                    "<your question>",
-                    "<your question or request>",
-                    "<question>",
-                    "<你的问题>",
-                    "<你的问题或请求>",
-                }
-                if question.lower() in placeholder_questions:
-                    continue
-                if question:
-                    return question
-        return None
-
     @staticmethod
     def _extract_progress(raw_output: str) -> int | None:
         """Check if worker output contains a progress marker."""

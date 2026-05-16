@@ -3,7 +3,7 @@
 import asyncio
 import logging
 from collections import deque
-from typing import Any, Awaitable, Callable
+from typing import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -20,9 +20,10 @@ class InProcessEventBus:
     """
 
     def __init__(self):
+        # No lock needed: this event bus runs entirely within a single
+        # asyncio event loop, so all mutations are naturally serialized.
         self._subscribers: dict[str, list[Callback]] = {}
         self._buffers: dict[str, deque[dict]] = {}
-        self._lock = asyncio.Lock()
 
     async def publish(self, channel: str, event: dict) -> None:
         # Always buffer so late subscribers can catch up
@@ -30,20 +31,27 @@ class InProcessEventBus:
             self._buffers[channel] = deque(maxlen=_MAX_BUFFER)
         self._buffers[channel].append(event)
 
-        callbacks = self._subscribers.get(channel, [])
-        for cb in callbacks:
-            try:
-                await cb(event)
-            except Exception:
-                logger.warning("EventBus callback error on channel %s", channel, exc_info=True)
+        # Backpressure: drop oldest if buffer exceeds max size
+        if len(self._buffers[channel]) > self._buffers[channel].maxlen:
+            dropped = self._buffers[channel].popleft()
+            logger.debug("Dropped oldest buffered event for %s: %s", channel, dropped.get("type", ""))
+
+        callbacks = list(self._subscribers.get(channel, []))
+        if callbacks:
+            await asyncio.gather(
+                *[self._safe_callback(cb, channel, event) for cb in callbacks],
+                return_exceptions=True,
+            )
+
+    async def _safe_callback(self, cb: Callback, channel: str, event: dict) -> None:
+        try:
+            await cb(event)
+        except Exception:
+            logger.warning("EventBus callback error on channel %s", channel, exc_info=True)
 
     async def subscribe(self, channel: str, callback: Callback) -> None:
-        if channel not in self._subscribers:
-            self._subscribers[channel] = []
-        self._subscribers[channel].append(callback)
-
-        # Replay buffered events to the new subscriber
-        buffer = self._buffers.get(channel)
+        # Replay buffered events FIRST (before registering) to avoid race
+        buffer = list(self._buffers.get(channel, []))
         if buffer:
             logger.info("Replaying %d buffered events on channel %s", len(buffer), channel)
             for event in buffer:
@@ -51,6 +59,8 @@ class InProcessEventBus:
                     await callback(event)
                 except Exception:
                     logger.warning("EventBus replay error on channel %s", channel, exc_info=True)
+        # THEN register — new events will be delivered live
+        self._subscribers.setdefault(channel, []).append(callback)
 
     async def unsubscribe(self, channel: str) -> None:
         self._subscribers.pop(channel, None)

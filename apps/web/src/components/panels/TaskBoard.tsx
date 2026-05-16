@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   Circle,
   Clock,
-  Ban,
   XCircle,
   RotateCw,
   Pencil,
@@ -19,6 +18,9 @@ import {
   Plus,
   Play,
   ArrowRightLeft,
+  FileText,
+  GitBranch,
+  Info,
 } from "lucide-react";
 import { useTaskStore } from "@/stores/taskStore";
 import { useRunStore } from "@/stores/runStore";
@@ -37,7 +39,6 @@ const STATUS_ICONS: Record<TaskStatus, LucideIcon> = {
   pending: Circle,
   assigned: Clock,
   running: Clock,
-  blocked: Ban,
   completed: CheckCircle2,
   failed: XCircle,
 };
@@ -46,7 +47,6 @@ const STATUS_LABELS: Record<TaskStatus, string> = {
   pending: "未开始",
   assigned: "已分配",
   running: "进行中",
-  blocked: "阻塞",
   completed: "成功",
   failed: "失败",
 };
@@ -65,6 +65,7 @@ const TaskLeaf = memo(function TaskLeaf({
   onUpdate,
   onAssign,
   workflowNodes,
+  nodeData,
 }: {
   task: Task;
   isSelected: boolean;
@@ -76,6 +77,7 @@ const TaskLeaf = memo(function TaskLeaf({
   onUpdate: (patch: Partial<Task>) => void;
   onAssign: (nodeId: string, nodeLabel: string, agentType: string, modelProvider: string, modelId: string, prompt: string) => void;
   workflowNodes: { id: string; label: string; agentType: string; modelProvider: string; modelId: string; prompt: string }[];
+  nodeData?: { targetFiles?: string[]; interfaceContract?: string; contextSummary?: string };
 }) {
   const [expanded, setExpanded] = useState(isSelected);
   const [editing, setEditing] = useState(false);
@@ -134,8 +136,8 @@ const TaskLeaf = memo(function TaskLeaf({
   // Shorten title for the collapsed view
   const shortTitle = task.title.length > 80 ? task.title.slice(0, 80) + "..." : task.title;
 
-  // Can assign/reassign if task is pending, blocked, failed, or completed
-  const canAssign = ["pending", "blocked", "failed", "completed"].includes(task.status);
+  // Can assign/reassign if task is pending, failed, or completed
+  const canAssign = ["pending", "failed", "completed"].includes(task.status);
 
   return (
     <div
@@ -187,6 +189,13 @@ const TaskLeaf = memo(function TaskLeaf({
         >
           {STATUS_LABELS[task.status]}
         </span>
+
+        {task.retry_count > 0 && (
+          <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-full bg-amber-100 text-amber-700 shrink-0">
+            <RotateCw size={8} className="inline -mt-0.5 mr-0.5" />
+            {task.retry_count}
+          </span>
+        )}
       </button>
 
       {/* Agent link / reassignment — shown below the title */}
@@ -290,6 +299,62 @@ const TaskLeaf = memo(function TaskLeaf({
             <div className="text-[10px] text-gray-500 bg-gray-50 rounded p-1.5 max-h-24 overflow-y-auto whitespace-pre-wrap">
               {task.result_summary}
             </div>
+          )}
+
+          {/* Retry info */}
+          {task.last_error && !editing && (
+            <div className="text-[10px] bg-red-50 border border-red-100 rounded p-1.5">
+              <div className="flex items-center gap-1 mb-0.5 font-medium text-red-600">
+                <AlertTriangle size={10} />
+                错误信息 {task.retry_count > 0 && `(重试 ${task.retry_count} 次)`}
+              </div>
+              <div className="text-red-700 max-h-20 overflow-y-auto whitespace-pre-wrap text-[9px]">
+                {task.last_error}
+              </div>
+            </div>
+          )}
+
+          {/* Rich context fields from planner */}
+          {nodeData && !editing && (
+            <>
+              {nodeData.targetFiles && nodeData.targetFiles.length > 0 && (
+                <div className="text-[10px]">
+                  <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                    <FileText size={10} className="text-orange-500" />
+                    目标文件
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {nodeData.targetFiles.map((f) => (
+                      <span key={f} className="rounded bg-orange-50 text-orange-700 px-1.5 py-0.5 font-mono text-[9px] break-all">
+                        {f}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {nodeData.interfaceContract && (
+                <div className="text-[10px]">
+                  <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                    <GitBranch size={10} className="text-indigo-500" />
+                    接口契约
+                  </div>
+                  <div className="text-gray-600 bg-indigo-50/60 rounded p-1.5 max-h-20 overflow-y-auto whitespace-pre-wrap text-[9px]">
+                    {nodeData.interfaceContract}
+                  </div>
+                </div>
+              )}
+              {nodeData.contextSummary && (
+                <div className="text-[10px]">
+                  <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                    <Info size={10} className="text-teal-500" />
+                    上下文说明
+                  </div>
+                  <div className="text-gray-600 bg-teal-50/60 rounded p-1.5 max-h-20 overflow-y-auto whitespace-pre-wrap text-[9px]">
+                    {nodeData.contextSummary}
+                  </div>
+                </div>
+              )}
+            </>
           )}
 
           {/* Messages */}
@@ -589,6 +654,22 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
     return () => { cancelled = true; };
   }, [currentRunId, runId, runStatus]);
 
+  // Map from node ID → rich context fields for task detail display
+  const nodeDataMap = useMemo(() => {
+    const map: Record<string, { targetFiles?: string[]; interfaceContract?: string; contextSummary?: string }> = {};
+    for (const n of rawNodes ?? []) {
+      const d = n.data as NodeData;
+      if (d?.targetFiles || d?.interfaceContract || d?.contextSummary) {
+        map[n.id] = {
+          targetFiles: d.targetFiles,
+          interfaceContract: d.interfaceContract,
+          contextSummary: d.contextSummary,
+        };
+      }
+    }
+    return map;
+  }, [rawNodes]);
+
   const filteredTasks = useMemo(() => {
     if (filterStatus === "all") return tasks;
     return tasks.filter((t) => t.status === filterStatus);
@@ -785,7 +866,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
           </button>
         </div>
 
-        {(["all", "running", "pending", "blocked", "completed", "failed"] as const).map(
+        {(["all", "running", "pending", "completed", "failed"] as const).map(
           (status) => (
             <button
               key={status}
@@ -851,6 +932,7 @@ export default function TaskBoard({ workflowId }: { workflowId?: string }) {
                 handleAssignTask(task.id, nodeId, nodeLabel, agentType, modelProvider, modelId, prompt)
               }
               workflowNodes={workflowNodes}
+              nodeData={task.assigned_node_id ? nodeDataMap[task.assigned_node_id] : undefined}
             />
           ))
         )}

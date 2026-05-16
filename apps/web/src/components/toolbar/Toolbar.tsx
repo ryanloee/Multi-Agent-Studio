@@ -64,7 +64,6 @@ export default function Toolbar({
     planning: "Planning",
     ready: "Ready",
     running: "Running",
-    blocked: "Blocked",
     review: "Review",
   };
 
@@ -245,14 +244,12 @@ export default function Toolbar({
           className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none ${
             lifecyclePhase === "ready"
               ? "bg-emerald-100 text-emerald-700"
-              : lifecyclePhase === "blocked"
-                ? "bg-red-100 text-red-700"
-                : lifecyclePhase === "running"
+              : lifecyclePhase === "running"
                   ? "bg-blue-100 text-blue-700"
                   : "bg-gray-100 text-gray-700"
           }`}
         >
-          {lifecyclePhase === "blocked" ? <AlertTriangle size={12} /> : <Target size={12} />}
+          <Target size={12} />
           {phaseLabels[lifecyclePhase]}
         </div>
       </div>

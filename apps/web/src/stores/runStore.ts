@@ -84,17 +84,13 @@ export const useRunStore = create<RunState>((set, get) => ({
     if (
       (event.type === "node_started" ||
         event.type === "node_completed" ||
-        event.type === "node_failed" ||
-        event.type === "task_blocked" ||
-        event.type === "task_unblocked") &&
+        event.type === "node_failed") &&
       event.node_id
     ) {
       const statusMap: Record<string, RunStatus> = {
         node_started: "running",
         node_completed: "completed",
         node_failed: "failed",
-        task_blocked: "paused",
-        task_unblocked: "running",
       };
       set({
         events: [...state.events, event],

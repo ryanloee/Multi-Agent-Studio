@@ -14,19 +14,31 @@ import shlex
 import shutil
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from typing import AsyncIterator
 from uuid import uuid4
 
 from app.config import settings
 
+# Debounce sync_back to avoid redundant syncs when multiple nodes complete quickly
+_last_sync_back: dict[str, float] = {}
+_SYNC_BACK_DEBOUNCE = 2.0  # seconds
+
 
 class _AsyncProcessShim:
     """Wraps subprocess.Popen to provide the same interface as
     asyncio.subprocess.Process (returncode, terminate, kill, wait)."""
 
-    def __init__(self, proc: subprocess.Popen) -> None:
+    def __init__(
+        self,
+        proc: subprocess.Popen,
+        stdout_buf: list[bytes] | None = None,
+        stderr_buf: list[bytes] | None = None,
+    ) -> None:
         self._proc = proc
+        self.stdout_buf: list[bytes] = stdout_buf or []
+        self.stderr_buf: list[bytes] = stderr_buf or []
 
     @property
     def returncode(self) -> int | None:
@@ -41,6 +53,12 @@ class _AsyncProcessShim:
 
     async def wait(self) -> int:
         return await asyncio.to_thread(self._proc.wait)
+
+    def get_stdout(self) -> str:
+        return b"".join(self.stdout_buf).decode("utf-8", errors="replace")
+
+    def get_stderr(self) -> str:
+        return b"".join(self.stderr_buf).decode("utf-8", errors="replace")
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +266,13 @@ class LocalSandbox:
             ignore=self._workspace_copy_ignore,
         )
 
+        # Preserve .agent/runner.port (needed for SSE runner communication)
+        runner_port_src = source_state.workspace_dir / ".agent" / "runner.port"
+        runner_port_dst = root / "workspace" / ".agent" / "runner.port"
+        if runner_port_src.exists():
+            runner_port_dst.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.copy2, str(runner_port_src), str(runner_port_dst))
+
         # Copy sandbox-meta directory (preserves git history / checkpoints)
         meta_src = source_state.root / "sandbox-meta"
         if meta_src.is_dir():
@@ -299,10 +324,29 @@ class LocalSandbox:
         workspace = state.workspace_dir
         shell = self._shell_prefix()
 
+        # Debounce: skip if synced recently
+        now = time.monotonic()
+        last = _last_sync_back.get(sandbox_id, 0)
+        if now - last < _SYNC_BACK_DEBOUNCE:
+            logger.debug("sync_back skipped for %s (debounced)", sandbox_id)
+            return True
+
+        if not workspace.exists():
+            raise RuntimeError(
+                f"Cannot sync_back: sandbox workspace does not exist: {workspace}"
+            )
+
         # 1. Compute diff inside the sandbox
+        #    "git add -A" stages new untracked files so they appear in the diff.
+        #    "git diff --cached HEAD" then captures ALL changes (modified + new).
         def _get_diff() -> str:
+            subprocess.run(
+                [*shell, "git add -A -f"],
+                cwd=str(workspace),
+                capture_output=True,
+            )
             result = subprocess.run(
-                [*shell, "git diff HEAD"],
+                [*shell, "git diff --cached HEAD"],
                 cwd=str(workspace),
                 capture_output=True,
             )
@@ -336,17 +380,23 @@ class LocalSandbox:
             rc = await asyncio.to_thread(_apply_patch)
             if rc == 0:
                 logger.info("sync_back: applied patch to %s", target_dir)
+                _last_sync_back[sandbox_id] = time.monotonic()
                 return True
             else:
                 logger.warning("sync_back: git apply failed (rc=%d) for %s", rc, target_dir)
-                await asyncio.to_thread(_copy_workspace_fallback, workspace, Path(target_dir))
-                logger.info("sync_back: copied workspace files to %s via fallback", target_dir)
-                return True
+                try:
+                    await asyncio.to_thread(_copy_workspace_fallback, workspace, Path(target_dir))
+                    logger.info("sync_back: copied workspace files to %s via fallback", target_dir)
+                    return True
+                except Exception as exc:
+                    logger.error("sync_back: fallback copy also failed for %s: %s", target_dir, exc)
+                    return False
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
     async def destroy(self, sandbox_id: str) -> None:
         """Remove sandbox directories and kill any remaining processes."""
+        _last_sync_back.pop(sandbox_id, None)
         state = self._sandboxes.pop(sandbox_id, None)
         if state is None:
             logger.warning("Sandbox %s not found, skipping destroy", sandbox_id)
@@ -429,18 +479,35 @@ class LocalSandbox:
 
         def _start_proc():
             import subprocess as sp
-            return sp.Popen(
+            import threading
+
+            proc = sp.Popen(
                 [*shell, rewritten],
                 cwd=str(state.workspace_dir),
                 stdout=sp.PIPE,
                 stderr=sp.PIPE,
                 env=env,
             )
+            # Drain stdout/stderr to prevent pipe buffer deadlock (64KB limit)
+            stdout_buf: list[bytes] = []
+            stderr_buf: list[bytes] = []
 
-        proc = await asyncio.to_thread(_start_proc)
+            def _drain(stream, buf: list[bytes]) -> None:
+                for line in iter(stream.readline, b""):
+                    buf.append(line)
+
+            threading.Thread(
+                target=_drain, args=(proc.stdout, stdout_buf), daemon=True,
+            ).start()
+            threading.Thread(
+                target=_drain, args=(proc.stderr, stderr_buf), daemon=True,
+            ).start()
+            return proc, stdout_buf, stderr_buf
+
+        proc, stdout_buf, stderr_buf = await asyncio.to_thread(_start_proc)
 
         # Wrap in a shim that provides the same interface as asyncio.subprocess.Process
-        shim = _AsyncProcessShim(proc)
+        shim = _AsyncProcessShim(proc, stdout_buf, stderr_buf)
         state.processes[exec_id] = shim
         logger.debug("Started async exec %s: %s", exec_id[:12], cmd[:80])
         return exec_id
@@ -582,3 +649,53 @@ def _copy_workspace_fallback(source: Path, target: Path) -> None:
         else:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, dest)
+
+
+# ---------------------------------------------------------------------------
+# SandboxRegistry -- reference-counted sandbox manager
+# ---------------------------------------------------------------------------
+
+class SandboxRegistry:
+    """Reference-counted sandbox manager.
+
+    Replaces the three-mechanism system (_owns_sandbox, destroy_owned_sandbox,
+    retained_sandboxes) with a single reference-counted approach.
+    """
+
+    def __init__(self, sandbox: LocalSandbox) -> None:
+        self._sandbox = sandbox
+        self._refcounts: dict[str, int] = {}
+        self._owners: dict[str, set[str]] = {}
+
+    def acquire(self, node_id: str, upstream_sandbox_id: str | None = None) -> str:
+        """Acquire a sandbox for a node.
+
+        If *upstream_sandbox_id* is provided, increment its refcount.
+        Returns the sandbox_id to use (empty string means caller should create
+        a new one and call ``register_new``).
+        """
+        if upstream_sandbox_id:
+            self._refcounts[upstream_sandbox_id] = self._refcounts.get(upstream_sandbox_id, 0) + 1
+            self._owners.setdefault(upstream_sandbox_id, set()).add(node_id)
+            return upstream_sandbox_id
+        return ""
+
+    def register_new(self, sandbox_id: str, node_id: str) -> None:
+        """Register a newly created sandbox."""
+        self._refcounts[sandbox_id] = 1
+        self._owners.setdefault(sandbox_id, set()).add(node_id)
+
+    def release(self, sandbox_id: str, node_id: str) -> None:
+        """Release a sandbox. Decrement refcount; caller should destroy when
+        refcount reaches 0."""
+        if sandbox_id not in self._refcounts:
+            return
+        self._refcounts[sandbox_id] -= 1
+        self._owners[sandbox_id].discard(node_id)
+        if self._refcounts[sandbox_id] <= 0:
+            del self._refcounts[sandbox_id]
+            del self._owners[sandbox_id]
+
+    def get_active_sandboxes(self) -> set[str]:
+        """Return set of sandboxes still in use."""
+        return set(self._refcounts.keys())

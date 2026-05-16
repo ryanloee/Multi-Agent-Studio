@@ -57,8 +57,8 @@ Optional: "depends_on" (list of task ID strings that must complete first).
 ## Orchestrator requirements:
 - Parallelize independent tasks by leaving their "depends_on" empty or pointing only to real prerequisites.
 - Do not create coarse tasks such as "develop frontend", "implement backend", "fix all bugs", or "write tests". Split them into file/module-level tasks a worker can complete independently.
-- Every worker prompt must include: goal, context, inputs, ordered steps, output format, acceptance criteria, boundaries, escalation rules, peer collaboration rules, and artifact requirements.
-- Workers may consult the planner by outputting `ESCALATE_TO_PLANNER: <question>`. Tell them to use this only for blockers or scope decisions.
+- Every worker prompt must include: goal, context, inputs, ordered steps, output format, acceptance criteria, boundaries, peer collaboration rules, and artifact requirements.
+- Workers should attempt to complete tasks independently without escalation.
 - Workers may collaborate with related DAG peers by outputting `ASK_WORKER: <target_node_id>: <question>` or `BROADCAST_TO_PEERS: <message>`. Restrict this to direct upstream, direct downstream, or same-layer parallel peers unless the prompt explicitly authorizes broader communication.
 - Every worker must produce an artifact summary. Use file_change for coder tasks, research_note for explore tasks, review_report for review tasks, test_result for shell/test tasks, decision for key decisions, and final_output for final delivery.
 - Hidden reasoning is not an artifact. Ask workers to report observable findings, commands, files, diffs, decisions, and results.
@@ -113,6 +113,10 @@ def parse_plan_json(raw_output: str) -> list[dict]:
             task["title"] = obj["title"]
         if obj.get("dependencies"):
             task["dependencies"] = obj["dependencies"]
+        # Preserve rich context fields
+        for extra_key in ("target_files", "interface_contract", "context_summary", "depends_on"):
+            if obj.get(extra_key) and extra_key not in task:
+                task[extra_key] = obj[extra_key]
 
         tasks.append(task)
 
@@ -285,14 +289,19 @@ def parse_plan_to_dag(plan_output: str) -> tuple[list[dict], list[dict]] | None:
             if node_type == "plan" and node_id != "planner":
                 node_type = "design"
             # Convert to standard format
+            data = {
+                "label": node.get("label", node_id),
+                "agent_type": node_type,
+                "prompt": node.get("prompt", ""),
+            }
+            # Preserve rich context fields
+            for extra_key in ("target_files", "interface_contract", "context_summary"):
+                if node.get(extra_key):
+                    data[extra_key] = node[extra_key]
             nodes.append({
                 "id": node_id,
                 "type": node_type,
-                "data": {
-                    "label": node.get("label", node_id),
-                    "agent_type": node_type,
-                    "prompt": node.get("prompt", ""),
-                },
+                "data": data,
             })
 
             depends_on = node.get("depends_on", [])
@@ -387,5 +396,11 @@ def _validate_tasks(tasks: list) -> list[dict]:
             validated["title"] = task["title"]
         if task.get("dependencies"):
             validated["dependencies"] = task["dependencies"]
+        if task.get("depends_on"):
+            validated["depends_on"] = task["depends_on"]
+        # Preserve rich context fields (additive, backward-compatible)
+        for extra_key in ("target_files", "interface_contract", "context_summary"):
+            if task.get(extra_key) and extra_key not in validated:
+                validated[extra_key] = task[extra_key]
         result.append(validated)
     return result

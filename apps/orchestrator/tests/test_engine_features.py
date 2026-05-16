@@ -122,7 +122,7 @@ class TestExtractLlmText:
 class TestBuildUpstreamContext:
     """Tests for _build_upstream_context method."""
 
-    def test_with_result_summary(self, engine):
+    async def test_with_result_summary(self, engine):
         """When upstream has result_summary, use it."""
         edges = [{"source": "node_a", "target": "node_b"}]
         layer_results = {
@@ -131,12 +131,12 @@ class TestBuildUpstreamContext:
                 "raw_output": "",
             }
         }
-        result = engine._build_upstream_context("node_b", edges, layer_results)
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
         assert "node_a" in result
         assert "Completed analysis successfully" in result
         assert "## 上游节点输出" in result
 
-    def test_with_raw_output_fallback(self, engine):
+    async def test_with_raw_output_fallback(self, engine):
         """When upstream has no result_summary, fall back to raw_output."""
         raw_jsonl = "\n".join([
             json.dumps({"type": "llm_token", "content": "Some LLM output"}),
@@ -148,23 +148,23 @@ class TestBuildUpstreamContext:
                 "raw_output": raw_jsonl,
             }
         }
-        result = engine._build_upstream_context("node_b", edges, layer_results)
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
         assert "node_a" in result
         assert "Some LLM output" in result
 
-    def test_no_upstream_edges(self, engine):
+    async def test_no_upstream_edges(self, engine):
         """No upstream edges returns empty string."""
         edges = [{"source": "node_a", "target": "node_c"}]
         layer_results = {"node_a": {"result_summary": "data"}}
-        result = engine._build_upstream_context("node_b", edges, layer_results)
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
         assert result == ""
 
-    def test_empty_edges_list(self, engine):
+    async def test_empty_edges_list(self, engine):
         """Empty edges list returns empty string."""
-        result = engine._build_upstream_context("node_a", [], {})
+        result = await engine._build_upstream_context("node_a", [], {})
         assert result == ""
 
-    def test_multiple_upstream_nodes(self, engine):
+    async def test_multiple_upstream_nodes(self, engine):
         """Multiple upstream nodes are all included."""
         edges = [
             {"source": "node_a", "target": "node_c"},
@@ -174,36 +174,36 @@ class TestBuildUpstreamContext:
             "node_a": {"result_summary": "Result from A"},
             "node_b": {"result_summary": "Result from B"},
         }
-        result = engine._build_upstream_context("node_c", edges, layer_results)
+        result = await engine._build_upstream_context("node_c", edges, layer_results)
         assert "node_a" in result
         assert "Result from A" in result
         assert "node_b" in result
         assert "Result from B" in result
 
-    def test_missing_source_result(self, engine):
+    async def test_missing_source_result(self, engine):
         """Edge pointing to a source with no result produces no section."""
         edges = [{"source": "missing_node", "target": "node_b"}]
         layer_results = {}
-        result = engine._build_upstream_context("node_b", edges, layer_results)
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
         assert result == ""
 
-    def test_empty_source_id_skipped(self, engine):
+    async def test_empty_source_id_skipped(self, engine):
         """Edge with empty source is skipped."""
         edges = [{"source": "", "target": "node_b"}]
         layer_results = {"": {"result_summary": "should not appear"}}
-        result = engine._build_upstream_context("node_b", edges, layer_results)
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
         assert result == ""
 
-    def test_non_dict_source_result_skipped(self, engine):
+    async def test_non_dict_source_result_skipped(self, engine):
         """Non-dict source result is skipped gracefully."""
         edges = [{"source": "node_a", "target": "node_b"}]
         layer_results = {"node_a": "not a dict"}
-        result = engine._build_upstream_context("node_b", edges, layer_results)
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
         assert result == ""
 
-    def test_raw_output_truncated_to_2000_chars(self, engine):
-        """Raw output is truncated to last 2000 characters when used as fallback."""
-        long_text = "x" * 3000
+    async def test_raw_output_truncated_to_4000_chars(self, engine):
+        """Raw output is truncated to last 4000 characters when used as fallback."""
+        long_text = "x" * 5000
         raw_jsonl = json.dumps({"type": "llm_token", "content": long_text})
         edges = [{"source": "node_a", "target": "node_b"}]
         layer_results = {
@@ -212,10 +212,10 @@ class TestBuildUpstreamContext:
                 "raw_output": raw_jsonl,
             }
         }
-        result = engine._build_upstream_context("node_b", edges, layer_results)
-        # The summary should contain at most 2000 chars of the extracted text
-        assert len(result) < 3000  # much less than 3000 raw chars
-        assert long_text[-2000:] in result or long_text[:2000] in result
+        result = await engine._build_upstream_context("node_b", edges, layer_results)
+        # The summary should contain at most 4000 chars of the extracted text
+        assert len(result) < 5000  # much less than 5000 raw chars
+        assert long_text[-4000:] in result or long_text[:4000] in result
 
 
 # ===========================================================================
@@ -381,10 +381,10 @@ class TestEnginePublicAPI:
     """Tests for the engine's public methods with mocked internals."""
 
     @pytest.mark.asyncio
-    async def test_start_workflow_creates_run(self, engine):
-        """start_workflow should register a run with 'running' status."""
-        layers = [[{"id": "n1", "type": "coder", "data": {"prompt": "test"}}]]
-        run_id = await engine.start_workflow("run-001", layers, {"_edges": []})
+    async def test_start_run_creates_run(self, engine):
+        """start_run should register a run with 'running' status."""
+        dag_json = {"nodes": [{"id": "n1", "type": "coder", "data": {"prompt": "test"}}], "edges": []}
+        run_id = await engine.start_run("run-001", dag_json, {"_edges": []})
         assert run_id == "run-001"
         status = await engine.get_status("run-001")
         assert status["status"] == "running"
@@ -396,10 +396,10 @@ class TestEnginePublicAPI:
         assert status["status"] == "unknown"
 
     @pytest.mark.asyncio
-    async def test_cancel_running_workflow(self, engine):
+    async def test_cancel_running_run(self, engine):
         """Cancel sets the cancel_event and status to 'cancelling'."""
-        layers = [[{"id": "n1", "type": "coder", "data": {"prompt": "test"}}]]
-        await engine.start_workflow("run-002", layers, {"_edges": []})
+        dag_json = {"nodes": [{"id": "n1", "type": "coder", "data": {"prompt": "test"}}], "edges": []}
+        await engine.start_run("run-002", dag_json, {"_edges": []})
         await engine.cancel("run-002")
         status = await engine.get_status("run-002")
         assert status["status"] == "cancelling"
@@ -412,8 +412,8 @@ class TestEnginePublicAPI:
     @pytest.mark.asyncio
     async def test_cancel_completed_run_noop(self, engine):
         """Cancelling a completed run does nothing."""
-        layers = [[{"id": "n1", "type": "coder", "data": {"prompt": "test"}}]]
-        await engine.start_workflow("run-003", layers, {"_edges": []})
+        dag_json = {"nodes": [{"id": "n1", "type": "coder", "data": {"prompt": "test"}}], "edges": []}
+        await engine.start_run("run-003", dag_json, {"_edges": []})
         # Manually set to completed
         engine._runs["run-003"]["status"] = "completed"
         await engine.cancel("run-003")

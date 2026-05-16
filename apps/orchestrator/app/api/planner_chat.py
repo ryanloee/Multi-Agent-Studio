@@ -432,7 +432,10 @@ PLANNER_SPEC_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
         "type": "explore",
         "label": "需求探索",
         "prompt": "目标：...\\n具体要求：...\\n产出格式：...\\n验收标准：...",
-        "depends_on": []
+        "depends_on": [],
+        "target_files": ["path/to/file.py"],
+        "interface_contract": "GET /api/todos -> [{id, title, done}]",
+        "context_summary": "项目使用 FastAPI + SQLAlchemy，参考 server/routes.py 中现有模式"
       }
     ],
     "edges": [
@@ -455,8 +458,13 @@ PLANNER_SPEC_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
 - 两个及以上并行 coder 后必须有 merge。
 - 关键 coder/merge 结果后必须有 review。
 - 末尾必须有 shell/test 验证节点。
+- 每个 coder/design 节点应输出：
+  - target_files：精确到文件路径，基于项目文件结构中的实际路径。
+  - interface_contract：API 签名/数据结构/函数签名。
+  - context_summary：子 agent 需要的现有代码模式和技术背景。
+- target_files 中的路径必须来自项目文件结构，不要猜测不存在的路径。
 - prompt 必须让子 agent 可直接工作：目标、上下文、具体要求、产出格式、验收标准、边界、协作规则。
-- 不确定支付渠道、第三方服务或技术取舍时，用 design 节点制定可执行默认方案并要求必要时 ESCALATE_TO_PLANNER；不要因此 blocked。
+- 不确定支付渠道、第三方服务或技术取舍时，用 design 节点制定可执行默认方案；不要因此 blocked。
 - 每个节点必须有 id/type/label/prompt/depends_on；edges 必须与 depends_on 一致。
 """
 
@@ -538,6 +546,38 @@ def _normalize_task_object(task_object: dict | None, fallback_goal: str, reply: 
         "assumptions": _coerce_string_list(source.get("assumptions"), []),
         "open_questions": _coerce_string_list(source.get("open_questions"), []),
     }
+
+
+def _build_workspace_index(workspace_directory: str | None, max_files: int = 200) -> str:
+    """Build a file tree summary for planner context injection."""
+    if not workspace_directory:
+        return ""
+    ws = Path(workspace_directory).expanduser().resolve()
+    if not ws.is_dir():
+        return ""
+    skip_dirs = {
+        ".git", "node_modules", "__pycache__", ".mas", ".sandboxes",
+        ".venv", "venv", "dist", "build", ".next", "target",
+    }
+    tree_lines: list[str] = []
+    file_count = 0
+    try:
+        for path in sorted(ws.rglob("*")):
+            if file_count >= max_files:
+                tree_lines.append(f"  ... (truncated at {max_files} files)")
+                break
+            rel = path.relative_to(ws)
+            parts = rel.parts
+            if any(p in skip_dirs for p in parts):
+                continue
+            if path.is_file():
+                tree_lines.append(f"  {rel}")
+                file_count += 1
+    except OSError:
+        return ""
+    if not tree_lines:
+        return ""
+    return f"## 项目文件结构\n```\n{chr(10).join(tree_lines)}\n```"
 
 
 def _normalize_project_summary(project_summary: dict | None) -> dict:
@@ -1371,7 +1411,8 @@ def _merge_dag_node_details(base_dag: dict, detail_dag: dict) -> dict:
             continue
         detail = details_by_id.get(str(node.get("id"))) or {}
         merged = dict(node)
-        for key in ("type", "agent_type", "label", "prompt", "model_provider", "model_id"):
+        for key in ("type", "agent_type", "label", "prompt", "model_provider", "model_id",
+                    "target_files", "interface_contract", "context_summary"):
             if detail.get(key):
                 merged[key] = detail.get(key)
         detail_data = detail.get("data") if isinstance(detail.get("data"), dict) else {}
@@ -1483,7 +1524,7 @@ def _repair_planner_dag(
             dag,
             "design",
             "制定支付集成方案",
-            "目标：为下游支付实现节点制定局部技术方案，不要继续拆分完整 DAG。\n具体要求：明确支付渠道候选、回调流程、密钥配置、订单状态流转、异常处理和可替代的模拟支付方案。\n产出格式：Markdown 方案说明，包含下游 coder 可直接执行的接口、文件范围、验收标准和风险。\n验收标准：支付相关 coder 能基于该方案继续实现；如仍缺用户决策，用 ESCALATE_TO_PLANNER 提出一个具体问题。",
+            "目标：为下游支付实现节点制定局部技术方案，不要继续拆分完整 DAG。\n具体要求：明确支付渠道候选、回调流程、密钥配置、订单状态流转、异常处理和可替代的模拟支付方案。\n产出格式：Markdown 方案说明，包含下游 coder 可直接执行的接口、文件范围、验收标准和风险。\n验收标准：支付相关 coder 能基于该方案继续实现。",
             roots,
         )
         for node in dag.get("nodes", []):
@@ -1656,7 +1697,21 @@ def _load_configured_models() -> list[dict]:
     return [item for item in models if isinstance(item, dict) and item.get("default_model")]
 
 
+def _load_model_strategy() -> dict[str, str]:
+    """Load model_strategy from settings.json.  Returns {agent_type: 'provider/model_id'}."""
+    settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    strategy = payload.get("model_strategy", {})
+    if not isinstance(strategy, dict):
+        return {}
+    return {k: v for k, v in strategy.items() if isinstance(v, str) and v.strip()}
+
+
 def _choose_default_model(agent_type: str, metadata: dict | None) -> tuple[str, str]:
+    # Priority 1: per-workflow auto_child_model_map from DAG metadata
     auto_map = (metadata or {}).get("auto_child_model_map", {}) if isinstance(metadata, dict) else {}
     if isinstance(auto_map, dict):
         raw = str(auto_map.get(agent_type) or "").strip()
@@ -1665,6 +1720,22 @@ def _choose_default_model(agent_type: str, metadata: dict | None) -> tuple[str, 
             if provider and model_id:
                 return provider, model_id
 
+    # Priority 2: global model_strategy from settings.json
+    strategy = _load_model_strategy()
+    raw = strategy.get(agent_type, "").strip()
+    if raw:
+        if "/" in raw:
+            provider, model_id = raw.split("/", 1)
+            if provider and model_id:
+                return provider, model_id
+        else:
+            # model_id only, find the provider from configured models
+            models = _load_configured_models()
+            for m in models:
+                if raw in str(m.get("default_model") or m.get("name") or ""):
+                    return str(m.get("format") or ""), raw
+
+    # Priority 3: hardcoded substring-matching fallback
     models = _load_configured_models()
     if not models:
         return "", ""
@@ -1734,6 +1805,11 @@ def _normalize_dag(dag: dict) -> dict:
                 data["label"] = node.get("label")
             if node.get("prompt") and not data.get("prompt"):
                 data["prompt"] = node.get("prompt")
+
+            # Preserve rich context fields from planner output
+            for rich_key in ("target_files", "interface_contract", "context_summary"):
+                if node.get(rich_key) and not data.get(rich_key):
+                    data[rich_key] = node[rich_key]
 
             provider = str(
                 data.get("modelProvider")
@@ -1967,6 +2043,12 @@ async def planner_chat(
             "\n\n## 当前左侧面板结构化状态\n"
             f"{json.dumps(metadata['planner_ui_state'], ensure_ascii=False, indent=2)}"
         )
+
+    # 4.6. Inject workspace file tree so planner references real paths
+    if workflow.workspace_directory:
+        ws_index = _build_workspace_index(workflow.workspace_directory)
+        if ws_index:
+            messages[-1]["content"] += f"\n\n{ws_index}"
 
     # 5. Stream the response as SSE
     async def generate():
@@ -2611,7 +2693,6 @@ async def planner_chat(
         draft_state["blockers"] = final_action.get("blockers") or []
         draft_state["lifecycle_phase"] = (
             "ready" if action_name == "set_ready"
-            else "blocked" if action_name == "report_blocker"
             else "assessing" if action_name == "assess"
             else "planning"
         )
@@ -2670,7 +2751,7 @@ async def planner_chat(
                 workflow.blockers_json = []
                 flag_modified(workflow, "blockers_json")
             elif action_name == "report_blocker":
-                workflow.lifecycle_phase = "blocked"
+                workflow.lifecycle_phase = "review"
                 workflow.blockers_json = final_action.get("blockers") or [{
                     "code": "planner_blocked",
                     "message": final_action.get("message") or "Planner 报告当前方案存在阻塞项。",

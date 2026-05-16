@@ -571,7 +571,7 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set({ workspaceDirectory: dir });
     try {
       await api.updateWorkflow(currentWorkflowId, { workspace_directory: dir });
-      if (!workspaceDirectory.trim() && dir.trim() && (lifecyclePhase === "draft" || lifecyclePhase === "blocked")) {
+      if (!workspaceDirectory.trim() && dir.trim() && lifecyclePhase === "draft") {
         const assessed = await api.assessWorkflow(currentWorkflowId);
         get().loadWorkflow(assessed);
       }

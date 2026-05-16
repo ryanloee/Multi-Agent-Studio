@@ -42,7 +42,7 @@ class UpdateWorkflowRequest(BaseModel):
     metadata: Optional[dict[str, Any]] = None
     lifecycle_phase: Optional[str] = Field(
         None,
-        pattern="^(draft|assessing|planning|ready|running|blocked|review)$",
+        pattern="^(draft|assessing|planning|ready|running|review)$",
     )
     blockers: Optional[list[dict[str, Any]]] = None
     project_summary: Optional[dict[str, Any]] = None
@@ -192,6 +192,8 @@ class TaskUpdate(BaseModel):
     progress: Optional[int] = Field(None, ge=0, le=100)
     result_summary: Optional[str] = None
     dependencies: Optional[str] = None
+    retry_count: Optional[int] = Field(None, ge=0)
+    last_error: Optional[str] = None
 
 
 class TaskAssignRequest(BaseModel):
@@ -216,6 +218,8 @@ class TaskResponse(BaseModel):
     progress: int
     result_summary: str
     dependencies: Optional[str] = None
+    retry_count: int = 0
+    last_error: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -236,7 +240,7 @@ class TaskMessageCreate(BaseModel):
     sender_id: str
     message_type: str = Field(
         ...,
-        pattern="^(assignment|question|answer|escalation|update|user_edit|worker_question|worker_answer|planner_question|planner_answer|artifact_created)$",
+        pattern="^(assignment|question|answer|escalation|update|user_edit|worker_question|worker_answer|artifact_created)$",
     )
     content: str
     target_node_id: Optional[str] = None

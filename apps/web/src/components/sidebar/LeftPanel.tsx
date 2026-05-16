@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useRef, useMemo } from "react";
-import { ListTodo, BookOpen, ClipboardList, Telescope, ArrowDown } from "lucide-react";
+import { ListTodo, BookOpen, ClipboardList, ArrowDown } from "lucide-react";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
@@ -10,7 +10,7 @@ import TaskBoard from "@/components/panels/TaskBoard";
 import SharedDocTab from "@/components/panels/SharedDocTab";
 import type { WorkflowEdge, WorkflowNode } from "@/types/workflow";
 
-type LeftTab = "task_object" | "summary" | "tasks" | "doc";
+type LeftTab = "task_object" | "tasks" | "doc";
 
 export default function LeftPanel({ workflowId }: { workflowId?: string }) {
   const [activeTab, setActiveTab] = useState<LeftTab>("task_object");
@@ -21,7 +21,6 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
   const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
   const lifecyclePhase = useWorkflowStore((s) => s.lifecyclePhase);
   const blockers = useWorkflowStore((s) => s.blockers);
-  const projectSummary = useWorkflowStore((s) => s.projectSummary);
   const plannerUiState = useWorkflowStore((s) => s.plannerUiState);
   const plannerDraftState = useWorkflowStore((s) => s.plannerDraftState);
   const plannerActionState = useWorkflowStore((s) => s.plannerActionState);
@@ -51,18 +50,12 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
     if (plannerActionState?.action === "update_dag" || plannerActionState?.action === "set_ready") {
       setActiveTab("task_object");
     }
-    if (Object.keys(projectSummary ?? {}).length > 0 && lifecyclePhase === "planning") {
-      setActiveTab("summary");
-    }
-  }, [plannerActionState, projectSummary, lifecyclePhase]);
+  }, [plannerActionState]);
 
   const plannedNodes = nodes.filter((node) => node.id !== "planner");
   const draftTaskObject = plannerDraftState?.task_object;
   const taskObject = plannerUiState.task_object ?? draftTaskObject;
   const plannedTaskItems = plannerUiState.task_board ?? plannerDraftState?.task_board ?? [];
-  const effectiveProjectSummary = Object.keys(projectSummary ?? {}).length > 0
-    ? projectSummary
-    : plannerDraftState?.project_summary ?? {};
   const draftDag = plannerDraftState?.dag;
   const plannedNodeCount = plannedNodes.length > 0
     ? plannedNodes.length
@@ -98,7 +91,6 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
       {/* Tab header */}
       <div className="flex items-center border-b border-gray-100 shrink-0">
         {tabBtn("task_object", <ClipboardList size={14} />, "任务对象")}
-        {tabBtn("summary", <Telescope size={14} />, "项目摘要")}
         {tabBtn("tasks", <ListTodo size={14} />, t("leftPanel.tasks") || "任务", taskCount)}
         {tabBtn("doc", <BookOpen size={14} />, t("leftPanel.sharedDoc") || "文档")}
       </div>
@@ -220,31 +212,6 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
                 <div className="mt-1 space-y-1 text-red-700">
                   {blockers.map((item) => (
                     <div key={`${item.code}-${item.message}`}>- {item.message}</div>
-                  ))}
-                </div>
-              </div>
-            )}
-          </div>
-        ) : activeTab === "summary" ? (
-          <div className="h-full overflow-y-auto p-3">
-            {Object.keys(effectiveProjectSummary ?? {}).length === 0 ? (
-              <div className="rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs text-gray-500">
-                还没有项目摘要。导入现有项目后，Planner 或系统 Assess 会在这里展示项目类型、技术栈、启动方式和风险点。
-              </div>
-            ) : (
-              <div className="rounded-lg border border-gray-200 bg-white p-3 text-xs text-gray-700">
-                <div className="space-y-2">
-                  {Object.entries(effectiveProjectSummary).map(([key, value]) => (
-                    <div key={key}>
-                      <div className="text-[10px] font-semibold uppercase tracking-wide text-gray-500">{key}</div>
-                      <div className="mt-0.5 whitespace-pre-wrap break-words text-[11px] leading-relaxed text-gray-700">
-                        {Array.isArray(value)
-                          ? value.join(" / ")
-                          : typeof value === "object" && value !== null
-                            ? JSON.stringify(value, null, 2)
-                            : String(value)}
-                      </div>
-                    </div>
                   ))}
                 </div>
               </div>

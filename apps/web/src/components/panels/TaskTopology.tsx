@@ -1,14 +1,19 @@
 "use client";
 
 import { useMemo, memo } from "react";
+import { useWorkflowStore } from "@/stores/workflowStore";
+import type { NodeData } from "@/types/workflow";
 import {
-  Ban,
   CheckCircle2,
   Circle,
   Clock,
   FileText,
   MessageSquare,
   XCircle,
+  GitBranch,
+  Info,
+  RotateCw,
+  AlertTriangle,
 } from "lucide-react";
 import type { Artifact, Task, TaskMessage, TaskStatus } from "@/types/task";
 
@@ -16,7 +21,6 @@ const STATUS_ICON_MAP: Record<TaskStatus, { icon: typeof Circle; color: string; 
   pending:   { icon: Circle,       color: "text-gray-400",  label: "等待" },
   assigned:  { icon: Clock,        color: "text-blue-500",  label: "已分配" },
   running:   { icon: Clock,        color: "text-blue-600",  label: "运行中" },
-  blocked:   { icon: Ban,          color: "text-amber-600", label: "咨询中" },
   completed: { icon: CheckCircle2, color: "text-green-600", label: "完成" },
   failed:    { icon: XCircle,      color: "text-red-600",   label: "失败" },
 };
@@ -78,12 +82,14 @@ const TopologyTask = memo(function TopologyTask({
   messages,
   selectedTaskId,
   onSelect,
+  nodeData,
 }: {
   task: Task;
   artifacts: Artifact[];
   messages: TaskMessage[];
   selectedTaskId: string | null;
   onSelect: (taskId: string) => void;
+  nodeData?: { targetFiles?: string[]; interfaceContract?: string; contextSummary?: string };
 }) {
   const statusCfg = STATUS_ICON_MAP[task.status];
   const StatusIcon = statusCfg.icon;
@@ -91,8 +97,6 @@ const TopologyTask = memo(function TopologyTask({
   const importantMessages = messages.filter((message) =>
     message.message_type === "worker_question" ||
     message.message_type === "worker_answer" ||
-    message.message_type === "planner_question" ||
-    message.message_type === "planner_answer" ||
     message.message_type === "artifact_created"
   );
   const deps = parseDeps(task);
@@ -115,6 +119,12 @@ const TopologyTask = memo(function TopologyTask({
             <span className="flex shrink-0 items-center gap-0.5 text-[9px] text-emerald-600">
               <FileText size={9} />
               {artifacts.length}
+            </span>
+          )}
+          {task.retry_count > 0 && (
+            <span className="flex shrink-0 items-center gap-0.5 text-[9px] text-amber-600">
+              <RotateCw size={9} />
+              {task.retry_count}
             </span>
           )}
           {importantMessages.length > 0 && (
@@ -149,6 +159,56 @@ const TopologyTask = memo(function TopologyTask({
                 {compact(task.description, 900)}
               </div>
             </div>
+          )}
+          {task.last_error && (
+            <div>
+              <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                <AlertTriangle size={10} className="text-red-500" />
+                错误信息 {task.retry_count > 0 && `(重试 ${task.retry_count} 次)`}
+              </div>
+              <div className="max-h-20 overflow-y-auto whitespace-pre-wrap rounded bg-red-50 border border-red-100 p-1.5 text-red-700">
+                {compact(task.last_error, 500)}
+              </div>
+            </div>
+          )}
+          {nodeData && (
+            <>
+              {nodeData.targetFiles && nodeData.targetFiles.length > 0 && (
+                <div>
+                  <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                    <FileText size={10} className="text-orange-500" />
+                    目标文件
+                  </div>
+                  <div className="flex flex-wrap gap-1">
+                    {nodeData.targetFiles.map((f) => (
+                      <span key={f} className="rounded bg-orange-50 text-orange-700 px-1.5 py-0.5 font-mono text-[9px] break-all">{f}</span>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {nodeData.interfaceContract && (
+                <div>
+                  <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                    <GitBranch size={10} className="text-indigo-500" />
+                    接口契约
+                  </div>
+                  <div className="max-h-20 overflow-y-auto whitespace-pre-wrap rounded bg-indigo-50/60 p-1.5 text-gray-600">
+                    {compact(nodeData.interfaceContract, 500)}
+                  </div>
+                </div>
+              )}
+              {nodeData.contextSummary && (
+                <div>
+                  <div className="flex items-center gap-1 mb-0.5 font-medium text-gray-500">
+                    <Info size={10} className="text-teal-500" />
+                    上下文说明
+                  </div>
+                  <div className="max-h-20 overflow-y-auto whitespace-pre-wrap rounded bg-teal-50/60 p-1.5 text-gray-600">
+                    {compact(nodeData.contextSummary, 500)}
+                  </div>
+                </div>
+              )}
+            </>
           )}
           {importantMessages.length > 0 && (
             <div>
@@ -203,6 +263,22 @@ export default function TaskTopology({
   selectedTaskId: string | null;
   onSelect: (taskId: string) => void;
 }) {
+  const rawNodes = useWorkflowStore((s) => s.nodes);
+  const nodeDataMap = useMemo(() => {
+    const map: Record<string, { targetFiles?: string[]; interfaceContract?: string; contextSummary?: string }> = {};
+    for (const n of rawNodes ?? []) {
+      const d = n.data as NodeData;
+      if (d?.targetFiles || d?.interfaceContract || d?.contextSummary) {
+        map[n.id] = {
+          targetFiles: d.targetFiles,
+          interfaceContract: d.interfaceContract,
+          contextSummary: d.contextSummary,
+        };
+      }
+    }
+    return map;
+  }, [rawNodes]);
+
   const layers = useMemo(() => buildLayers(tasks), [tasks]);
   const artifactsByTask = useMemo(() => {
     const map: Record<string, Artifact[]> = {};
@@ -238,6 +314,7 @@ export default function TaskTopology({
               messages={messages[task.id] ?? []}
               selectedTaskId={selectedTaskId}
               onSelect={onSelect}
+              nodeData={task.assigned_node_id ? nodeDataMap[task.assigned_node_id] : undefined}
             />
           ))}
         </div>

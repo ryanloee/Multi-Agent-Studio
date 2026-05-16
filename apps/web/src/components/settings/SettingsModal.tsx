@@ -18,6 +18,7 @@ import {
   Wifi,
   WifiOff,
   Play,
+  Layers,
 } from "lucide-react";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLocaleStore } from "@/stores/localeStore";
@@ -33,6 +34,7 @@ const TABS: { key: SettingsTab; icon: typeof Globe; labelKey: string }[] = [
   { key: "general", icon: Globe, labelKey: "settings.tabGeneral" },
   { key: "display", icon: Monitor, labelKey: "settings.tabDisplay" },
   { key: "models", icon: Cpu, labelKey: "settings.tabModels" },
+  { key: "strategy", icon: Layers, labelKey: "settings.tabStrategy" },
 ];
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -170,6 +172,7 @@ export default function SettingsModal() {
               <DisplayTab settings={settings} updateDisplay={updateDisplay} />
             )}
             {activeTab === "models" && <ModelsTab />}
+            {activeTab === "strategy" && <ModelStrategyTab />}
           </div>
 
           <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-between bg-gray-50/50">
@@ -873,6 +876,94 @@ function ModelsTab() {
             })}
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Model Strategy Tab — per-role model assignment
+// ---------------------------------------------------------------------------
+
+const ROLE_KEYS = ["planner", "design", "review", "merge", "explore", "coder", "shell"] as const;
+type RoleKey = (typeof ROLE_KEYS)[number];
+
+const ROLE_LABELS: Record<RoleKey, string> = {
+  planner: "Planner",
+  design: "Design",
+  review: "Review",
+  merge: "Merge",
+  explore: "Explore",
+  coder: "Coder",
+  shell: "Shell",
+};
+
+const ROLE_DESCS: Record<RoleKey, string> = {
+  planner: "任务规划与分解",
+  design: "架构设计与方案",
+  review: "代码审查与反馈",
+  merge: "代码合并与冲突解决",
+  explore: "代码探索与调研",
+  coder: "代码编写与实现",
+  shell: "命令执行与测试",
+};
+
+function ModelStrategyTab() {
+  const t = useLocaleStore((s) => s.t);
+  const rawModels = useSettingsStore((s) => s.settings.models);
+  const models: ModelEntry[] = Array.isArray(rawModels) ? rawModels : [];
+  const modelStrategy = useSettingsStore((s) => s.settings.model_strategy);
+  const updateModelStrategy = useSettingsStore((s) => s.updateModelStrategy);
+
+  // Build model options: "provider/model_id" format
+  const modelOptions = models.map((m) => ({
+    value: `${m.format}/${m.default_model}`,
+    label: `${m.name || m.default_model} (${m.format})`,
+  }));
+
+  return (
+    <div className="space-y-6 max-w-2xl">
+      <div>
+        <h4 className="text-sm font-semibold text-gray-800 mb-1">按角色分配模型</h4>
+        <p className="text-xs text-gray-400">
+          为每种任务角色指定默认模型。留空则使用系统默认匹配。
+          格式：provider/model_id（如 openai/gpt-4o）
+        </p>
+      </div>
+
+      <div className="space-y-3">
+        {ROLE_KEYS.map((role) => (
+          <div
+            key={role}
+            className="flex items-center gap-4 p-3 rounded-lg border border-gray-200 bg-white hover:border-gray-300 transition-colors"
+          >
+            <div className="w-20 shrink-0">
+              <span className="text-sm font-medium text-gray-700">{ROLE_LABELS[role]}</span>
+              <p className="text-[10px] text-gray-400 mt-0.5">{ROLE_DESCS[role]}</p>
+            </div>
+            <select
+              value={modelStrategy?.[role] ?? ""}
+              onChange={(e) => updateModelStrategy({ [role]: e.target.value })}
+              className="flex-1 rounded-lg border border-gray-300 bg-white px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-200 focus:outline-none"
+            >
+              <option value="">默认（自动匹配）</option>
+              {modelOptions.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label}
+                </option>
+              ))}
+            </select>
+          </div>
+        ))}
+      </div>
+
+      <div className="p-3 rounded-lg bg-blue-50 border border-blue-100">
+        <p className="text-xs text-blue-700">
+          <strong>优先级：</strong>节点指定模型 → 工作流 autoChildModelMap → 全局模型策略 → 系统默认
+        </p>
+        <p className="text-xs text-blue-600 mt-1">
+          建议：Planner/Review 使用强模型（如 Claude Opus），Coder/Explore 使用快模型（如 GPT-4o-mini）
+        </p>
       </div>
     </div>
   );

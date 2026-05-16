@@ -127,7 +127,7 @@ export interface PlannerUiTaskItem {
   title: string;
   description?: string;
   node_id?: string;
-  status?: "planned" | "blocked" | "ready";
+  status?: "planned" | "ready";
   depends_on?: string[];
 }
 

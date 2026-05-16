@@ -114,6 +114,13 @@ export function useWebSocket(
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+
+          // Reply to backend ping to keep connection alive
+          if (data.type === "ping") {
+            ws.send(JSON.stringify({ type: "pong" }));
+            return;
+          }
+
           addEvent(data);
 
           // Handle task-related events
@@ -133,6 +140,8 @@ export function useWebSocket(
               progress: 0,
               result_summary: "",
               dependencies: data.dependencies || undefined,
+              retry_count: 0,
+              last_error: null,
               created_at: new Date().toISOString(),
               updated_at: new Date().toISOString(),
             });

@@ -170,7 +170,7 @@ async def restart_task(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task.status not in ("failed", "completed", "blocked", "pending"):
+    if task.status not in ("failed", "completed", "pending"):
         raise HTTPException(
             status_code=400,
             detail=f"Cannot restart task in status '{task.status}'. "
@@ -217,7 +217,7 @@ async def restart_task(
                     break
 
         if node_config:
-            from app.core.task_scheduler import ManagedTask, ESCALATION_MARKER, PROGRESS_MARKER
+            from app.core.task_scheduler import ManagedTask, PROGRESS_MARKER
 
             node_data = node_config.get("data", {}) or {}
             managed = ManagedTask(
@@ -234,8 +234,6 @@ async def restart_task(
             worker_prompt = node_data.get("prompt", "") or task.description or task.title
             worker_prompt += (
                 f"\n\n---\nTask ID: {node_id}\n"
-                f"When you need help or are stuck, output a line:\n"
-                f"{ESCALATION_MARKER} <your question>\n"
                 f"To report progress, output a line:\n"
                 f"{PROGRESS_MARKER} <0-100>\n"
             )
@@ -249,13 +247,6 @@ async def restart_task(
             }
 
             cancel_event = asyncio.Event()
-            planner_node = {
-                "id": "planner",
-                "agent_type": "plan",
-                "model_provider": "",
-                "model_id": "",
-                "prompt": "Answer worker escalation questions concisely using the run context.",
-            }
 
             # Start execution in background
             async def _run_task():
@@ -273,7 +264,6 @@ async def restart_task(
                     task=managed,
                     global_config={"_workflow_id": str(run_obj.workflow_id) if run_obj else ""},
                     cancel_event=cancel_event,
-                    planner_node=planner_node,
                 )
                 if result.get("state") == "completed":
                     await _engine._create_artifact_for_task(
@@ -312,7 +302,7 @@ async def assign_task(
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task.status not in ("pending", "blocked", "failed", "completed"):
+    if task.status not in ("pending", "failed", "completed"):
         raise HTTPException(
             status_code=400,
             detail=f"Cannot assign task in status '{task.status}'. "
@@ -341,7 +331,7 @@ async def assign_task(
 
     # If the engine is available, start the task execution in the background
     if _engine and _event_bus and body.prompt:
-        from app.core.task_scheduler import ManagedTask, ESCALATION_MARKER, PROGRESS_MARKER
+        from app.core.task_scheduler import ManagedTask, PROGRESS_MARKER
 
         managed = ManagedTask(
             db_id=str(task.id),
@@ -357,8 +347,6 @@ async def assign_task(
         worker_prompt = body.prompt
         worker_prompt += (
             f"\n\n---\nTask ID: {body.node_id}\n"
-            f"When you need help or are stuck, output a line:\n"
-            f"{ESCALATION_MARKER} <your question>\n"
             f"To report progress, output a line:\n"
             f"{PROGRESS_MARKER} <0-100>\n"
         )
@@ -372,13 +360,6 @@ async def assign_task(
         }
 
         cancel_event = asyncio.Event()
-        planner_node = {
-            "id": "planner",
-            "agent_type": "plan",
-            "model_provider": "",
-            "model_id": "",
-            "prompt": "Answer worker escalation questions concisely using the run context.",
-        }
 
         # Start execution in background
         async def _run_task():
@@ -397,7 +378,6 @@ async def assign_task(
                 task=managed,
                 global_config={"_workflow_id": workflow_id or ""},
                 cancel_event=cancel_event,
-                planner_node=planner_node,
             )
             if result.get("state") == "completed":
                 await _engine._create_artifact_for_task(

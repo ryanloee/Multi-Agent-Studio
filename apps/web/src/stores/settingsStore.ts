@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { AppSettings, GeneralSettings, DisplaySettings, ModelEntry } from "@/types/settings";
+import type { AppSettings, GeneralSettings, DisplaySettings, ModelEntry, ModelStrategy } from "@/types/settings";
 import { api } from "@/lib/api";
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -55,6 +55,15 @@ const DEFAULT_SETTINGS: AppSettings = {
     compact_mode: false,
   },
   models: [],
+  model_strategy: {
+    planner: "",
+    design: "",
+    review: "",
+    merge: "",
+    explore: "",
+    coder: "",
+    shell: "",
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -73,6 +82,7 @@ interface SettingsState {
   loadFromServer: () => Promise<void>;
   updateGeneral: (patch: Partial<GeneralSettings>) => void;
   updateDisplay: (patch: Partial<DisplaySettings>) => void;
+  updateModelStrategy: (patch: Partial<ModelStrategy>) => void;
   addModel: (model: ModelEntry) => void;
   updateModel: (id: string, patch: Partial<ModelEntry>) => void;
   removeModel: (id: string) => void;
@@ -129,6 +139,16 @@ export const useSettingsStore = create<SettingsState>()(
       updateDisplay: (patch) => {
         set((s) => ({
           settings: { ...s.settings, display: { ...s.settings.display, ...patch } },
+          saveError: null,
+        }));
+      },
+
+      updateModelStrategy: (patch) => {
+        set((s) => ({
+          settings: {
+            ...s.settings,
+            model_strategy: { ...s.settings.model_strategy, ...patch },
+          },
           saveError: null,
         }));
       },

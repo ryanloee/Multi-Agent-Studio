@@ -11,7 +11,7 @@ function eventKind(type: string): TimelineKind {
   if (type === "llm_token" || type === "llm_chunk") return "llm";
   if (type === "tool_call" || type === "tool_result") return "tool";
   if (type === "shell_stdout" || type === "shell_stderr") return "shell";
-  if (type === "task_message" || type === "worker_message" || type === "planner_guidance") return "comm";
+  if (type === "task_message" || type === "worker_message") return "comm";
   if (type === "artifact_created") return "artifact";
   return "status";
 }

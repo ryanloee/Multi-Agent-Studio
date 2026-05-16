@@ -45,6 +45,12 @@ export interface NodeData {
   parentNodeId?: string;
   /** true if this node was created at runtime by a planner */
   isDynamic?: boolean;
+  /** Files this node should read/modify (planner-specified) */
+  targetFiles?: string[];
+  /** Interface contract describing expected I/O for this node */
+  interfaceContract?: string;
+  /** High-level context summary for the node */
+  contextSummary?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +92,6 @@ export type WorkflowLifecyclePhase =
   | "planning"
   | "ready"
   | "running"
-  | "blocked"
   | "review";
 
 export interface WorkflowBlocker {

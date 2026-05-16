@@ -128,6 +128,10 @@ async def lifespan(app: FastAPI):
                 if "dependencies" not in task_columns:
                     logger.info("Schema migration: tasks table missing dependencies, will recreate database")
                     needs_reset = True
+                if "retry_count" not in task_columns:
+                    logger.info("Schema migration: adding retry_count and last_error to tasks table")
+                    await conn.execute(sa_text("ALTER TABLE tasks ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0"))
+                    await conn.execute(sa_text("ALTER TABLE tasks ADD COLUMN last_error TEXT"))
             msg_table = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' AND name='task_messages'"))
             if msg_table.fetchone():
                 msg_cols_result = await conn.execute(sa_text("PRAGMA table_info(task_messages)"))

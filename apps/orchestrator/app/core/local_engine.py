@@ -18,8 +18,8 @@ import json
 import logging
 import os
 import shlex
-import time
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,7 +28,7 @@ from uuid import uuid4
 
 from app.core.local_bus import InProcessEventBus
 from app.core.local_sandbox import LocalSandbox
-from app.core.task_scheduler import TaskScheduler, ESCALATION_MARKER, PROGRESS_MARKER
+from app.core.task_scheduler import PROGRESS_MARKER, TaskScheduler
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
 from app.workflows.compiler import compile_dag
@@ -36,14 +36,26 @@ from app.workflows.plan_parser import parse_plan_output, parse_plan_to_dag
 
 logger = logging.getLogger(__name__)
 
+_model_config_cache: dict[str, dict] = {}
+_model_config_cache_time: float = 0
+_MODEL_CONFIG_CACHE_TTL = 5.0  # seconds
+
+_db_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_db_semaphore() -> asyncio.Semaphore:
+    global _db_semaphore
+    if _db_semaphore is None:
+        _db_semaphore = asyncio.Semaphore(10)
+    return _db_semaphore
+
 # Event types that the agent writes to stream.jsonl in the correct format
 _KNOWN_EVENT_TYPES = frozenset({
     "llm_token", "llm_chunk", "tool_call", "tool_result", "shell_stdout",
     "shell_stderr", "status", "error", "node_started", "node_completed",
     "node_failed", "child_created", "child_completed",
-    "task_created", "task_updated", "task_message", "worker_escalation",
-    "artifact_created", "worker_message", "planner_guidance",
-    "task_blocked", "task_unblocked",
+    "task_created", "task_updated", "task_message",
+    "artifact_created", "worker_message",
     "idle_warning", "agent_status",
 })
 
@@ -95,16 +107,29 @@ def _build_subprocess_env() -> dict[str, str]:
 
 def _load_settings_models() -> list[dict[str, Any]]:
     """Load UI model entries from settings.json."""
+    global _model_config_cache, _model_config_cache_time
+    now = time.time()
+    if now - _model_config_cache_time < _MODEL_CONFIG_CACHE_TTL:
+        return _model_config_cache.get("models", [])
+
     settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
     try:
         data = json.loads(settings_path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
+        _model_config_cache = {"models": []}
+        _model_config_cache_time = now
         return []
 
     models = data.get("models", [])
     if not isinstance(models, list) or not models:
+        _model_config_cache = {"models": []}
+        _model_config_cache_time = now
         return []
-    return [m for m in models if isinstance(m, dict)]
+
+    result = [m for m in models if isinstance(m, dict)]
+    _model_config_cache = {"models": result}
+    _model_config_cache_time = now
+    return result
 
 
 def _normalize_model_config(entry: dict[str, Any]) -> dict[str, str | int]:
@@ -168,6 +193,67 @@ def _resolve_auto_child_model(
     return _parse_full_model_id(raw)
 
 
+def _normalize_node_config(
+    node: dict,
+    auto_child_model_map: dict,
+    node_id: str,
+) -> tuple[dict, str, str, str]:
+    """Normalize a node dict for execution.
+
+    Returns: (normalized_node, agent_type, model_provider, model_id)
+    """
+    data = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
+    agent_type = (
+        node.get("agent_type")
+        or data.get("agent_type")
+        or data.get("agentType")
+        or node.get("type")
+        or "coder"
+    )
+    if agent_type == "plan" and node_id != "planner":
+        agent_type = "design"
+    prompt = node.get("prompt") or data.get("prompt") or ""
+    model_provider = (
+        node.get("model_provider")
+        or data.get("model_provider")
+        or data.get("modelProvider")
+        or ""
+    )
+    model_id = (
+        node.get("model_id")
+        or data.get("model_id")
+        or data.get("modelId")
+        or ""
+    )
+    if not model_provider or not model_id:
+        fallback_provider, fallback_model_id = _resolve_auto_child_model(
+            auto_child_model_map, str(agent_type)
+        )
+        if not model_provider:
+            model_provider = fallback_provider
+        if not model_id:
+            model_id = fallback_model_id
+
+    normalized = {
+        "id": node_id,
+        "agent_type": agent_type,
+        "model_provider": model_provider,
+        "model_id": model_id,
+        "prompt": (
+            prompt
+            + f"\n\n---\nTask ID: {node_id}\n"
+            + "To report progress, output a line:\n"
+            + f"{PROGRESS_MARKER} <0-100>\n"
+        ),
+    }
+    # Preserve rich context fields from planner output
+    for rich_key in ("target_files", "interface_contract", "context_summary"):
+        value = node.get(rich_key) or data.get(rich_key)
+        if value:
+            normalized[rich_key] = value
+    return normalized, str(agent_type), model_provider, model_id
+
+
 class LocalDAGExecutor:
     """Local asyncio-based DAG executor.  Replaces Temporal."""
 
@@ -199,56 +285,7 @@ class LocalDAGExecutor:
     # Public API
     # ------------------------------------------------------------------
 
-    async def start_workflow(
-        self,
-        run_id: str,
-        layers: list[dict],
-        global_config: dict | None = None,
-        workspace_directory: str | None = None,
-    ) -> str:
-        """Start DAG execution as a background asyncio task."""
-        cancel_event = asyncio.Event()
-        self._runs[run_id] = {
-            "status": "running",
-            "task": None,
-            "cancel_event": cancel_event,
-            "global_config": global_config or {},
-            "workspace_directory": workspace_directory,
-            "kind": "workflow",
-            "layers": layers,
-        }
-        await self._write_mas_run_manifest(
-            run_id=run_id,
-            workspace_directory=workspace_directory,
-            kind="workflow",
-            status="running",
-            payload={
-                "layers": layers,
-                "global_config": global_config or {},
-            },
-        )
-        task = asyncio.create_task(
-            self._execute_dag(
-                run_id, layers, global_config or {}, cancel_event,
-                workspace_directory=workspace_directory,
-            ),
-            name=f"dag-{run_id}",
-        )
-
-        def _log_task_exception(t: asyncio.Task) -> None:
-            if t.cancelled():
-                return
-            exc = t.exception()
-            if exc:
-                logger.exception("DAG task failed for run %s", run_id)
-
-        task.add_done_callback(_log_task_exception)
-
-        self._runs[run_id]["task"] = task
-        logger.info("DAG task created for run %s with %d layers", run_id, len(layers))
-        return run_id
-
-    async def start_task_dag(
+    async def start_run(
         self,
         run_id: str,
         dag_json: dict,
@@ -309,10 +346,12 @@ class LocalDAGExecutor:
         re-execute only unfinished nodes.
         """
         try:
-            from app.core.database import async_session_factory
-            from app.models.db import Run as RunModel, Workflow
-            from app.models.task import Task as TaskModel
             from sqlalchemy import select
+
+            from app.core.database import async_session_factory
+            from app.models.db import Run as RunModel
+            from app.models.db import Workflow
+            from app.models.task import Task as TaskModel
 
             async with async_session_factory() as session:
                 result = await session.execute(
@@ -326,7 +365,7 @@ class LocalDAGExecutor:
                         select(TaskModel).where(TaskModel.run_id == run.id)
                     )
                     for task in task_result.scalars().all():
-                        if task.status in ("running", "blocked"):
+                        if task.status == "running":
                             task.status = "pending"
                     run.status = "running"
                 await session.commit()
@@ -436,36 +475,37 @@ class LocalDAGExecutor:
 
     async def _persist_run_event(self, event: dict[str, Any]) -> None:
         """Store a stream event so UI panels can be restored after reconnect."""
-        try:
-            from app.core.database import async_session_factory
-            from app.models.db import Run, RunEvent
+        async with _get_db_semaphore():
+            try:
+                from app.core.database import async_session_factory
+                from app.models.db import Run, RunEvent
 
-            run_id = uuid.UUID(str(event.get("run_id", "")))
-            node_id = str(event.get("node_id") or "")
-            async with async_session_factory() as session:
-                run = await session.get(Run, run_id)
-                if run is None:
-                    run_state = self._runs.get(str(run_id), {})
-                    workflow_id_raw = (
-                        (run_state.get("global_config") or {}).get("_workflow_id")
-                        or event.get("workflow_id")
-                    )
-                    if workflow_id_raw:
-                        session.add(Run(
-                            id=run_id,
-                            workflow_id=uuid.UUID(str(workflow_id_raw)),
-                            status=str(run_state.get("status") or "running"),
-                            engine_workflow_id=str(run_id),
-                        ))
-                session.add(RunEvent(
-                    run_id=run_id,
-                    event_type=str(event.get("type") or ""),
-                    node_id=node_id,
-                    payload=event,
-                ))
-                await session.commit()
-        except Exception:
-            logger.warning("Failed to persist run event %s", event.get("type"), exc_info=True)
+                run_id = uuid.UUID(str(event.get("run_id", "")))
+                node_id = str(event.get("node_id") or "")
+                async with async_session_factory() as session:
+                    run = await session.get(Run, run_id)
+                    if run is None:
+                        run_state = self._runs.get(str(run_id), {})
+                        workflow_id_raw = (
+                            (run_state.get("global_config") or {}).get("_workflow_id")
+                            or event.get("workflow_id")
+                        )
+                        if workflow_id_raw:
+                            session.add(Run(
+                                id=run_id,
+                                workflow_id=uuid.UUID(str(workflow_id_raw)),
+                                status=str(run_state.get("status") or "running"),
+                                engine_workflow_id=str(run_id),
+                            ))
+                    session.add(RunEvent(
+                        run_id=run_id,
+                        event_type=str(event.get("type") or ""),
+                        node_id=node_id,
+                        payload=event,
+                    ))
+                    await session.commit()
+            except Exception:
+                logger.warning("Failed to persist run event %s", event.get("type"), exc_info=True)
 
     def _mas_run_dir(self, workspace_directory: str | None, run_id: str) -> Path | None:
         if not workspace_directory:
@@ -965,7 +1005,6 @@ class LocalDAGExecutor:
                 "\n## 冲突处理建议\n"
                 f"- 当前需要重点核对的上游节点: {', '.join(conflicting_nodes)}\n"
                 "- 可以用 `ASK_WORKER: <node_id>: <question>` 询问具体冲突来源。\n"
-                "- 如果涉及架构或范围取舍，用 `ESCALATE_TO_PLANNER: <question>` 请求 Planner 决策。\n"
                 f"- 结构化清单见 `/workspace/.agent/merge-manifest-{node_id}.json`。\n"
             )
         elif merge_sandbox_id:
@@ -1033,55 +1072,7 @@ class LocalDAGExecutor:
                 parts.append(ev.get("content", ""))
         return "".join(parts)
 
-    async def _route_escalation(
-        self, run_id: str, source_node_id: str, message: str
-    ) -> None:
-        """Route an escalation from a worker to its upstream node.
-
-        The planner is always the upstream — the existing
-        TaskScheduler handles this.  For DAG-defined workflows,
-        we look up the edges to find the direct upstream node(s)
-        and emit an ``escalation_routed`` event targeting them.
-
-        If the upstream node has already completed, we inject the
-        escalation as a new message into the run's event stream.
-        """
-        run_state = self._runs.get(run_id, {})
-        global_config = run_state.get("global_config", {})
-        edges: list[dict] = global_config.get("_edges", [])
-
-        # Find upstream nodes (edges where source_node_id is the target)
-        upstream_ids = [
-            e["source"] for e in edges
-            if e.get("target") == source_node_id
-        ]
-
-        if not upstream_ids:
-            logger.info(
-                "Escalation from %s: no upstream node found in edges, "
-                "broadcasting to run",
-                source_node_id,
-            )
-            # No upstream — just broadcast
-            await self._emit(
-                "escalation_broadcast", run_id, source_node_id,
-                content=message,
-            )
-            return
-
-        # Route to all upstream nodes (typically just one in serial chains)
-        for upstream_id in upstream_ids:
-            logger.info(
-                "Escalation from %s routed to upstream %s: %s",
-                source_node_id, upstream_id, message[:100],
-            )
-            await self._emit(
-                "escalation_routed", run_id, upstream_id,
-                content=message,
-                source_node_id=source_node_id,
-            )
-
-    def _build_upstream_context(
+    async def _build_upstream_context(
         self,
         node_id: str,
         edges: list[dict],
@@ -1091,7 +1082,8 @@ class LocalDAGExecutor:
 
         For each upstream edge targeting *node_id*, extracts the
         ``result_summary`` from the upstream result, or falls back to the
-        last 2 000 characters of LLM text in ``raw_output``.
+        last 4 000 characters of LLM text in ``raw_output``.
+        Also includes a list of changed files when available.
         Returns an empty string when there are no upstream edges.
         """
         upstream_edges = [e for e in edges if e.get("target") == node_id]
@@ -1117,15 +1109,84 @@ class LocalDAGExecutor:
                 raw = source_result.get("raw_output", "")
                 if raw:
                     full_text = self._extract_llm_text(raw)
-                    summary = full_text[-2000:]
+                    summary = full_text[-4000:]
 
             if summary:
                 sections.append(f"### {source_id}\n{summary}")
+
+            # Include changed files list from the upstream sandbox
+            source_sandbox = source_result.get("sandbox_id")
+            if source_sandbox:
+                try:
+                    changed_out, _ = await self._sandbox.exec(
+                        source_sandbox,
+                        'git diff --name-status HEAD~1 HEAD 2>/dev/null || true',
+                    )
+                    if changed_out.strip():
+                        sections.append(
+                            f"### {source_id} 变更文件\n```\n{changed_out.strip()}\n```"
+                        )
+                except Exception:
+                    pass
 
         if not sections:
             return ""
 
         return "\n\n## 上游节点输出\n" + "\n".join(sections) + "\n"
+
+    async def _build_rich_node_context(
+        self,
+        node: dict,
+        sandbox_id: str,
+        workspace_directory: str | None,
+    ) -> str:
+        """Build rich context from planner-specified fields: target file contents,
+        interface contract, and context summary."""
+        sections: list[str] = []
+        data = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
+
+        # 1. Interface contract
+        contract = node.get("interface_contract") or data.get("interface_contract") or ""
+        if contract:
+            sections.append(f"## 接口契约\n{contract}")
+
+        # 2. Context summary
+        ctx = node.get("context_summary") or data.get("context_summary") or ""
+        if ctx:
+            sections.append(f"## 上下文说明\n{ctx}")
+
+        # 3. Target files — read current content from sandbox
+        target_files = node.get("target_files") or data.get("target_files") or []
+        if isinstance(target_files, list) and target_files:
+            file_sections: list[str] = []
+            for fpath in target_files[:10]:
+                fpath = str(fpath).strip()
+                if not fpath:
+                    continue
+                content = ""
+                try:
+                    content = await self._sandbox.read_file(sandbox_id, f"/workspace/{fpath}")
+                except Exception:
+                    pass
+                if not content and workspace_directory:
+                    try:
+                        host_path = Path(workspace_directory) / fpath
+                        if host_path.is_file():
+                            content = host_path.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+                if content:
+                    if len(content) > 3000:
+                        content = content[:3000] + f"\n... (文件截断，共 {len(content)} 字符)"
+                    file_sections.append(f"### {fpath}\n```\n{content}\n```")
+                else:
+                    file_sections.append(f"### {fpath}\n（文件不存在，需要创建）")
+            if file_sections:
+                sections.append("## 目标文件当前内容\n" + "\n\n".join(file_sections))
+
+        if not sections:
+            return ""
+        return "\n\n" + "\n\n".join(sections) + "\n"
 
     async def _execute_layers(
         self,
@@ -1135,24 +1196,35 @@ class LocalDAGExecutor:
         global_config: dict,
         cancel_event: asyncio.Event,
         workspace_directory: str | None = None,
+        task_db_map: dict[str, str] | None = None,
+        task_label_map: dict[str, str] | None = None,
+        task_type_map: dict[str, str] | None = None,
+        parent_node_id: str = "planner",
+        completed_results: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Execute compiled DAG layers with sandbox reuse and upstream context.
+        """Unified layer executor — handles both task-aware and simple DAG modes.
 
         Iterates layers sequentially; within each layer, nodes execute in
-        parallel.  Returns a dict mapping node_id -> result for all executed
-        nodes.  Used by both ``_execute_dag`` and ``_execute_dynamic_plan``.
+        parallel.  When *task_db_map* is provided each node is routed through
+        ``TaskScheduler.run_worker_task()``; otherwise ``_execute_node()`` is
+        called directly.  Returns a dict mapping node_id -> result.
         """
-        layer_results: dict[str, Any] = {}
-        sandbox_map: dict[str, str] = {}  # node_id -> sandbox_id
-        commit_map: dict[str, str] = {}    # node_id -> last commit hash
+        task_db_map = task_db_map or {}
+        task_label_map = task_label_map or {}
+        task_type_map = task_type_map or {}
+        has_tasks = bool(task_db_map)
+
+        layer_results: dict[str, Any] = dict(completed_results or {})
+        sandbox_map: dict[str, str] = {}
+        commit_map: dict[str, str] = {}
         retained_sandboxes: set[str] = set()
+
+        workflow_id = await self._get_run_workflow_id(run_id) if has_tasks else None
 
         for layer_idx, layer in enumerate(layers):
             if cancel_event.is_set():
                 break
 
-            # Layer may be a list of node dicts directly (from the engine's
-            # serialisation) or a dict with a "nodes" key.
             if isinstance(layer, dict):
                 nodes = layer.get("nodes", [])
                 if not nodes:
@@ -1160,330 +1232,63 @@ class LocalDAGExecutor:
             else:
                 nodes = layer
 
-            logger.info(
-                "Layers run=%s layer %d: executing %d nodes",
-                run_id, layer_idx, len(nodes),
-            )
-
-            # -- Resolve sandbox reuse strategy for each node in the layer --
-            # Single upstream: reuse if not already claimed; otherwise clone.
-            # Multi-upstream: reuse the primary (last) upstream's sandbox;
-            #   if already claimed, clone it.  All upstream summaries are
-            #   injected separately via _build_upstream_context.
-            # No upstreams: create a brand-new sandbox.
-            layer_sandbox_assignments: dict[str, str | None] = {}
-            layer_clone_requests: dict[str, str] = {}  # n_id -> source sandbox_id to clone
-            reused_upstream_ids: set[str] = set()  # upstream ids already claimed
-
-            for node in nodes:
-                n_id = node.get("id", node.get("node_id", ""))
-                upstream_ids = [
-                    e["source"] for e in edges
-                    if e.get("target") == n_id
-                ]
-                resolved_sid: str | None = None
-
-                if len(upstream_ids) >= 1:
-                    # Pick the primary upstream (last in the edges list).
-                    # For single-upstream this is the only one; for
-                    # multi-upstream the last edge is the primary.
-                    primary_upstream = upstream_ids[-1]
-                    candidate = sandbox_map.get(primary_upstream)
-
-                    # Check transfer_files on the connecting edge
-                    transfer_edge = next(
-                        (e for e in edges
-                         if e.get("target") == n_id and e.get("source") == primary_upstream),
-                        {},
-                    )
-                    transfer_files = transfer_edge.get("data", {}).get("transfer_files", True)
-
-                    if candidate and transfer_files is not False:
-                        if primary_upstream not in reused_upstream_ids:
-                            # Reuse the primary upstream's sandbox directly
-                            resolved_sid = candidate
-                            reused_upstream_ids.add(primary_upstream)
-                        else:
-                            # Another parallel node already claimed it --
-                            # clone the sandbox so this node gets a COPY
-                            # instead of an empty one.
-                            layer_clone_requests[n_id] = candidate
-                # else: 0 upstreams -> resolved_sid stays None (new sandbox)
-
-                layer_sandbox_assignments[n_id] = resolved_sid
-
-            # Execute all nodes in this layer concurrently
-            tasks = []
-            for node in nodes:
-                n_id = node.get("id", node.get("node_id", ""))
-                assigned_sid = layer_sandbox_assignments.get(n_id)
-                agent_type = self._node_agent_type(node)
-                upstream_ids = self._upstream_ids_for_node(n_id, edges)
-                task_id = (global_config.get("_task_db_map") or {}).get(n_id)
-                if task_id:
-                    await self._update_task_status_db(
-                        task_id, "running", progress=5,
-                    )
-                    await self._emit(
-                        "task_updated", run_id, "",
-                        task_id=task_id,
-                        status="running",
-                        progress=5,
-                        assigned_node_id=n_id,
-                    )
-
-                # If this node needs a clone, do it now (before launching)
-                if assigned_sid is None and n_id in layer_clone_requests:
-                    source_sid = layer_clone_requests[n_id]
-                    try:
-                        assigned_sid = await self._sandbox.clone(
-                            source_sid,
-                            f"ws-{n_id}-{uuid4().hex[:8]}",
-                        )
-                        logger.info(
-                            "Cloned sandbox %s -> %s for parallel node %s",
-                            source_sid[:12], assigned_sid[:12], n_id,
-                        )
-                    except Exception:
-                        logger.warning(
-                            "Failed to clone sandbox %s for node %s, "
-                            "will create a new empty sandbox",
-                            source_sid[:12], n_id, exc_info=True,
-                        )
-                        assigned_sid = None
-
-                merge_context = ""
-                if agent_type == "merge":
-                    prepared_sid, prepared_context = await self._prepare_merge_sandbox(
-                        run_id=run_id,
-                        node_id=n_id,
-                        workspace_directory=workspace_directory,
-                        upstream_ids=upstream_ids,
-                        sandbox_map=sandbox_map,
-                        commit_map=commit_map,
-                        layer_results=layer_results,
-                    )
-                    if prepared_sid:
-                        assigned_sid = prepared_sid
-                    merge_context = prepared_context
-
-                tasks.append(
-                    self._execute_node(
-                        run_id, node, layer_results, global_config, cancel_event,
-                        workspace_directory=workspace_directory,
-                        sandbox_id=assigned_sid,
-                        upstream_context=self._build_upstream_context(
-                            n_id, edges, layer_results,
-                        ) + merge_context,
-                        destroy_owned_sandbox=False,
-                    )
-                )
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for node, result in zip(nodes, results):
-                node_id = node.get("id", node.get("node_id", ""))
-                if isinstance(result, Exception):
-                    import traceback
-                    tb = "".join(traceback.format_exception(type(result), result, result.__traceback__)) if result.__traceback__ else str(result)
-                    logger.error(
-                        "Layers run=%s node %s failed: %s\n%s",
-                        run_id, node_id, result, tb,
-                    )
-                    layer_results[node_id] = {
-                        "state": "failed",
-                        "error": str(result),
-                    }
-                else:
-                    layer_results[node_id] = result
-                    # Track sandbox for downstream reuse
-                    _sid = result.get("sandbox_id")
-                    if _sid:
-                        sandbox_map[node_id] = _sid
-                        retained_sandboxes.add(_sid)
-
-                        # Persist to run state for API access
-                        run_state = self._runs.get(run_id, {})
-                        if not run_state.get("_sandbox_map"):
-                            run_state["_sandbox_map"] = {}
-                        run_state["_sandbox_map"][node_id] = _sid
-
-                        # Post-node git checkpoint + commit_map tracking
-                        try:
-                            commit_hash = await self._checkpoint.auto_commit(
-                                _sid, message=f"after [{node_id}]"
-                            )
-                            if commit_hash:
-                                commit_map[node_id] = commit_hash
-
-                                # Persist to run state for API access
-                                run_state = self._runs.get(run_id, {})
-                                if not run_state.get("_commit_map"):
-                                    run_state["_commit_map"] = {}
-                                run_state["_commit_map"][node_id] = commit_hash
-                                await self._write_node_git_artifacts(
-                                    run_id=run_id,
-                                    node_id=node_id,
-                                    workspace_directory=workspace_directory,
-                                    sandbox_id=_sid,
-                                    commit_hash=commit_hash,
-                                )
-                        except Exception:
-                            pass
-
-                    # Plan node: parse output and execute dynamic children
-                    _node_data = node.get("data", {})
-                    _atype = (
-                        node.get("agent_type")
-                        or node.get("type")
-                        or (_node_data.get("agentType") if isinstance(_node_data, dict) else None)
-                    )
-                    logger.info(
-                        "Layers run=%s node %s: agent_type=%s, state=%s, has_raw_output=%s",
-                        run_id, node_id, _atype, result.get("state"),
-                        bool(result.get("raw_output")),
-                    )
-                    allow_dynamic_plan = (
-                        node_id == "planner"
-                        or bool(global_config.get("_allow_dynamic_plan"))
-                        or (
-                            isinstance(_node_data, dict)
-                            and bool(_node_data.get("allowDynamicPlan") or _node_data.get("allow_dynamic_plan"))
-                        )
-                    )
-                    if (
-                        _atype == "plan"
-                        and result.get("state") == "completed"
-                        and not global_config.get("_disable_dynamic_plan")
-                        and allow_dynamic_plan
-                    ):
-                        plan_results = await self._execute_dynamic_plan(
-                            run_id, node_id, result, global_config, cancel_event,
-                            planner_node=node,
-                            workspace_directory=workspace_directory,
-                        )
-                        layer_results.update(plan_results)
-
-        for sandbox_id in retained_sandboxes:
-            try:
-                await self._sandbox.destroy(sandbox_id)
-            except Exception:
-                logger.debug("Failed to destroy retained sandbox %s", sandbox_id, exc_info=True)
-
-        return layer_results
-
-    async def _execute_task_layers(
-        self,
-        run_id: str,
-        layers: list,
-        edges: list[dict],
-        global_config: dict,
-        cancel_event: asyncio.Event,
-        task_db_map: dict[str, str],
-        task_type_map: dict[str, str],
-        task_label_map: dict[str, str],
-        workspace_directory: str | None = None,
-        planner_node: dict | None = None,
-        parent_node_id: str = "planner",
-        completed_results: dict[str, dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        """Execute DAG layers through the task-aware runner.
-
-        This path preserves DAG parallelism while routing every worker through
-        TaskScheduler so progress markers, planner escalation, worker
-        collaboration, task DB updates, and artifacts behave consistently.
-        """
-        layer_results: dict[str, Any] = dict(completed_results or {})
-        dag_layers: list[list[str]] = []
-        for layer in layers:
-            if isinstance(layer, dict):
-                nodes = layer.get("nodes", []) or [layer]
-            else:
-                nodes = layer
-            dag_layers.append([str(node.get("id", node.get("node_id", ""))) for node in nodes])
-
-        global_config["_edges"] = edges
-        global_config["_task_db_map"] = task_db_map
-        global_config["_dag_layers"] = dag_layers
-
-        fallback_planner = planner_node or {
-            "id": "planner",
-            "agent_type": "plan",
-            "model_provider": "",
-            "model_id": "",
-            "prompt": "Answer worker escalation questions concisely using the run context.",
-        }
-        workflow_id = await self._get_run_workflow_id(run_id)
-        sandbox_map: dict[str, str] = {}
-        commit_map: dict[str, str] = {}
-        retained_sandboxes: set[str] = set()
-
-        for layer_idx, layer in enumerate(layers):
-            if cancel_event.is_set():
-                break
-            nodes = layer.get("nodes", []) if isinstance(layer, dict) else layer
-            if isinstance(layer, dict) and not nodes:
-                nodes = [layer]
             runnable_nodes = [
                 node for node in nodes
                 if str(node.get("id", node.get("node_id", ""))) not in layer_results
             ]
 
             logger.info(
-                "Task-aware layers run=%s layer %d: executing %d nodes (%d already completed)",
+                "Layers run=%s layer %d: executing %d nodes (%d already completed)",
                 run_id, layer_idx, len(runnable_nodes), len(nodes) - len(runnable_nodes),
             )
             if not runnable_nodes:
                 continue
 
+            # Dependency failure check
             runnable_after_dependency_check: list[dict] = []
             for node in runnable_nodes:
                 node_id = str(node.get("id", node.get("node_id", "")))
                 upstream_ids = self._upstream_ids_for_node(node_id, edges)
-                # P4: only block on direct upstream failures, not transitive
                 bad_upstreams = [
                     upstream_id for upstream_id in upstream_ids
                     if isinstance(layer_results.get(upstream_id), dict)
-                    and layer_results[upstream_id].get("state") in {"failed", "blocked"}
+                    and layer_results[upstream_id].get("state") == "failed"
                 ]
                 if not bad_upstreams:
                     runnable_after_dependency_check.append(node)
                     continue
                 message = (
-                    "Blocked because upstream node(s) did not complete: "
+                    "Failed because upstream node(s) did not complete: "
                     + ", ".join(bad_upstreams)
                 )
                 result = {
-                    "state": "blocked",
+                    "state": "failed",
                     "node_id": node_id,
                     "error": message,
                     "result_summary": message,
                 }
                 layer_results[node_id] = result
-                task_id = task_db_map.get(node_id)
-                if task_id:
-                    await self._update_task_status_db(
-                        task_id,
-                        "blocked",
-                        progress=0,
-                        result_summary=message,
-                    )
-                    await self._emit(
-                        "task_updated", run_id, "",
-                        task_id=task_id,
-                        status="blocked",
-                        progress=0,
-                        result_summary=message,
-                    )
+                if has_tasks:
+                    task_id = task_db_map.get(node_id)
+                    if task_id:
+                        await self._update_task_status_db(
+                            task_id, "failed", progress=0, result_summary=message,
+                        )
+                        await self._emit(
+                            "task_updated", run_id, "",
+                            task_id=task_id, status="failed", progress=0,
+                            result_summary=message,
+                        )
                 await self._emit("node_failed", run_id, node_id, content=message)
                 await self._emit(
                     "child_completed", run_id, parent_node_id,
-                    child_node_id=node_id,
-                    content="state=blocked",
+                    child_node_id=node_id, content="state=failed",
                 )
             runnable_nodes = runnable_after_dependency_check
             if not runnable_nodes:
                 continue
 
+            # Sandbox reuse strategy
             layer_sandbox_assignments: dict[str, str | None] = {}
             layer_clone_requests: dict[str, str] = {}
             reused_upstream_ids: set[str] = set()
@@ -1514,10 +1319,11 @@ class LocalDAGExecutor:
             async def _run_one(node: dict) -> tuple[str, dict]:
                 node_id = str(node.get("id", node.get("node_id", "")))
                 agent_type = self._node_agent_type(node)
+                default_retries = 2 if agent_type == "coder" else 1
                 max_retries = int(
                     (node.get("data", {}).get("retry_count") if isinstance(node.get("data"), dict) else None)
                     or node.get("retry_count")
-                    or 1
+                    or default_retries
                 )
 
                 for attempt in range(max_retries + 1):
@@ -1533,7 +1339,7 @@ class LocalDAGExecutor:
                                 f"ws-{node_id}-{uuid4().hex[:8]}",
                             )
                         except Exception:
-                            logger.warning("Failed to clone sandbox %s for task-layer node %s", source_sid[:12], node_id, exc_info=True)
+                            logger.warning("Failed to clone sandbox %s for layer node %s", source_sid[:12], node_id, exc_info=True)
                             assigned_sid = None
 
                     merge_context = ""
@@ -1551,21 +1357,10 @@ class LocalDAGExecutor:
                             assigned_sid = prepared_sid
                         merge_context = prepared_context
 
-                    task_id = task_db_map.get(node_id)
-                    if not task_id:
-                        result = await self._execute_node(
-                            run_id, node, layer_results, global_config, cancel_event,
-                            workspace_directory=workspace_directory,
-                            sandbox_id=assigned_sid,
-                            upstream_context=self._build_upstream_context(
-                                node_id, edges, layer_results,
-                            ) + merge_context,
-                            destroy_owned_sandbox=False,
-                        )
-                    else:
+                    if has_tasks and node_id in task_db_map:
                         from app.core.task_scheduler import ManagedTask
                         managed = ManagedTask(
-                            db_id=task_id,
+                            db_id=task_db_map[node_id],
                             run_id=run_id,
                             title=task_label_map.get(node_id, node_id),
                             description=node.get("prompt", ""),
@@ -1579,17 +1374,26 @@ class LocalDAGExecutor:
                             global_config=global_config,
                             cancel_event=cancel_event,
                             db_session=True,
-                            planner_node=fallback_planner,
                             layer_results=layer_results,
                             workspace_directory=workspace_directory,
-                            upstream_context=self._build_upstream_context(
+                            upstream_context=await self._build_upstream_context(
                                 node_id, edges, layer_results,
                             ) + merge_context,
                             sandbox_id=assigned_sid,
                             destroy_owned_sandbox=False,
                         )
+                    else:
+                        result = await self._execute_node(
+                            run_id, node, layer_results, global_config, cancel_event,
+                            workspace_directory=workspace_directory,
+                            sandbox_id=assigned_sid,
+                            upstream_context=await self._build_upstream_context(
+                                node_id, edges, layer_results,
+                            ) + merge_context,
+                            destroy_owned_sandbox=False,
+                        )
 
-                    # P3: retry on failure
+                    # Retry on failure — inject error context into the node prompt
                     if result.get("state") == "failed" and attempt < max_retries:
                         logger.info(
                             "Node %s attempt %d/%d failed, retrying: %s",
@@ -1600,15 +1404,41 @@ class LocalDAGExecutor:
                             "status", run_id, node_id,
                             content=f"retrying (attempt {attempt + 2}/{max_retries + 1})",
                         )
-                        # Reset sandbox assignment for retry (fresh sandbox)
+                        # Build failure context for the retry prompt
+                        retry_error = result.get("error", "") or ""
+                        retry_llm = ""
+                        raw_out = result.get("raw_output", "")
+                        if raw_out:
+                            retry_llm = self._extract_llm_text(raw_out)[-1500:]
+                        failure_ctx = (
+                            f"\n\n## 上次执行失败（第 {attempt + 1} 次尝试）\n"
+                            f"错误信息：{retry_error[:500]}\n"
+                        )
+                        if retry_llm:
+                            failure_ctx += f"上次输出摘要：\n```\n{retry_llm}\n```\n"
+                        failure_ctx += "请分析失败原因，修正你的实现，避免重复同样的错误。\n"
+                        # Shallow-copy node to avoid mutating the layer list
+                        node = dict(node)
+                        node_data = node.get("data")
+                        if isinstance(node_data, dict):
+                            node["data"] = {**node_data, "prompt": node_data.get("prompt", "") + failure_ctx}
+                        else:
+                            node["prompt"] = node.get("prompt", "") + failure_ctx
+                        # Persist retry info to task DB
+                        if has_tasks and node_id in task_db_map:
+                            await self._update_task_retry_db(
+                                task_id=task_db_map[node_id],
+                                retry_count=attempt + 1,
+                                last_error=retry_error[:2000],
+                            )
                         layer_sandbox_assignments[node_id] = None
                         continue
 
-                    if result.get("state") == "completed" and task_id:
+                    if has_tasks and result.get("state") == "completed" and node_id in task_db_map:
                         await self._create_artifact_for_task(
                             run_id=run_id,
                             workflow_id=workflow_id,
-                            task_id=task_id,
+                            task_id=task_db_map[node_id],
                             node_id=node_id,
                             agent_type=task_type_map.get(node_id, "coder"),
                             title=task_label_map.get(node_id, node_id),
@@ -1630,7 +1460,7 @@ class LocalDAGExecutor:
             for node, item in zip(runnable_nodes, results):
                 node_id = str(node.get("id", node.get("node_id", "")))
                 if isinstance(item, Exception):
-                    logger.warning("Task-aware layer execution failed for %s: %s", node_id, item, exc_info=True)
+                    logger.warning("Layer execution failed for %s: %s", node_id, item, exc_info=True)
                     result = {
                         "state": "failed",
                         "node_id": node_id,
@@ -1642,8 +1472,7 @@ class LocalDAGExecutor:
                     await self._emit("status", run_id, node_id, content="failed")
                     await self._emit(
                         "child_completed", run_id, parent_node_id,
-                        child_node_id=node_id,
-                        content="state=failed",
+                        child_node_id=node_id, content="state=failed",
                     )
                     continue
                 node_id, result = item
@@ -1671,30 +1500,61 @@ class LocalDAGExecutor:
                                 commit_hash=commit_hash,
                             )
                     except Exception:
-                        logger.debug("Failed to auto-commit task-layer sandbox for %s", node_id, exc_info=True)
+                        logger.debug("Failed to auto-commit layer sandbox for %s", node_id, exc_info=True)
 
-        total = len(task_db_map)
-        completed_count = sum(
-            1 for result in layer_results.values()
-            if isinstance(result, dict) and result.get("state") == "completed"
-        )
-        failed_count = sum(
-            1 for result in layer_results.values()
-            if isinstance(result, dict) and result.get("state") != "completed"
-        )
-        if total:
-            await self._emit(
-                "progress_summary", run_id, "",
-                total=total,
-                completed=completed_count,
-                failed=failed_count,
+                # Plan node: parse output and execute dynamic children
+                _node_data = node.get("data", {})
+                _atype = (
+                    node.get("agent_type")
+                    or node.get("type")
+                    or (_node_data.get("agentType") if isinstance(_node_data, dict) else None)
+                )
+                logger.info(
+                    "Layers run=%s node %s: agent_type=%s, state=%s, has_raw_output=%s",
+                    run_id, node_id, _atype, result.get("state"),
+                    bool(result.get("raw_output")),
+                )
+                allow_dynamic_plan = (
+                    node_id == "planner"
+                    or bool(global_config.get("_allow_dynamic_plan"))
+                    or (
+                        isinstance(_node_data, dict)
+                        and bool(_node_data.get("allowDynamicPlan") or _node_data.get("allow_dynamic_plan"))
+                    )
+                )
+                if (
+                    _atype == "plan"
+                    and result.get("state") == "completed"
+                    and not global_config.get("_disable_dynamic_plan")
+                    and allow_dynamic_plan
+                ):
+                    plan_results = await self._execute_dynamic_plan(
+                        run_id, node_id, result, global_config, cancel_event,
+                        workspace_directory=workspace_directory,
+                    )
+                    layer_results.update(plan_results)
+
+        if has_tasks:
+            total = len(task_db_map)
+            completed_count = sum(
+                1 for result in layer_results.values()
+                if isinstance(result, dict) and result.get("state") == "completed"
             )
+            failed_count = sum(
+                1 for result in layer_results.values()
+                if isinstance(result, dict) and result.get("state") != "completed"
+            )
+            if total:
+                await self._emit(
+                    "progress_summary", run_id, "",
+                    total=total, completed=completed_count, failed=failed_count,
+                )
 
         for sandbox_id in retained_sandboxes:
             try:
                 await self._sandbox.destroy(sandbox_id)
             except Exception:
-                logger.debug("Failed to destroy retained task-layer sandbox %s", sandbox_id, exc_info=True)
+                logger.debug("Failed to destroy retained sandbox %s", sandbox_id, exc_info=True)
 
         return layer_results
 
@@ -1705,10 +1565,11 @@ class LocalDAGExecutor:
     async def _update_run_status_db(self, run_id: str, status: str) -> None:
         """Update run status in the database."""
         try:
+            from uuid import UUID as _UUID
+
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel
             from app.models.db import Workflow as WorkflowModel
-            from uuid import UUID as _UUID
             async with async_session_factory() as session:
                 from sqlalchemy import select
                 result = await session.execute(
@@ -1731,7 +1592,7 @@ class LocalDAGExecutor:
                         elif status in ("completed", "failed", "cancelled"):
                             workflow_row.lifecycle_phase = "review"
                         elif status == "paused":
-                            workflow_row.lifecycle_phase = "blocked"
+                            workflow_row.lifecycle_phase = "review"
                             blockers = workflow_row.blockers_json or []
                             if not blockers:
                                 workflow_row.blockers_json = [{
@@ -1763,32 +1624,65 @@ class LocalDAGExecutor:
         result_summary: str = "",
     ) -> None:
         """Update task-board row status for a running DAG node."""
-        try:
-            from app.core.database import async_session_factory
-            from app.models.task import Task as TaskModel
-            from sqlalchemy import select
-            from uuid import UUID as _UUID
+        async with _get_db_semaphore():
+            try:
+                from uuid import UUID as _UUID
 
-            async with async_session_factory() as session:
-                result = await session.execute(
-                    select(TaskModel).where(TaskModel.id == _UUID(task_id))
-                )
-                task_row = result.scalar_one_or_none()
-                if task_row is not None:
-                    task_row.status = status
-                    task_row.progress = progress
-                    if result_summary:
-                        task_row.result_summary = result_summary
-                    await session.commit()
-        except Exception:
-            logger.warning("Failed to update task status for %s", task_id, exc_info=True)
+                from sqlalchemy import select
+
+                from app.core.database import async_session_factory
+                from app.models.task import Task as TaskModel
+
+                async with async_session_factory() as session:
+                    result = await session.execute(
+                        select(TaskModel).where(TaskModel.id == _UUID(task_id))
+                    )
+                    task_row = result.scalar_one_or_none()
+                    if task_row is not None:
+                        task_row.status = status
+                        task_row.progress = progress
+                        if result_summary:
+                            task_row.result_summary = result_summary
+                        await session.commit()
+            except Exception:
+                logger.warning("Failed to update task status for %s", task_id, exc_info=True)
+
+    async def _update_task_retry_db(
+        self,
+        task_id: str,
+        retry_count: int,
+        last_error: str,
+    ) -> None:
+        """Persist retry count and last error message for a task."""
+        async with _get_db_semaphore():
+            try:
+                from uuid import UUID as _UUID
+
+                from sqlalchemy import select
+
+                from app.core.database import async_session_factory
+                from app.models.task import Task as TaskModel
+
+                async with async_session_factory() as session:
+                    result = await session.execute(
+                        select(TaskModel).where(TaskModel.id == _UUID(task_id))
+                    )
+                    task_row = result.scalar_one_or_none()
+                    if task_row is not None:
+                        task_row.retry_count = retry_count
+                        task_row.last_error = last_error[:2000]
+                        await session.commit()
+            except Exception:
+                logger.warning("Failed to update task retry info for %s", task_id, exc_info=True)
 
     async def _get_run_workflow_id(self, run_id: str) -> str | None:
         try:
+            from uuid import UUID as _UUID
+
+            from sqlalchemy import select
+
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel
-            from sqlalchemy import select
-            from uuid import UUID as _UUID
 
             async with async_session_factory() as session:
                 result = await session.execute(
@@ -1830,9 +1724,12 @@ class LocalDAGExecutor:
             return None
 
         try:
+            from uuid import UUID as _UUID
+            from uuid import uuid4
+
             from app.core.database import async_session_factory
-            from app.models.task import Artifact as ArtifactModel, TaskMessage as TaskMessageModel
-            from uuid import UUID as _UUID, uuid4
+            from app.models.task import Artifact as ArtifactModel
+            from app.models.task import TaskMessage as TaskMessageModel
 
             raw = result.get("raw_output", "") if isinstance(result, dict) else ""
             summary = self._task_scheduler._summarize(raw, max_len=1200) if raw else ""
@@ -1917,9 +1814,10 @@ class LocalDAGExecutor:
         try:
             await self._emit("run_started", run_id, "")
 
+            from uuid import uuid4
+
             from app.core.database import async_session_factory
             from app.models.task import Task as TaskModel
-            from uuid import uuid4
 
             task_db_map: dict[str, str] = {}
             task_type_map: dict[str, str] = {}
@@ -1945,40 +1843,24 @@ class LocalDAGExecutor:
                     if not node_id:
                         continue
 
-                    data = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
-                    agent_type = (
-                        node.get("agent_type")
-                        or data.get("agent_type")
-                        or data.get("agentType")
-                        or node.get("type")
-                        or "coder"
+                    normalized, agent_type, model_provider, model_id = _normalize_node_config(
+                        node, auto_child_model_map, node_id,
                     )
-                    if agent_type == "plan" and node_id != "planner":
-                        agent_type = "design"
-                    label = data.get("label") or node.get("label") or node_id
-                    prompt = node.get("prompt") or data.get("prompt") or ""
-                    model_provider = (
-                        node.get("model_provider")
-                        or data.get("model_provider")
-                        or data.get("modelProvider")
+                    label = (
+                        node.get("data", {}).get("label")
+                        or node.get("label")
+                        or node_id
+                    )
+                    prompt = (
+                        node.get("prompt")
+                        or (node.get("data", {}).get("prompt")
+                            if isinstance(node.get("data"), dict)
+                            else "")
                         or ""
                     )
-                    model_id = (
-                        node.get("model_id")
-                        or data.get("model_id")
-                        or data.get("modelId")
-                        or ""
-                    )
-                    if not model_provider or not model_id:
-                        fallback_provider, fallback_model_id = _resolve_auto_child_model(
-                            auto_child_model_map, str(agent_type)
-                        )
-                        if not model_provider:
-                            model_provider = fallback_provider
-                        if not model_id:
-                            model_id = fallback_model_id
 
                     task_id = uuid4()
+                    deps = deps_by_node.get(node_id, [])
                     db_task = TaskModel(
                         id=task_id,
                         run_id=uuid.UUID(run_id),
@@ -1987,27 +1869,14 @@ class LocalDAGExecutor:
                         status="pending",
                         assigned_node_id=node_id,
                         assigned_worker_label=str(label),
-                        dependencies=json.dumps(deps_by_node.get(node_id, [])) if deps_by_node.get(node_id) else None,
+                        dependencies=json.dumps(deps) if deps else None,
                     )
                     session.add(db_task)
                     task_db_map[node_id] = str(task_id)
                     task_type_map[node_id] = agent_type
                     task_label_map[node_id] = str(label)
 
-                    normalized_nodes.append({
-                        "id": node_id,
-                        "agent_type": agent_type,
-                        "model_provider": model_provider,
-                        "model_id": model_id,
-                        "prompt": (
-                            prompt
-                            + f"\n\n---\nTask ID: {node_id}\n"
-                            + f"When you need help or are stuck, output a line:\n"
-                            + f"{ESCALATION_MARKER} <your question>\n"
-                            + f"To report progress, output a line:\n"
-                            + f"{PROGRESS_MARKER} <0-100>\n"
-                        ),
-                    })
+                    normalized_nodes.append(normalized)
 
                     await self._emit(
                         "task_created", run_id, "planner",
@@ -2040,17 +1909,16 @@ class LocalDAGExecutor:
             global_config["_task_db_map"] = task_db_map
             global_config["_disable_dynamic_plan"] = True
 
-            child_results = await self._execute_task_layers(
+            child_results = await self._execute_layers(
                 run_id=run_id,
                 layers=layers,
                 edges=sub_dag["edges"],
                 global_config=global_config,
                 cancel_event=cancel_event,
+                workspace_directory=workspace_directory,
                 task_db_map=task_db_map,
                 task_type_map=task_type_map,
                 task_label_map=task_label_map,
-                workspace_directory=workspace_directory,
-                planner_node=None,
                 parent_node_id="planner",
             )
 
@@ -2081,7 +1949,7 @@ class LocalDAGExecutor:
                 )
 
             has_failed = any(
-                isinstance(result, dict) and result.get("state") in {"failed", "blocked"}
+                isinstance(result, dict) and result.get("state") == "failed"
                 for result in child_results.values()
             )
             status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
@@ -2117,17 +1985,19 @@ class LocalDAGExecutor:
         """Resume an existing auto DAG from persisted task rows.
 
         Completed tasks are treated as immutable upstream context. Pending,
-        stale running, and blocked tasks are re-enqueued. This avoids restarting
+        stale running tasks are re-enqueued. This avoids restarting
         the entire workflow after a backend crash.
         """
         logger.info("Task DAG recovery STARTED for run %s", run_id)
         try:
             await self._emit("status", run_id, "", content="running")
 
+            from uuid import uuid4
+
+            from sqlalchemy import select
+
             from app.core.database import async_session_factory
             from app.models.task import Task as TaskModel
-            from sqlalchemy import select
-            from uuid import uuid4
 
             edges = dag_json.get("edges", [])
             deps_by_node: dict[str, list[str]] = {}
@@ -2163,41 +2033,27 @@ class LocalDAGExecutor:
                     if not node_id:
                         continue
 
-                    data = node.get("data", {}) if isinstance(node.get("data"), dict) else {}
-                    agent_type = (
-                        node.get("agent_type")
-                        or data.get("agent_type")
-                        or data.get("agentType")
-                        or node.get("type")
-                        or "coder"
+                    normalized, agent_type, model_provider, model_id = _normalize_node_config(
+                        node, auto_child_model_map, node_id,
                     )
-                    if agent_type == "plan" and node_id != "planner":
-                        agent_type = "design"
-                    label = str(data.get("label") or node.get("label") or node_id)
-                    prompt = node.get("prompt") or data.get("prompt") or ""
-                    model_provider = (
-                        node.get("model_provider")
-                        or data.get("model_provider")
-                        or data.get("modelProvider")
+                    data = node.get("data", {})
+                    label = str(
+                        data.get("label")
+                        if isinstance(data, dict)
+                        else node.get("label")
+                        or node_id
+                    )
+                    prompt = (
+                        node.get("prompt")
+                        or (data.get("prompt")
+                            if isinstance(data, dict)
+                            else "")
                         or ""
                     )
-                    model_id = (
-                        node.get("model_id")
-                        or data.get("model_id")
-                        or data.get("modelId")
-                        or ""
-                    )
-                    if not model_provider or not model_id:
-                        fallback_provider, fallback_model_id = _resolve_auto_child_model(
-                            auto_child_model_map, str(agent_type)
-                        )
-                        if not model_provider:
-                            model_provider = fallback_provider
-                        if not model_id:
-                            model_id = fallback_model_id
 
                     task = tasks_by_node.get(node_id)
                     if task is None:
+                        deps = deps_by_node.get(node_id, [])
                         task = TaskModel(
                             id=uuid4(),
                             run_id=uuid.UUID(run_id),
@@ -2206,7 +2062,7 @@ class LocalDAGExecutor:
                             status="pending",
                             assigned_node_id=node_id,
                             assigned_worker_label=label,
-                            dependencies=json.dumps(deps_by_node.get(node_id, [])) if deps_by_node.get(node_id) else None,
+                            dependencies=json.dumps(deps) if deps else None,
                         )
                         session.add(task)
                         await self._emit(
@@ -2218,7 +2074,7 @@ class LocalDAGExecutor:
                             child_node_id=node_id,
                             dependencies=task.dependencies or "",
                         )
-                    elif task.status in ("running", "blocked"):
+                    elif task.status == "running":
                         task.status = "pending"
 
                     task_db_map[node_id] = str(task.id)
@@ -2233,20 +2089,7 @@ class LocalDAGExecutor:
                             "recovered": True,
                         }
 
-                    normalized_nodes.append({
-                        "id": node_id,
-                        "agent_type": agent_type,
-                        "model_provider": model_provider,
-                        "model_id": model_id,
-                        "prompt": (
-                            prompt
-                            + f"\n\n---\nTask ID: {node_id}\n"
-                            + f"When you need help or are stuck, output a line:\n"
-                            + f"{ESCALATION_MARKER} <your question>\n"
-                            + f"To report progress, output a line:\n"
-                            + f"{PROGRESS_MARKER} <0-100>\n"
-                        ),
-                    })
+                    normalized_nodes.append(normalized)
 
                 await session.commit()
 
@@ -2257,17 +2100,16 @@ class LocalDAGExecutor:
             global_config["_disable_dynamic_plan"] = True
             global_config["_recovered"] = True
 
-            child_results = await self._execute_task_layers(
+            child_results = await self._execute_layers(
                 run_id=run_id,
                 layers=layers,
                 edges=edges,
                 global_config=global_config,
                 cancel_event=cancel_event,
+                workspace_directory=workspace_directory,
                 task_db_map=task_db_map,
                 task_type_map=task_type_map,
                 task_label_map=task_label_map,
-                workspace_directory=workspace_directory,
-                planner_node=None,
                 parent_node_id="planner",
                 completed_results=completed_results,
             )
@@ -2300,7 +2142,7 @@ class LocalDAGExecutor:
                 )
 
             has_failed = any(
-                isinstance(result, dict) and result.get("state") in {"failed", "blocked"}
+                isinstance(result, dict) and result.get("state") == "failed"
                 for result in child_results.values()
             )
             status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
@@ -2321,64 +2163,6 @@ class LocalDAGExecutor:
 
         except Exception as exc:
             logger.exception("Task DAG recovery failed for run %s", run_id)
-            self._runs[run_id]["status"] = "failed"
-            await self._emit("run_failed", run_id, "", content=str(exc))
-            await self._update_run_status_db(run_id, "failed")
-
-    async def _execute_dag(
-        self,
-        run_id: str,
-        layers: list[dict],
-        global_config: dict,
-        cancel_event: asyncio.Event,
-        workspace_directory: str | None = None,
-    ) -> None:
-        """Top-level DAG execution loop.  Delegates to _execute_layers for
-        actual node execution and manages run lifecycle state."""
-        logger.info("DAG execution STARTED for run %s, %d layers", run_id, len(layers))
-        try:
-            await self._emit("run_started", run_id, "")
-            edges = global_config.get("_edges", [])
-
-            layer_results = await self._execute_layers(
-                run_id, layers, edges, global_config, cancel_event,
-                workspace_directory=workspace_directory,
-            )
-
-            # Persist commit_map and sandbox_map into _runs for API access
-            run_state = self._runs.get(run_id, {})
-            run_state["_commit_map"] = run_state.get("_commit_map", {})
-            run_state["_sandbox_map"] = run_state.get("_sandbox_map", {})
-            # Store initial commit hash (first checkpoint of the run)
-            if "_initial" not in run_state.get("_commit_map", {}):
-                commit_map = run_state.get("_commit_map", {})
-                # The first entry by time is the initial commit
-                if commit_map:
-                    first_key = next(iter(commit_map))
-                    run_state["_commit_map"]["_initial"] = commit_map[first_key]
-
-            has_failed = any(
-                isinstance(result, dict) and result.get("state") == "failed"
-                for result in layer_results.values()
-            )
-            status = "cancelled" if cancel_event.is_set() else ("failed" if has_failed else "completed")
-            self._runs[run_id]["status"] = status
-            if status == "completed":
-                await self._create_artifact_for_task(
-                    run_id=run_id,
-                    workflow_id=await self._get_run_workflow_id(run_id),
-                    task_id=None,
-                    node_id="planner",
-                    agent_type="plan",
-                    title="Final output",
-                    result={"state": status, "raw_output": f"Run completed with {len(layer_results)} node results."},
-                )
-            event_type = "run_completed" if status == "completed" else "run_failed"
-            await self._emit(event_type, run_id, "", content=f"status={status}")
-            await self._update_run_status_db(run_id, status)
-
-        except Exception as exc:
-            logger.exception("DAG execution failed for run %s", run_id)
             self._runs[run_id]["status"] = "failed"
             await self._emit("run_failed", run_id, "", content=str(exc))
             await self._update_run_status_db(run_id, "failed")
@@ -2427,6 +2211,12 @@ class LocalDAGExecutor:
             logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
         else:
             logger.info("Reusing sandbox %s for node %s", sandbox_id[:12], node_id)
+            # Clear stale stream.jsonl from previous node to prevent
+            # _stream_log_lines from picking up ghost terminal events.
+            await self._sandbox.exec(
+                sandbox_id,
+                "mkdir -p /workspace/.agent && : > /workspace/.agent/stream.jsonl",
+            )
 
         await self._prepare_node_output_workspace(
             run_id, node_id, workspace_directory, sandbox_id,
@@ -2476,6 +2266,15 @@ class LocalDAGExecutor:
                 model_provider = str(default_model_cfg.get("provider", ""))
             if not model_id:
                 model_id = str(default_model_cfg.get("model", ""))
+
+            if not model_provider or not model_id:
+                return {
+                    "state": "failed",
+                    "error": "No model configured. Please configure a model in settings.",
+                    "node_id": node_id,
+                    "sandbox_id": sandbox_id,
+                }
+
             model_cfg = _load_model_config(model_provider, model_id)
             prompt: str = (
                 node.get("prompt")
@@ -2496,7 +2295,7 @@ class LocalDAGExecutor:
 
                 # Register an asyncio.Event that the approve/reject API will set
                 approval_event = asyncio.Event()
-                from app.api.runs import set_approval_event, _approval_results, clear_approval
+                from app.api.runs import _approval_results, clear_approval, set_approval_event
                 set_approval_event(run_id, approval_event)
 
                 # Wait for approval (with periodic cancel_event checks)
@@ -2545,19 +2344,14 @@ class LocalDAGExecutor:
                     "sandbox_id": sandbox_id,
                 }
 
-            # Inject escalation protocol for non-plan, non-human nodes
-            if agent_type != "plan" and agent_type != "human":
-                escalation_hint = (
-                    f"\n\n---\nNode ID: {node_id}\n"
-                    f"If you need help or are stuck, include this exact line in your output:\n"
-                    f"ESCALATE: <your question or request>\n"
-                    "This will be sent to your upstream node for guidance.\n"
-                )
-                prompt = prompt + escalation_hint
-
             # Append upstream context when provided (dual-mode data passing)
             if upstream_context:
                 prompt = prompt + upstream_context
+
+            # Inject rich context from planner-specified fields
+            rich_context = await self._build_rich_node_context(node, sandbox_id, workspace_directory)
+            if rich_context:
+                prompt = prompt + rich_context
 
             # Resolve provider URL + API key from models.json
             from app.api.models import load_provider_config
@@ -2636,8 +2430,18 @@ class LocalDAGExecutor:
                     sse_port, run_id, node_id, exec_id,
                     cancel_event, idle_timeout_seconds,
                 )
+                # SSE failed → switch to real-time file polling so the
+                # frontend still sees progress instead of a blank screen.
+                if forced_failure_reason:
+                    logger.info(
+                        "SSE failed for node %s, switching to file polling for real-time events",
+                        node_id,
+                    )
+                    forced_failure_reason = await self._poll_stream_file(
+                        sandbox_id, stream_file, run_id, node_id, exec_id,
+                        cancel_event, idle_timeout_seconds, _agent_type_for_timeout,
+                    )
             else:
-                # Fallback: file polling (legacy)
                 forced_failure_reason = await self._poll_stream_file(
                     sandbox_id, stream_file, run_id, node_id, exec_id,
                     cancel_event, idle_timeout_seconds, _agent_type_for_timeout,
@@ -2651,7 +2455,13 @@ class LocalDAGExecutor:
             proc_info = await self._sandbox.get_process(exec_id)
             exit_code = proc_info.exit_code if proc_info.exit_code is not None else -1
             logger.info("Node %s exit_code=%d", node_id, exit_code)
-            state = "failed" if forced_failure_reason else ("completed" if exit_code == 0 else "failed")
+            if forced_failure_reason and exit_code == 0:
+                logger.info(
+                    "Node %s had error but exit_code=0, treating as completed",
+                    node_id,
+                )
+                forced_failure_reason = ""
+            state = "failed" if (forced_failure_reason or exit_code != 0) else "completed"
 
             await self._emit(
                 "node_completed" if state == "completed" else "node_failed",
@@ -2684,8 +2494,9 @@ class LocalDAGExecutor:
                 try:
                     shim = self._sandbox._find_process(exec_id)
                     if shim and shim._proc.stderr:
-                        stderr_bytes = shim._proc.stderr.read()
-                        stderr_text = stderr_bytes.decode("utf-8", errors="replace")[:2000]
+                        stderr_text = await asyncio.to_thread(
+                            lambda: shim._proc.stderr.read().decode("utf-8", errors="replace")[:2000]
+                        )
                         if stderr_text.strip():
                             result["error"] = stderr_text.strip()
                             logger.error("Node %s stderr: %s", node_id, stderr_text[:500])
@@ -2765,10 +2576,16 @@ class LocalDAGExecutor:
         Returns the new file position after reading.
         """
         try:
-            log_content, _ = await self._sandbox.exec(
-                sandbox_id,
-                f"cat {stream_file} 2>/dev/null || true",
-            )
+            if start_pos == 0:
+                log_content, _ = await self._sandbox.exec(
+                    sandbox_id,
+                    f"cat {stream_file} 2>/dev/null || true",
+                )
+            else:
+                log_content, _ = await self._sandbox.exec(
+                    sandbox_id,
+                    f"tail -c +{start_pos + 1} {stream_file} 2>/dev/null || true",
+                )
         except Exception as exc:
             logger.warning("_stream_log_lines exec failed: %s", exc)
             return start_pos
@@ -2780,8 +2597,7 @@ class LocalDAGExecutor:
 
         logger.info("_stream_log_lines: read %d new bytes (pos %d→%d)", len(log_content) - start_pos, start_pos, len(log_content))
 
-        new_content = log_content[start_pos:]
-        for line in new_content.strip().split("\n"):
+        for line in log_content.strip().split("\n"):
             if not line.strip():
                 continue
             try:
@@ -2804,11 +2620,6 @@ class LocalDAGExecutor:
                     await self._emit(event_type, run_id, node_id, **extra)
                     content = ev.get("content", "")
                     if isinstance(content, str):
-                        if "ESCALATE_TO_PLANNER:" in content:
-                            await self._emit(
-                                "planner_guidance", run_id, node_id,
-                                content=content.split("ESCALATE_TO_PLANNER:", 1)[1].strip(),
-                            )
                         if "ASK_WORKER:" in content or "BROADCAST_TO_PEERS:" in content:
                             await self._emit(
                                 "worker_message", run_id, node_id,
@@ -2829,14 +2640,6 @@ class LocalDAGExecutor:
                     await self._emit(event_type, run_id, node_id, **extra)
             except json.JSONDecodeError:
                 # Non-JSON line (stdout pollution) -- treat as plain text
-                # Check for escalation markers in the streamed content
-                if "ESCALATE:" in line:
-                    escalation_msg = line.split("ESCALATE:", 1)[1].strip()
-                    await self._emit(
-                        "worker_escalation", run_id, node_id, content=escalation_msg,
-                    )
-                    # Route the escalation to the upstream node based on workflow edges.
-                    await self._route_escalation(run_id, node_id, escalation_msg)
                 await self._emit("shell_stdout", run_id, node_id, content=line)
 
         return len(log_content)
@@ -2932,16 +2735,47 @@ class LocalDAGExecutor:
         url = f"http://127.0.0.1:{port}/events"
         forced_failure_reason = ""
         last_activity = time.monotonic()
+        last_busy_time: float | None = None
         idle_warnings_sent: set[int] = set()
+        hard_timeout = idle_timeout_seconds * 2 if idle_timeout_seconds > 0 else 0
 
         async def _idle_monitor() -> str:
             """Concurrent task that enforces idle timeout."""
-            nonlocal last_activity, forced_failure_reason
+            nonlocal last_activity, last_busy_time, forced_failure_reason
             while True:
                 await asyncio.sleep(5)
                 if cancel_event.is_set():
                     break
-                idle_seconds = int(time.monotonic() - last_activity)
+                now = time.monotonic()
+                idle_seconds = int(now - last_activity)
+
+                # If we've seen busy recently, agent is working — only check hard timeout
+                if last_busy_time is not None and (now - last_busy_time) < idle_timeout_seconds:
+                    # Reset stale last_busy_time to prevent permanent bypass
+                    if last_busy_time is not None and (now - last_busy_time) > hard_timeout and hard_timeout > 0:
+                        last_busy_time = None
+                    continue
+
+                # Hard timeout: kill regardless of status
+                if hard_timeout > 0 and idle_seconds >= hard_timeout:
+                    forced_failure_reason = (
+                        f"node hard timeout after {idle_seconds}s "
+                        f"(exceeded {hard_timeout}s hard limit)"
+                    )
+                    logger.warning("Node %s SSE hard timeout: %s", node_id, forced_failure_reason)
+                    shim = self._sandbox._find_process(exec_id)
+                    if shim is not None:
+                        try:
+                            shim.terminate()
+                            await asyncio.wait_for(shim.wait(), timeout=2.0)
+                        except Exception:
+                            try:
+                                shim.kill()
+                            except Exception:
+                                pass
+                    return forced_failure_reason
+
+                # If no busy events AND no activity for full timeout, kill
                 if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
                     forced_failure_reason = (
                         f"node idle timeout after {idle_seconds}s "
@@ -2959,6 +2793,7 @@ class LocalDAGExecutor:
                             except Exception:
                                 pass
                     return forced_failure_reason
+
                 # Progressive warnings
                 if idle_timeout_seconds > 0 and idle_seconds > 0:
                     pct = int(idle_seconds / idle_timeout_seconds * 100)
@@ -3016,6 +2851,8 @@ class LocalDAGExecutor:
                             if event_type == "agent_status":
                                 status_type = ev.get("status_type", "")
                                 last_activity = time.monotonic()
+                                if status_type == "busy":
+                                    last_busy_time = time.monotonic()
                                 logger.debug(
                                     "Node %s agent_status=%s", node_id, status_type,
                                 )
@@ -3039,11 +2876,6 @@ class LocalDAGExecutor:
                                 last_activity = time.monotonic()
                                 content = ev.get("content", "")
                                 if isinstance(content, str):
-                                    if "ESCALATE_TO_PLANNER:" in content:
-                                        await self._emit(
-                                            "planner_guidance", run_id, node_id,
-                                            content=content.split("ESCALATE_TO_PLANNER:", 1)[1].strip(),
-                                        )
                                     if "ASK_WORKER:" in content or "BROADCAST_TO_PEERS:" in content:
                                         await self._emit(
                                             "worker_message", run_id, node_id,
@@ -3058,6 +2890,8 @@ class LocalDAGExecutor:
 
         except Exception:
             logger.warning("SSE subscription error for node %s", node_id, exc_info=True)
+            if not forced_failure_reason:
+                forced_failure_reason = f"SSE stream error for node {node_id}: runner connection lost"
 
         return forced_failure_reason
 
@@ -3161,7 +2995,6 @@ class LocalDAGExecutor:
         parent_result: dict,
         global_config: dict,
         cancel_event: asyncio.Event,
-        planner_node: dict | None = None,
         workspace_directory: str | None = None,
     ) -> dict[str, Any]:
         """After a planner node completes, parse its output for child tasks,
@@ -3222,6 +3055,11 @@ class LocalDAGExecutor:
                     }
                     if nd.get("model"):
                         task_entry["model"] = nd["model"]
+                    # Preserve rich context fields from planner output
+                    for rich_key in ("target_files", "interface_contract", "context_summary"):
+                        val = nd.get(rich_key) or dag_node.get(rich_key)
+                        if val:
+                            task_entry[rich_key] = val
                     parsed_tasks.append(task_entry)
             else:
                 logger.info(
@@ -3246,8 +3084,9 @@ class LocalDAGExecutor:
         # Load shared document for worker context injection
         shared_doc_content = ""
         try:
-            from app.models.db import SharedDocument as SharedDocModel
             from sqlalchemy import select as sa_select
+
+            from app.models.db import SharedDocument as SharedDocModel
             wf_id = global_config.get("_workflow_id")
             if wf_id:
                 from app.core.database import async_session_factory as _doc_session_factory
@@ -3264,9 +3103,10 @@ class LocalDAGExecutor:
             logger.debug("Failed to load shared doc for workers", exc_info=True)
 
         # Persist tasks to DB and emit events
+        from uuid import uuid4
+
         from app.core.database import async_session_factory
         from app.models.task import Task as TaskModel
-        from uuid import uuid4
 
         # Build worker node dicts and persist to DB in one pass
         worker_nodes: list[dict] = []
@@ -3277,12 +3117,10 @@ class LocalDAGExecutor:
             for idx, parsed in enumerate(parsed_tasks):
                 child_node_id = parsed.get("node_id") or f"{parent_node_id}_child_{idx}"
 
-                # Create DB task
                 task_id = uuid4()
                 task_type = parsed.get("type", "coder")
                 worker_label = parsed.get("title") or f"{task_type} #{idx + 1}"
 
-                # Compute dependencies from DAG edges or task depends_on
                 deps_list = parsed.get("depends_on", []) or parsed.get("dependencies", [])
                 deps_json = json.dumps(deps_list) if deps_list else None
 
@@ -3297,105 +3135,100 @@ class LocalDAGExecutor:
                     dependencies=deps_json,
                 )
                 session.add(db_task)
-                await session.commit()
-
-                # Emit task_created event
-                await self._emit(
-                    "task_created", run_id, parent_node_id,
-                    task_id=str(task_id),
-                    task_title=db_task.title,
-                    task_description=db_task.description,
-                    status="pending",
-                    child_node_id=child_node_id,
-                    dependencies=db_task.dependencies or "",
-                )
-
-                # Build the worker node dict
-                model_str = parsed.get("model", "")
-                model_provider, model_id = _parse_full_model_id(model_str)
-
-                strategy_provider, strategy_model_id = _resolve_auto_child_model(
-                    auto_child_model_map, str(task_type)
-                )
-                if not model_provider and strategy_provider:
-                    model_provider = strategy_provider
-                if not model_id and strategy_model_id:
-                    model_id = strategy_model_id
-
-                # Inherit planner's model config as fallback when task doesn't specify one
-                if not model_provider or not model_id:
-                    p_data = planner_node.get("data", {}) if planner_node else {}
-                    fallback_provider = (
-                        planner_node.get("model_provider", "")
-                        if planner_node else ""
-                    ) or (p_data.get("modelProvider", "") if isinstance(p_data, dict) else "")
-                    fallback_model = (
-                        planner_node.get("model_id", "")
-                        if planner_node else ""
-                    ) or (p_data.get("modelId", "") if isinstance(p_data, dict) else "")
-                    if not model_provider and fallback_provider:
-                        model_provider = fallback_provider
-                    if not model_id and fallback_model:
-                        model_id = fallback_model
-
-                resolved_model = (
-                    f"{model_provider}/{model_id}"
-                    if model_provider and model_id
-                    else model_id
-                )
-
-                # Also emit child_created for backward compat (frontend canvas)
-                await self._emit(
-                    "child_created", run_id, parent_node_id,
-                    child_node_id=child_node_id,
-                    child_type=parsed.get("type", "coder"),
-                    child_prompt=parsed.get("prompt", ""),
-                    child_model=resolved_model,
-                )
-
-                # Inject escalation protocol into worker prompt
-                worker_prompt = parsed.get("prompt", "")
-
-                # Inject project context
-                project_goal = global_config.get("_goal", "")
-                if project_goal:
-                    worker_prompt = f"## 项目目标\n{project_goal}\n\n---\n\n{worker_prompt}"
-
-                # Inject sibling task summary for context awareness
-                if len(parsed_tasks) > 1:
-                    sibling_lines = []
-                    for si, sib in enumerate(parsed_tasks):
-                        sib_id = sib.get("node_id") or f"{parent_node_id}_child_{si}"
-                        sib_title = sib.get("title") or sib.get("prompt", "")[:60]
-                        sib_type = sib.get("type", "coder")
-                        marker = " → " if sib_id == child_node_id else "   "
-                        sibling_lines.append(f"{marker}[{sib_type}] {sib_title}")
-                    worker_prompt += (
-                        f"\n\n## 任务上下文（共 {len(parsed_tasks)} 个子任务，当前第 {idx + 1} 个）\n"
-                        + "\n".join(sibling_lines)
-                    )
-
-                # Inject shared document context
-                if shared_doc_content:
-                    worker_prompt += f"\n\n## 项目共享文档\n{shared_doc_content}"
-
-                worker_prompt += (
-                    f"\n\n---\nTask ID: {child_node_id}\n"
-                    f"When you need help or are stuck, output a line:\n"
-                    f"{ESCALATION_MARKER} <your question>\n"
-                    f"To report progress, output a line:\n"
-                    f"{PROGRESS_MARKER} <0-100>\n"
-                )
-
-                worker_node = {
-                    "id": child_node_id,
-                    "agent_type": parsed.get("type", "coder"),
-                    "model_provider": model_provider,
-                    "model_id": model_id,
-                    "prompt": worker_prompt,
-                }
-                worker_nodes.append(worker_node)
                 task_db_map[child_node_id] = (str(task_id), worker_label, task_type)
+
+            await session.commit()
+
+        for idx, parsed in enumerate(parsed_tasks):
+            child_node_id = parsed.get("node_id") or f"{parent_node_id}_child_{idx}"
+            task_id, worker_label, task_type = task_db_map[child_node_id]
+
+            await self._emit(
+                "task_created", run_id, parent_node_id,
+                task_id=task_id,
+                task_title=parsed.get("title") or parsed.get("prompt", "")[:200],
+                task_description=parsed.get("prompt", ""),
+                status="pending",
+                child_node_id=child_node_id,
+                dependencies=parsed.get("depends_on", []) or parsed.get("dependencies", []) or "",
+            )
+
+            model_str = parsed.get("model", "")
+            model_provider, model_id = _parse_full_model_id(model_str)
+
+            strategy_provider, strategy_model_id = _resolve_auto_child_model(
+                auto_child_model_map, str(task_type)
+            )
+            if not model_provider and strategy_provider:
+                model_provider = strategy_provider
+            if not model_id and strategy_model_id:
+                model_id = strategy_model_id
+
+            if not model_provider or not model_id:
+                pass
+
+            resolved_model = (
+                f"{model_provider}/{model_id}"
+                if model_provider and model_id
+                else model_id
+            )
+
+            await self._emit(
+                "child_created", run_id, parent_node_id,
+                child_node_id=child_node_id,
+                child_type=parsed.get("type", "coder"),
+                child_prompt=parsed.get("prompt", ""),
+                child_model=resolved_model,
+            )
+
+            worker_prompt = parsed.get("prompt", "")
+
+            project_goal = global_config.get("_goal", "")
+            if project_goal:
+                worker_prompt = f"## 项目目标\n{project_goal}\n\n---\n\n{worker_prompt}"
+
+            # Inject interface contract and context summary
+            contract = parsed.get("interface_contract", "")
+            if contract:
+                worker_prompt = f"## 接口契约\n{contract}\n\n---\n\n{worker_prompt}"
+            ctx = parsed.get("context_summary", "")
+            if ctx:
+                worker_prompt = f"## 上下文说明\n{ctx}\n\n---\n\n{worker_prompt}"
+
+            if len(parsed_tasks) > 1:
+                sibling_lines = []
+                for si, sib in enumerate(parsed_tasks):
+                    sib_id = sib.get("node_id") or f"{parent_node_id}_child_{si}"
+                    sib_title = sib.get("title") or sib.get("prompt", "")[:60]
+                    sib_type = sib.get("type", "coder")
+                    marker = " → " if sib_id == child_node_id else "   "
+                    sibling_lines.append(f"{marker}[{sib_type}] {sib_title}")
+                worker_prompt += (
+                    f"\n\n## 任务上下文（共 {len(parsed_tasks)} 个子任务，当前第 {idx + 1} 个）\n"
+                    + "\n".join(sibling_lines)
+                )
+
+            if shared_doc_content:
+                worker_prompt += f"\n\n## 项目共享文档\n{shared_doc_content}"
+
+            worker_prompt += (
+                f"\n\n---\nTask ID: {child_node_id}\n"
+                f"To report progress, output a line:\n"
+                f"{PROGRESS_MARKER} <0-100>\n"
+            )
+
+            worker_node = {
+                "id": child_node_id,
+                "agent_type": parsed.get("type", "coder"),
+                "model_provider": model_provider,
+                "model_id": model_id,
+                "prompt": worker_prompt,
+            }
+            # Carry rich context fields through to execution
+            for rich_key in ("target_files", "interface_contract", "context_summary"):
+                if parsed.get(rich_key):
+                    worker_node[rich_key] = parsed[rich_key]
+            worker_nodes.append(worker_node)
 
             # ---------- Execute child tasks ----------
 
@@ -3442,17 +3275,16 @@ class LocalDAGExecutor:
                         li, [n.get("id", "?") for n in layer],
                     )
 
-                child_results = await self._execute_task_layers(
+                child_results = await self._execute_layers(
                     run_id=run_id,
                     layers=sub_layers,
                     edges=child_edges_dag,
                     global_config=global_config,
                     cancel_event=cancel_event,
+                    workspace_directory=workspace_directory,
                     task_db_map={node_id: meta[0] for node_id, meta in task_db_map.items()},
                     task_type_map={node_id: meta[2] for node_id, meta in task_db_map.items()},
                     task_label_map={node_id: meta[1] for node_id, meta in task_db_map.items()},
-                    workspace_directory=workspace_directory,
-                    planner_node=planner_node,
                     parent_node_id=parent_node_id,
                 )
 
@@ -3480,16 +3312,15 @@ class LocalDAGExecutor:
                 except ValueError:
                     legacy_layers = [[node] for node in worker_nodes]
 
-                return await self._execute_task_layers(
+                return await self._execute_layers(
                     run_id=run_id,
                     layers=legacy_layers,
                     edges=legacy_edges,
                     global_config=global_config,
                     cancel_event=cancel_event,
+                    workspace_directory=workspace_directory,
                     task_db_map={node_id: meta[0] for node_id, meta in task_db_map.items()},
                     task_type_map={node_id: meta[2] for node_id, meta in task_db_map.items()},
                     task_label_map={node_id: meta[1] for node_id, meta in task_db_map.items()},
-                    workspace_directory=workspace_directory,
-                    planner_node=planner_node,
                     parent_node_id=parent_node_id,
                 )
