@@ -409,7 +409,7 @@ async function main() {
   let sawFinalStepFinish = false
   const child = Bun.spawn({
     cmd: [
-      "bun",
+      process.execPath,
       opencodeEntry,
       "run",
       "--format",

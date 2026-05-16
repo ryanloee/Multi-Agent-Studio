@@ -2360,6 +2360,19 @@ class LocalDAGExecutor:
             provider_key = str(model_cfg.get("key", ""))
             provider_url = provider_url or provider_cfg.get("url", "")
             provider_key = provider_key or provider_cfg.get("key", "")
+
+            # Fallback: scan all providers in models.json for a matching key
+            if not provider_url or not provider_key:
+                for _pid, _pcfg in load_provider_config().items():
+                    if _pcfg.get("url") and _pcfg.get("key"):
+                        provider_url = provider_url or _pcfg["url"]
+                        provider_key = provider_key or _pcfg["key"]
+                        break
+
+            # Fallback: environment variables (same as planner_chat.py)
+            if not provider_url or not provider_key:
+                provider_url = provider_url or os.environ.get("MIMO_API_URL", "")
+                provider_key = provider_key or os.environ.get("MIMO_API_KEY", "")
             context_window = int(model_cfg.get("context_window") or 128000)
             max_output_tokens = int(model_cfg.get("max_output_tokens") or 4096)
 
@@ -2447,13 +2460,21 @@ class LocalDAGExecutor:
                     cancel_event, idle_timeout_seconds, _agent_type_for_timeout,
                 )
 
+            # Wait for the process to actually finish before checking exit code.
+            # Without this, if SSE/polling returns early, we'd read None → -1
+            # while the runner is still working.
+            try:
+                exit_code = await asyncio.wait_for(
+                    self._sandbox.wait_process(exec_id), timeout=30,
+                )
+            except asyncio.TimeoutError:
+                proc_info = await self._sandbox.get_process(exec_id)
+                exit_code = proc_info.exit_code if proc_info.exit_code is not None else -1
+
             # Final read to capture any remaining output from stream.jsonl
             await self._stream_log_lines(
                 sandbox_id, stream_file, 0, run_id, node_id,
             )
-
-            proc_info = await self._sandbox.get_process(exec_id)
-            exit_code = proc_info.exit_code if proc_info.exit_code is not None else -1
             logger.info("Node %s exit_code=%d", node_id, exit_code)
             if forced_failure_reason and exit_code == 0:
                 logger.info(
@@ -2810,7 +2831,7 @@ class LocalDAGExecutor:
             return ""
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=None, write=5, pool=5)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=5, read=None, write=5, pool=5), trust_env=False) as client:
                 async with client.stream("GET", url) as response:
                     if response.status_code != 200:
                         logger.warning("SSE connection failed: %d", response.status_code)
@@ -2889,9 +2910,20 @@ class LocalDAGExecutor:
                             pass
 
         except Exception:
-            logger.warning("SSE subscription error for node %s", node_id, exc_info=True)
-            if not forced_failure_reason:
-                forced_failure_reason = f"SSE stream error for node {node_id}: runner connection lost"
+            # If the runner already sent a terminal event (node_completed),
+            # the connection drop is not a real failure — the runner finished.
+            run_state = self._runs.get(run_id)
+            terminal_events = run_state.get("_node_terminal_events", {}) if isinstance(run_state, dict) else {}
+            terminal_event = terminal_events.get(node_id) if isinstance(terminal_events, dict) else None
+            if terminal_event == "node_completed":
+                logger.info(
+                    "SSE connection lost for node %s but runner already completed — ignoring",
+                    node_id,
+                )
+            else:
+                logger.warning("SSE subscription error for node %s", node_id, exc_info=True)
+                if not forced_failure_reason:
+                    forced_failure_reason = f"SSE stream error for node {node_id}: runner connection lost"
 
         return forced_failure_reason
 
