@@ -30,6 +30,10 @@ export type StreamEventType =
   | "agent_status"
   | "idle_warning"
   | "permission_request"
+  | "director_decision"
+  | "node_paused"
+  | "node_approved"
+  | "node_rejected"
   | "ping";
 
 // ---------------------------------------------------------------------------
@@ -225,6 +229,17 @@ export interface ArtifactCreatedEvent extends StreamEvent {
   title: string;
 }
 
+/** Director agent made a dispatch decision */
+export interface DirectorDecisionEvent extends StreamEvent {
+  type: "director_decision";
+  node_id: "director";
+  action: "scout" | "worker" | "test" | "done" | "failed";
+  reasoning: string;
+  task_id: string;
+  target_files?: string[];
+  iteration?: number;
+}
+
 // ---------------------------------------------------------------------------
 // Event map — maps type discriminator to the concrete event interface
 // ---------------------------------------------------------------------------
@@ -255,4 +270,5 @@ export interface StreamEventMap {
   agent_status: AgentStatusEvent;
   idle_warning: IdleWarningEvent;
   permission_request: PermissionRequestEvent;
+  director_decision: DirectorDecisionEvent;
 }

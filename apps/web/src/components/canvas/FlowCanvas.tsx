@@ -1,217 +1,250 @@
 "use client";
 
-import { useCallback, useEffect, useRef, type DragEvent } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import {
   ReactFlow,
+  ReactFlowProvider,
   Background,
   Controls,
   MiniMap,
-  type ReactFlowInstance,
-  type NodeMouseHandler,
+  useNodesState,
+  useEdgesState,
 } from "@xyflow/react";
-
 import "@xyflow/react/dist/style.css";
-
-import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
+import { useWorkflowStore } from "@/stores/workflowStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { nodeTypes } from "@/components/canvas/nodeTypes";
-import type { AgentNodeType, WorkflowNode, WorkflowEdge } from "@/types/workflow";
-import { NODE_META } from "@/lib/constants";
-import type { ChildCreatedEvent } from "@/types/events";
+import type { DirectorDecisionEvent } from "@/types/events";
+import type { RunStatus } from "@/types/workflow";
 
-export default function FlowCanvas() {
-  const staticNodes = useWorkflowStore((s) => s.nodes) ?? [];
-  const edges = useWorkflowStore((s) => s.edges) ?? [];
-  const onNodesChange = useWorkflowStore((s) => s.onNodesChange);
-  const onEdgesChange = useWorkflowStore((s) => s.onEdgesChange);
-  const onConnect = useWorkflowStore((s) => s.onConnect);
-  const addNode = useWorkflowStore((s) => s.addNode);
-  const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
-  const focusNodeId = useWorkflowStore((s) => s.focusNodeId);
-  const setFocusNode = useWorkflowStore((s) => s.setFocusNode);
-  const mode = useWorkflowStore((s) => s.mode);
-  const t = useLocaleStore((s) => s.t);
+const STATUS_COLORS: Record<string, string> = {
+  pending: "bg-gray-200 text-gray-600",
+  running: "bg-blue-100 text-blue-700 border-blue-300 animate-pulse",
+  completed: "bg-green-100 text-green-700 border-green-300",
+  failed: "bg-red-100 text-red-700 border-red-300",
+  idle: "bg-gray-100 text-gray-500",
+  cancelled: "bg-gray-200 text-gray-500",
+};
 
+const ACTION_ICONS: Record<string, string> = {
+  scout: "🔍",
+  worker: "🔧",
+  test: "🧪",
+  done: "✅",
+  failed: "❌",
+};
+
+function formatTimestamp(ts: number): string {
+  if (!ts) return "";
+  const d = new Date(ts > 1e12 ? ts : ts * 1000);
+  return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+// ---------------------------------------------------------------------------
+// DAG view (planning phase)
+// ---------------------------------------------------------------------------
+
+function DagView() {
+  const storeNodes = useWorkflowStore((s) => s.nodes);
+  const storeEdges = useWorkflowStore((s) => s.edges);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
-  const allEvents = useRunStore((s) => s.events);
-  const addDynamicNode = useWorkflowStore((s) => s.addDynamicNode);
-  const setSelectedEdge = useWorkflowStore((s) => s.setSelectedEdge);
 
-  // ---- Sync child_created events into workflowStore as real nodes ----
+  const [nodes, setNodes, onNodesChange] = useNodesState(storeNodes as any[]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(storeEdges as any[]);
+
   useEffect(() => {
-    const currentNodes = useWorkflowStore.getState().nodes;
-    const existingIds = new Set(currentNodes.map((n) => n.id));
+    setNodes(storeNodes as any[]);
+  }, [storeNodes, setNodes]);
 
-    for (const ev of allEvents) {
-      if (ev.type !== "child_created") continue;
-      const ce = ev as ChildCreatedEvent;
-      const childId = ce.child_node_id;
-      if (!childId || existingIds.has(childId)) continue;
+  useEffect(() => {
+    setEdges(storeEdges as any[]);
+  }, [storeEdges, setEdges]);
 
-      existingIds.add(childId);
-      addDynamicNode(ce.node_id, {
-        id: childId,
-        type: (ce.child_type || "coder") as AgentNodeType,
-        prompt: ce.child_prompt || "",
-        model: ce.child_model || "",
-      });
-    }
-  }, [allEvents, addDynamicNode]);
-
-  // ---- React Flow instance ref (for screenToFlowPosition in onDrop) ----
-  const rfInstanceRef = useRef<ReactFlowInstance<WorkflowNode, WorkflowEdge> | null>(null);
-  const setRfInstance = useCallback((instance: ReactFlowInstance<WorkflowNode, WorkflowEdge>) => {
-    rfInstanceRef.current = instance;
-  }, []);
-
-  // ---- Drag-over: allow drop ----
-  const onDragOver = useCallback((event: DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-  }, []);
-
-  // ---- Drop: create node from sidebar drag ----
-  const onDrop = useCallback(
-    (event: DragEvent<HTMLDivElement>) => {
-      event.preventDefault();
-
-      const nodeType = event.dataTransfer.getData("application/reactflow") as AgentNodeType | "";
-      if (!nodeType || !NODE_META[nodeType]) return;
-
-      // Convert screen coordinates to flow coordinates
-      const rf = rfInstanceRef.current;
-      if (!rf) return;
-      const position = rf.screenToFlowPosition({
-        x: event.clientX,
-        y: event.clientY,
-      });
-
-      addNode(nodeType, position);
-    },
-    [addNode]
-  );
-
-  // ---- Node click: select node (+ set run node during active run) ----
-  const onNodeClick: NodeMouseHandler = useCallback(
-    (_event, node) => {
-      setSelectedNode(node.id);
+  const onNodeClick = useCallback(
+    (_: React.MouseEvent, node: any) => {
       setSelectedRunNode(node.id);
     },
-    [setSelectedNode, setSelectedRunNode]
+    [setSelectedRunNode],
   );
 
-  // ---- Pane click: deselect ----
-  const onPaneClick = useCallback(() => {
-    setSelectedNode(null);
-    setSelectedRunNode(null);
-    setSelectedEdge(null);
-  }, [setSelectedNode, setSelectedRunNode, setSelectedEdge]);
-
-  // ---- Edge click: select edge for configuration ----
-  const onEdgeClick = useCallback(
-    (_event: React.MouseEvent, edge: WorkflowEdge) => {
-      setSelectedEdge(edge.id);
-      setSelectedRunNode(null);
-    },
-    [setSelectedEdge, setSelectedRunNode]
-  );
-
-  // ---- Focus node when focusNodeId changes (e.g. from TaskBoard click) ----
-  useEffect(() => {
-    if (!focusNodeId || !rfInstanceRef.current) return;
-    const rf = rfInstanceRef.current;
-    const node = staticNodes.find((n) => n.id === focusNodeId);
-    if (!node) return;
-
-    // Animate to center the node with some zoom
-    rf.fitView({
-      nodes: [{ id: focusNodeId }],
-      padding: 0.5,
-      duration: 400,
-      maxZoom: 1.2,
-    });
-
-    // Clear the focus trigger so it doesn't re-trigger
-    setFocusNode(null);
-  }, [focusNodeId, staticNodes, setFocusNode]);
-
-  // ---- Child nodes are added to workflowStore via addDynamicNode ----
-  // No merge needed — staticNodes already contains them.
+  if (storeNodes.length === 0) {
+    const t = useLocaleStore.getState().t;
+    return (
+      <div className="w-full h-full flex items-center justify-center bg-white">
+        <div className="text-center space-y-3 max-w-sm px-4">
+          <div className="w-12 h-12 rounded-xl bg-blue-50 flex items-center justify-center mx-auto">
+            <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+            </svg>
+          </div>
+          <p className="text-gray-500 text-base font-medium">{t("canvas.autoMode")}</p>
+          <p className="text-gray-400 text-sm leading-relaxed">{t("canvas.autoModeDesc")}</p>
+        </div>
+      </div>
+    );
+  }
 
   return (
-    <div className="w-full h-full relative">
-      <ReactFlow
-        nodes={staticNodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={mode === "auto" ? undefined : onEdgesChange}
-        onConnect={mode === "auto" ? undefined : onConnect}
-        onInit={setRfInstance}
-        onDragOver={mode === "auto" ? undefined : onDragOver}
-        onDrop={mode === "auto" ? undefined : onDrop}
-        onNodeClick={onNodeClick}
-        onPaneClick={onPaneClick}
-        onEdgeClick={onEdgeClick}
-        nodeTypes={nodeTypes}
-        snapToGrid
-        snapGrid={[16, 16]}
-        fitView
-        minZoom={0.2}
-        maxZoom={2}
-        nodesDraggable
-        nodesConnectable={mode !== "auto"}
-        deleteKeyCode={mode === "auto" ? null : undefined}
-      >
-        <Background gap={16} size={1} />
-        <Controls />
-        <MiniMap
-          nodeStrokeWidth={3}
-          zoomable
-          pannable
-          className="!bg-gray-50 !border-gray-200"
-        />
-      </ReactFlow>
+    <ReactFlow
+      nodes={nodes}
+      edges={edges}
+      onNodesChange={onNodesChange}
+      onEdgesChange={onEdgesChange}
+      onNodeClick={onNodeClick}
+      nodeTypes={nodeTypes}
+      fitView
+      fitViewOptions={{ padding: 0.2 }}
+      proOptions={{ hideAttribution: true }}
+    >
+      <Background />
+      <Controls position="bottom-right" />
+      <MiniMap
+        nodeStrokeWidth={3}
+        zoomable
+        pannable
+        style={{ border: "1px solid #e5e7eb" }}
+      />
+    </ReactFlow>
+  );
+}
 
-      {/* Empty canvas guide text */}
-      {staticNodes.length === 0 && (
-        <div className="absolute inset-0 flex items-center justify-center pointer-events-none select-none z-10">
-          <div className="text-center space-y-3 max-w-sm px-4">
-            <div className={`w-12 h-12 rounded-xl flex items-center justify-center mx-auto ${
-              mode === "auto" ? "bg-blue-50" : "bg-blue-50"
-            }`}>
-              {mode === "auto" ? (
-                <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
-                </svg>
-              ) : (
-                <svg className="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-                </svg>
-              )}
+// ---------------------------------------------------------------------------
+// Timeline view (run phase)
+// ---------------------------------------------------------------------------
+
+function TimelineView() {
+  const decisions = useRunStore((s) => s.directorDecisions);
+  const events = useRunStore((s) => s.events);
+  const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  const handleNodeClick = useCallback(
+    (nodeId: string) => {
+      setSelectedRunNode(nodeId);
+    },
+    [setSelectedRunNode],
+  );
+
+  useEffect(() => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [decisions, events]);
+
+  const nodeEvents = events.filter(
+    (e) =>
+      e.type === "node_started" ||
+      e.type === "node_completed" ||
+      e.type === "node_failed" ||
+      e.type === "director_decision",
+  );
+
+  return (
+    <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-3 space-y-1">
+      <div className="relative">
+        <div className="absolute left-[19px] top-0 bottom-0 w-0.5 bg-gray-200" />
+        {nodeEvents.map((event, idx) => {
+          if (event.type === "director_decision") {
+            const de = event as DirectorDecisionEvent;
+            const icon = ACTION_ICONS[de.action] || "📋";
+            return (
+              <div key={`decision-${idx}`} className="relative flex items-start gap-3 py-2 group">
+                <div className="relative z-10 w-10 h-10 rounded-full bg-white border-2 border-gray-300 flex items-center justify-center text-lg shrink-0">
+                  {icon}
+                </div>
+                <div className="flex-1 min-w-0 pt-1">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-mono text-gray-400">{formatTimestamp(event.timestamp)}</span>
+                    <span className="text-xs font-medium px-1.5 py-0.5 rounded bg-purple-100 text-purple-700">{de.action}</span>
+                    {de.iteration !== undefined && <span className="text-xs text-gray-400">#{de.iteration}</span>}
+                  </div>
+                  <p className="text-sm text-gray-700 mt-0.5 line-clamp-2">{de.reasoning}</p>
+                  {de.target_files && de.target_files.length > 0 && (
+                    <div className="flex flex-wrap gap-1 mt-1">
+                      {de.target_files.map((f) => (
+                        <span key={f} className="text-xs px-1.5 py-0.5 bg-gray-100 text-gray-600 rounded">{f}</span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          }
+
+          const status: RunStatus =
+            event.type === "node_started" ? "running" :
+            event.type === "node_completed" ? "completed" : "failed";
+          const colorClass = STATUS_COLORS[status] || STATUS_COLORS.pending;
+          const statusLabel = status === "running" ? "Running" : status === "completed" ? "Done" : "Failed";
+
+          return (
+            <div
+              key={`node-${idx}`}
+              className="relative flex items-start gap-3 py-2 cursor-pointer group hover:bg-gray-50 rounded-lg -mx-2 px-2"
+              onClick={() => handleNodeClick(event.node_id)}
+            >
+              <div className={`relative z-10 w-10 h-10 rounded-full border-2 flex items-center justify-center text-xs font-bold shrink-0 ${colorClass}`}>
+                {status === "running" ? "..." : statusLabel[0]}
+              </div>
+              <div className="flex-1 min-w-0 pt-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-sm font-medium text-gray-800 truncate">{event.node_id}</span>
+                  <span className={`text-xs font-medium px-1.5 py-0.5 rounded ${colorClass}`}>{statusLabel}</span>
+                </div>
+                <span className="text-xs font-mono text-gray-400">{formatTimestamp(event.timestamp)}</span>
+              </div>
             </div>
-            {mode === "auto" ? (
-              <>
-                <p className="text-gray-500 text-base font-medium">
-                  {t("canvas.autoMode")}
-                </p>
-                <p className="text-gray-400 text-sm leading-relaxed">
-                  {t("canvas.autoModeDesc")}
-                </p>
-              </>
-            ) : (
-              <>
-                <p className="text-gray-500 text-base font-medium">
-                  {t("canvas.manualMode")}
-                </p>
-                <p className="text-gray-400 text-sm leading-relaxed">
-                  {t("canvas.manualModeDesc")}
-                </p>
-              </>
-            )}
-          </div>
-        </div>
-      )}
+          );
+        })}
+      </div>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main canvas — switches between DAG and Timeline
+// ---------------------------------------------------------------------------
+
+function FlowCanvasInner() {
+  const events = useRunStore((s) => s.events);
+  const runStatus = useRunStore((s) => s.status);
+  const storeNodes = useWorkflowStore((s) => s.nodes);
+  const goal = useWorkflowStore((s) => s.goal);
+  const t = useLocaleStore((s) => s.t);
+
+  const hasRunEvents = events.some(
+    (e) =>
+      e.type === "node_started" ||
+      e.type === "node_completed" ||
+      e.type === "node_failed" ||
+      e.type === "director_decision",
+  );
+  const isRunning = runStatus === "running" || runStatus === "pending";
+
+  // Show timeline during/after runs; show DAG during planning
+  const showTimeline = hasRunEvents || isRunning;
+
+  return (
+    <div className="w-full h-full flex flex-col bg-white">
+      <div className="px-4 py-3 border-b border-gray-200 bg-gray-50 shrink-0">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-medium text-gray-400 uppercase tracking-wide">
+            {showTimeline ? "Director" : "DAG"}
+          </span>
+          {goal && <span className="text-sm text-gray-600 truncate">— {goal}</span>}
+        </div>
+      </div>
+
+      {showTimeline ? <TimelineView /> : <DagView />}
+    </div>
+  );
+}
+
+export default function FlowCanvas() {
+  return (
+    <ReactFlowProvider>
+      <FlowCanvasInner />
+    </ReactFlowProvider>
   );
 }

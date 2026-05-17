@@ -66,6 +66,7 @@ const TaskLeaf = memo(function TaskLeaf({
   onAssign,
   workflowNodes,
   nodeData,
+  t,
 }: {
   task: Task;
   isSelected: boolean;

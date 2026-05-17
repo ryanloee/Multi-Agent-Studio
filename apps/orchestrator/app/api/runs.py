@@ -29,23 +29,23 @@ from app.models.db import NodeExecution, Run, RunEvent
 from app.models.schemas import NodeExecutionResponse, RunEventResponse, RunResponse, TriggerRunRequest
 
 if TYPE_CHECKING:
-    from app.core.local_engine import LocalDAGExecutor
+    from app.core.director_loop import DirectorLoop
 
 logger = logging.getLogger("uvicorn.error")
 
 router = APIRouter()
 
 # Module-level engine singleton — initialised by main.py lifespan
-_engine: LocalDAGExecutor | None = None
+_engine: DirectorLoop | None = None
 
 
-def init_engine(engine: LocalDAGExecutor) -> None:
-    """Set the module-level DAG executor.  Called once during app startup."""
+def init_engine(engine: DirectorLoop) -> None:
+    """Set the module-level director loop engine. Called once during app startup."""
     global _engine
     _engine = engine
 
 
-def _require_engine() -> LocalDAGExecutor:
+def _require_engine() -> DirectorLoop:
     if _engine is None:
         raise HTTPException(status_code=503, detail="Workflow engine not initialised")
     return _engine
@@ -73,165 +73,6 @@ def clear_approval(run_id: str) -> None:
     _approval_results.pop(run_id, None)
 
 
-def _extract_node_model(node: dict) -> str:
-    data = node.get("data", {}) if isinstance(node, dict) else {}
-    provider = (
-        data.get("modelProvider")
-        or data.get("model_provider")
-        or node.get("model_provider")
-        or ""
-    )
-    model_id = (
-        data.get("modelId")
-        or data.get("model_id")
-        or node.get("model_id")
-        or ""
-    )
-    if provider and model_id:
-        return f"{provider}/{model_id}"
-    return str(model_id or provider or "").strip()
-
-
-def _workflow_has_model_fallback(workflow, agent_type: str) -> bool:
-    dag_json = workflow.dag_json or {}
-    metadata = dag_json.get("metadata", {}) if isinstance(dag_json, dict) else {}
-    auto_map = metadata.get("auto_child_model_map", {}) if isinstance(metadata, dict) else {}
-    if isinstance(auto_map, dict) and auto_map.get(agent_type):
-        return True
-
-    try:
-        settings_path = Path(__file__).resolve().parents[3] / "data" / "settings.json"
-        import json
-
-        payload = json.loads(settings_path.read_text(encoding="utf-8"))
-        models = payload.get("models", [])
-        has_model = isinstance(models, list) and any(
-            isinstance(item, dict) and item.get("default_model")
-            for item in models
-        )
-        logger.info(
-            "Run model fallback lookup: agent_type=%s settings_path=%s has_model=%s",
-            agent_type, settings_path, has_model,
-        )
-        return has_model
-    except Exception:
-        logger.exception("Run model fallback lookup failed for agent_type=%s", agent_type)
-        return False
-
-
-def _validate_run_request(
-    workflow,
-    dag_json: dict | None,
-) -> list[dict[str, str]]:
-    blockers: list[dict[str, str]] = []
-    workspace_directory = (workflow.workspace_directory or "").strip()
-    if not workspace_directory:
-        blockers.append({
-            "code": "workspace_missing",
-            "message": "请先设置工作目录后再启动工作流。",
-        })
-    else:
-        workspace_path = Path(workspace_directory).expanduser()
-        if not workspace_path.exists() or not workspace_path.is_dir():
-            blockers.append({
-                "code": "workspace_missing",
-                "message": f"工作目录不存在或不可用: {workspace_directory}",
-            })
-
-    nodes = [
-        node for node in (dag_json or {}).get("nodes", [])
-        if isinstance(node, dict)
-    ]
-    executable_nodes = [node for node in nodes if node.get("id") != "planner"]
-    logger.info(
-        "Run preflight: workflow=%s workspace=%s nodes=%d executable_nodes=%d edges=%d",
-        getattr(workflow, "id", ""),
-        workspace_directory or "<missing>",
-        len(nodes),
-        len(executable_nodes),
-        len((dag_json or {}).get("edges", []) or []),
-    )
-    if not executable_nodes:
-        blockers.append({
-            "code": "dag_empty",
-            "message": "当前画布还没有可执行节点，不能启动运行。",
-        })
-
-    edges = [
-        edge for edge in (dag_json or {}).get("edges", [])
-        if isinstance(edge, dict)
-    ]
-    incoming: dict[str, int] = {}
-    for edge in edges:
-        target = str(edge.get("target") or "")
-        if target:
-            incoming[target] = incoming.get(target, 0) + 1
-
-    for node in executable_nodes:
-        agent_type = (
-            node.get("type")
-            or (node.get("data", {}) if isinstance(node.get("data"), dict) else {}).get("agentType")
-            or "coder"
-        )
-        node_id = str(node.get("id") or "")
-        if agent_type == "plan" and node_id != "planner":
-            agent_type = "design"
-        node_model = _extract_node_model(node)
-        has_fallback = _workflow_has_model_fallback(workflow, agent_type)
-        logger.info(
-            "Run preflight node: workflow=%s node=%s type=%s model=%s fallback=%s",
-            getattr(workflow, "id", ""),
-            node_id,
-            agent_type,
-            node_model or "<missing>",
-            has_fallback,
-        )
-        if agent_type == "merge" and incoming.get(node_id, 0) == 0:
-            blockers.append({
-                "code": "merge_missing_inputs",
-                "message": f"Merge 节点 {node_id} 没有上游依赖，无法执行。",
-            })
-        if (
-            agent_type in {"design", "plan", "coder", "explore", "merge", "review"}
-            and not node_model
-            and not has_fallback
-        ):
-            blockers.append({
-                "code": "model_missing",
-                "message": f"节点 {node_id} 缺少可解析模型，请在节点或模型策略中补齐。",
-            })
-    if blockers:
-        logger.warning(
-            "Run preflight blocked: workflow=%s blockers=%s",
-            getattr(workflow, "id", ""),
-            blockers,
-        )
-    else:
-        logger.info("Run preflight passed: workflow=%s", getattr(workflow, "id", ""))
-    return blockers
-
-
-def _strip_internal_planner_node(dag_json: dict | None) -> dict:
-    """Remove the top-level planner sentinel from executable auto DAGs."""
-    if not isinstance(dag_json, dict):
-        return {"nodes": [], "edges": []}
-
-    nodes = [
-        node for node in dag_json.get("nodes", [])
-        if isinstance(node, dict) and node.get("id") != "planner"
-    ]
-    node_ids = {str(node.get("id")) for node in nodes if node.get("id")}
-    edges = [
-        edge for edge in dag_json.get("edges", [])
-        if (
-            isinstance(edge, dict)
-            and str(edge.get("source") or "") in node_ids
-            and str(edge.get("target") or "") in node_ids
-        )
-    ]
-    metadata = dag_json.get("metadata", {}) if isinstance(dag_json.get("metadata"), dict) else {}
-    return {"nodes": nodes, "edges": edges, "metadata": metadata}
-
 
 @router.post("/{workflow_id}/run", response_model=RunResponse, status_code=201)
 async def trigger_run(
@@ -239,15 +80,12 @@ async def trigger_run(
     body: TriggerRunRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Trigger workflow execution via the local DAG engine.
-
-    Always uses auto mode: the Planner builds the workflow DAG from
-    workflow.goal and planner chat history.
+    """Trigger workflow execution via the Director dispatch loop.
 
     Steps:
-    1. Look up workflow from DB to get DAG JSON, mode, and goal.
-    2. Recover or validate DAG from planner chat history.
-    3. Start DAG execution in the background via start_run().
+    1. Look up workflow from DB to get goal and workspace.
+    2. Validate workspace exists.
+    3. Start Director loop in the background via start_run().
     4. Persist run record to DB and return it.
     """
 
@@ -263,97 +101,28 @@ async def trigger_run(
         raise HTTPException(status_code=404, detail="Workflow not found")
 
     workspace_directory = (workflow.workspace_directory or "").strip()
+    goal = getattr(workflow, "goal", "") or ""
+
+    # 2. Validate
+    if not workspace_directory:
+        raise HTTPException(status_code=400, detail="请先设置工作目录后再启动工作流。")
+
+    workspace_path = Path(workspace_directory).expanduser()
+    if not workspace_path.exists() or not workspace_path.is_dir():
+        raise HTTPException(status_code=400, detail=f"工作目录不存在或不可用: {workspace_directory}")
+
+    if not goal:
+        raise HTTPException(status_code=400, detail="请先设置工作目标后再启动工作流。")
 
     payload = body or TriggerRunRequest()
     global_config = payload.config or {}
-    dag_json: dict | None = None
     run_id = uuid4()
-    workflow_metadata = (
-        workflow.dag_json.get("metadata", {})
-        if isinstance(workflow.dag_json, dict)
-        else {}
-    )
 
-    # 2. Auto mode: recover DAG from payload or planner chat history
-    goal = getattr(workflow, "goal", "") or ""
-    saved_dag = payload.dag if payload.dag else (workflow.dag_json or {})
-    saved_nodes = [
-        node for node in saved_dag.get("nodes", [])
-        if isinstance(node, dict) and node.get("id") != "planner"
-    ]
-    if not saved_nodes:
-        from app.api.planner_chat import _extract_dag_from_text
-        from app.models.db import ChatMessage as ChatMessageORM
-
-        saw_unparsed_plan = False
-        chat_result = await db.execute(
-            select(ChatMessageORM)
-            .where(
-                ChatMessageORM.workflow_id == workflow_id,
-                ChatMessageORM.node_id == "planner",
-                ChatMessageORM.role == "assistant",
-            )
-            .order_by(ChatMessageORM.created_at.desc())
-        )
-        for msg in chat_result.scalars().all():
-            if "```plan" in (msg.content or ""):
-                saw_unparsed_plan = True
-            recovered_dag = _extract_dag_from_text(msg.content or "")
-            recovered_nodes = [
-                node for node in (recovered_dag or {}).get("nodes", [])
-                if isinstance(node, dict) and node.get("id") != "planner"
-            ]
-            if recovered_nodes:
-                saved_dag = recovered_dag or {}
-                saved_nodes = recovered_nodes
-                workflow.dag_json = saved_dag
-                db.add(workflow)
-                await db.flush()
-                logger.info(
-                    "Recovered auto DAG for workflow %s from planner chat history (%d nodes)",
-                    workflow_id, len(saved_nodes),
-                )
-                break
-        if not saved_nodes and saw_unparsed_plan:
-            workflow.lifecycle_phase = "review"
-            workflow.blockers_json = [{
-                "code": "planner_dag_parse_failed",
-                "message": "Planner 曾输出结构化计划，但 JSON 不完整或无效，系统无法恢复画布节点。请让 Planner 重新生成更简洁的 DAG。",
-            }]
-            await db.commit()
-            logger.warning(
-                "Run blocked by unrecoverable planner DAG: workflow=%s",
-                workflow_id,
-            )
-            raise HTTPException(status_code=400, detail=workflow.blockers_json[0])
-
-    blockers = _validate_run_request(workflow, saved_dag)
-    if blockers:
-        workflow.lifecycle_phase = "review"
-        workflow.blockers_json = blockers
-        await db.commit()
-        raise HTTPException(status_code=400, detail=blockers[0]["message"])
-    if saved_nodes:
-        # Planner chat already produced a concrete DAG. Execute that
-        # saved team directly and mirror every node to the task board.
-        dag_json = _strip_internal_planner_node(saved_dag)
-        global_config["_mode"] = "auto"
-        global_config["_goal"] = goal
-    else:
-        workflow.lifecycle_phase = "review"
-        workflow.blockers_json = [{
-            "code": "dag_empty",
-            "message": "当前只有 Planner 规划，没有形成可执行 DAG。请先在 Planner 中完成方案并进入 Ready。",
-        }]
-        await db.commit()
-        raise HTTPException(status_code=400, detail=workflow.blockers_json[0]["message"])
-
-    global_config["_edges"] = (dag_json or workflow.dag_json or {}).get("edges", [])
+    global_config["_goal"] = goal
     global_config["_workflow_id"] = str(workflow_id)
-    global_config["_auto_child_model_map"] = workflow_metadata.get("auto_child_model_map", {})
+    dag_json = workflow.dag_json or {}
 
-    # 3. Persist run record before starting background execution. Dynamic
-    # tasks are inserted from a separate DB session and need this FK visible.
+    # 3. Persist run record before starting background execution
     workflow.lifecycle_phase = "running"
     workflow.blockers_json = []
     run = Run(
@@ -366,10 +135,10 @@ async def trigger_run(
     await db.commit()
     await db.refresh(run)
 
-    # 4. Start execution via LocalDAGExecutor
+    # 4. Start execution via DirectorLoop
     await engine.start_run(
         run_id=str(run_id),
-        dag_json=dag_json or {},
+        dag_json=dag_json,
         global_config=global_config,
         workspace_directory=workspace_directory,
     )
@@ -463,7 +232,7 @@ async def cancel_run(
 
     engine = _require_engine()
 
-    # Cancel via LocalDAGExecutor
+    # Cancel via DirectorLoop
     await engine.cancel(str(run.id))
 
     # Update DB
@@ -479,71 +248,35 @@ async def get_run_diff(
     node_id: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get Git diff for Human-in-the-Loop approval panel.
+    """Get Git diff for the run's shared sandbox.
 
-    Queries the GitCheckpointManager for the diff between the initial
-    checkpoint (before the run started) and the current HEAD of the
-    sandbox used by the specified node (or the last node that executed).
+    Returns the diff from the first checkpoint to the current HEAD.
     """
     engine = _require_engine()
+    checkpoint = engine._checkpoint
 
-    # Find the relevant node to get its sandbox_id and commit history
-    result = await db.execute(
-        select(NodeExecution)
-        .where(NodeExecution.run_id == run_id)
-        .order_by(NodeExecution.started_at.desc())
-    )
-    nodes = result.scalars().all()
-    if not nodes:
-        return {"run_id": str(run_id), "diff": "", "error": "No executed nodes found"}
-
-    # Find the target node or use the most recent one
-    target_node = None
-    if node_id:
-        target_node = next((n for n in nodes if n.node_id == node_id), None)
-    if target_node is None:
-        target_node = nodes[0]
-
-    # Get the commit map from the engine to find the initial and current commits
+    # Find the sandbox from engine run state
     run_state = engine._runs.get(str(run_id))
-    commit_map: dict = {}
-    sandbox_map: dict = {}
-    if run_state and isinstance(run_state, dict):
-        commit_map = run_state.get("_commit_map", {})
-        sandbox_map = run_state.get("_sandbox_map", {})
+    if not run_state:
+        return {"run_id": str(run_id), "diff": "", "error": "Run state not found"}
 
-    # Find the sandbox_id for the target node
-    sandbox_id = sandbox_map.get(target_node.node_id)
-    if not sandbox_id:
-        return {"run_id": str(run_id), "diff": "", "node_id": target_node.node_id}
+    workspace_directory = run_state.get("workspace_directory")
+    if not workspace_directory:
+        return {"run_id": str(run_id), "diff": ""}
 
-    # Get the initial commit (first checkpoint) for this run
-    initial_hash = commit_map.get("_initial")
-    if not initial_hash:
-        # Fallback: get the first commit in the log
-        try:
-            if not hasattr(engine._checkpoint, 'get_log'):
-                log = []
-            else:
-                log = await engine._checkpoint.get_log(
-                    sandbox_id, max_entries=50,
-                )
-            if log:
-                initial_hash = log[-1]["hash"]  # oldest commit
-        except Exception:
-            pass
-
-    if not initial_hash:
-        return {"run_id": str(run_id), "diff": "", "node_id": target_node.node_id}
-
-    # Get diff from initial commit to HEAD
+    # Use the workspace directory to get diff
     try:
-        diff_text = await engine._checkpoint.get_diff(sandbox_id, initial_hash)
+        import asyncio
+        diff_text, _ = await engine._sandbox.exec(
+            # Find the director sandbox for this run
+            list(engine._sandbox._containers.keys())[-1] if engine._sandbox._containers else "",
+            'git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" diff HEAD~5 HEAD 2>/dev/null || git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" diff 2>/dev/null || true',
+        )
     except Exception as exc:
         logger.warning("Failed to get diff for run %s: %s", run_id, exc)
         diff_text = ""
 
-    return {"run_id": str(run_id), "diff": diff_text, "node_id": target_node.node_id}
+    return {"run_id": str(run_id), "diff": diff_text}
 
 
 @router.get("/{run_id}/nodes", response_model=list[NodeExecutionResponse])
@@ -637,10 +370,9 @@ async def rollback_run(
     body: RollbackRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Rollback a run's sandbox to the checkpoint of a specific node.
+    """Rollback a run's workspace to a specific commit.
 
-    Uses GitCheckpointManager.rollback() to restore the workspace
-    files to the state they were in after *node_id* executed.
+    In the Director architecture, this rolls back the shared sandbox.
     """
     engine = _require_engine()
 
@@ -651,47 +383,44 @@ async def rollback_run(
     if run is None:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    # Get the commit_map and sandbox_map from the engine's run state
-    run_state = engine._runs.get(str(run_id))
-    if not run_state:
-        raise HTTPException(status_code=404, detail="Run execution state not found")
+    # Get workspace directory from the run's workflow
+    from app.models.db import Workflow
+    wf_result = await db.execute(
+        select(Workflow).where(Workflow.id == run.workflow_id)
+    )
+    workflow = wf_result.scalar_one_or_none()
+    if not workflow or not workflow.workspace_directory:
+        raise HTTPException(status_code=404, detail="Workflow or workspace not found")
 
-    commit_map: dict = run_state.get("_commit_map", {})
-    sandbox_map: dict = run_state.get("_sandbox_map", {})
+    workspace_path = Path(workflow.workspace_directory).expanduser()
 
-    # Find the commit hash and sandbox for the target node
-    commit_hash = commit_map.get(body.node_id)
-    sandbox_id = sandbox_map.get(body.node_id)
-
-    if not commit_hash:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No checkpoint found for node '{body.node_id}'",
-        )
-    if not sandbox_id:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No sandbox found for node '{body.node_id}'",
-        )
-
-    # Execute rollback
+    # Use git to rollback in the workspace directly
+    import asyncio
     try:
-        await engine._checkpoint.rollback(sandbox_id, commit_hash)
+        commit_hash = body.node_id  # In new arch, node_id field reused for commit hash
+        if not commit_hash:
+            raise HTTPException(status_code=400, detail="Commit hash required")
+
+        proc = await asyncio.create_subprocess_exec(
+            "git", "checkout", commit_hash,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise Exception(stderr.decode(errors="replace"))
     except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=f"Rollback failed: {exc}",
         ) from exc
 
-    logger.info(
-        "Rolled back run %s to node %s (commit %s)",
-        run_id, body.node_id, commit_hash[:12],
-    )
+    logger.info("Rolled back run %s to commit %s", run_id, commit_hash[:12])
 
     return {
         "status": "rolled_back",
         "run_id": str(run_id),
-        "node_id": body.node_id,
         "commit_hash": commit_hash,
         "reason": body.reason,
     }

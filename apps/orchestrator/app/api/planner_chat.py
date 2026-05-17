@@ -396,105 +396,24 @@ async def _call_llm_stream(
 # Extract DAG from assistant message
 # ---------------------------------------------------------------------------
 
-PLANNER_OUTLINE_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
-
-本轮只输出“规划大纲节点”，不要输出完整 planner-spec JSON。
-
-输出必须包含：
-- 给用户看的阶段说明，每个阶段写“阶段名（N 节点）：A → B → C”。
-- 一个 `planner-outline` 代码块，里面按顺序列出节点数组。
-- 每个节点必须有 id/type/label/depends_on。
-
-示例：
-```planner-outline
-[
-  {"id":"explore_requirements","type":"explore","label":"需求探索","depends_on":[]},
-  {"id":"design_architecture","type":"design","label":"架构设计","depends_on":["explore_requirements"]}
-]
-```
-
-硬性规则：
-- 节点类型只允许 explore / design / coder / merge / review / shell。
-- 不要生成 human/人工节点，不要生成顶级 plan/planner 节点。
-- 两个及以上并行 coder 后必须有 merge。
-- 关键 coder/merge 结果后必须有 review。
-- 末尾必须有 shell/test 验证节点。
-- 不确定第三方服务时，用局部 design 节点给下游 coder 明确方案，不要 blocked。
-"""
+PLANNER_OUTLINE_SYSTEM = (
+    "You are the Director of Multi-Agent Studio, the technical lead.\n"
+    "\n"
+    "You are discussing the project goal with the user. Analyze their requirements, "
+    "discuss implementation approaches, and give your recommendations.\n"
+    "\n"
+    "Your responsibilities:\n"
+    "1. Understand what the user wants to achieve\n"
+    "2. Analyze the current state, give feasibility assessment\n"
+    "3. Discuss implementation approaches, highlight key decision points\n"
+    "4. When the approach is clear, summarize the execution plan\n"
+    "\n"
+    "Note: This is for planning discussion only, not for execution. "
+    "When the user clicks 'Start Run', the Director will automatically plan and execute."
+)
 
 
-PLANNER_SPEC_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。
-
-本轮不要调用任何增量建图工具，也不要逐个添加节点。你必须一次性输出一个完整、可解析、可执行的标准规划规格。
-
-只输出一个 fenced JSON 块，代码块语言必须是 `planner-spec`，不要在代码块外输出正文：
-
-```planner-spec
-{
-  "reply": "给用户看的中文规划说明，必须按阶段写出节点数量，例如：基础搭建（3 节点）：A → B → C。",
-  "observable_trace": ["识别目标", "拆解模块", "生成完整 DAG"],
-  "task_object": {
-    "title": "任务标题",
-    "objective": "任务目标",
-    "background": "背景",
-    "constraints": ["约束"],
-    "success_criteria": ["验收标准"],
-    "assumptions": ["默认假设"],
-    "open_questions": []
-  },
-  "project_summary": {
-    "project_type": "项目类型",
-    "tech_stack": ["待 Assess 或已知技术栈"],
-    "startup": ["启动方式"],
-    "build": ["构建方式"],
-    "tests": ["测试方式"],
-    "key_directories": ["关键目录"],
-    "risk_points": ["风险点"],
-    "suggested_next_steps": ["下一步"]
-  },
-  "shared_doc": "# 项目规划\\n\\nMarkdown 项目文档",
-  "dag": {
-    "nodes": [
-      {
-        "id": "explore_requirements",
-        "type": "explore",
-        "label": "需求探索",
-        "prompt": "目标：...\\n具体要求：...\\n产出格式：...\\n验收标准：...",
-        "depends_on": [],
-        "target_files": ["path/to/file.py"],
-        "interface_contract": "GET /api/todos -> [{id, title, done}]",
-        "context_summary": "项目使用 FastAPI + SQLAlchemy，参考 server/routes.py 中现有模式"
-      }
-    ],
-    "edges": [
-      {"source": "explore_requirements", "target": "design_architecture"}
-    ]
-  },
-  "action": {
-    "action": "update_dag",
-    "message": "已生成完整工作流 DAG。",
-    "blockers": []
-  }
-}
-```
-
-硬性规则：
-- 复杂项目必须拆成细粒度的任务，按照任务规划的多个阶段的节点；不要缩水成 2-3 个泛化节点。
-- 节点类型只允许 explore / design / coder / merge / review / shell。
-- 不要生成 human/人工节点，不要生成顶级 plan/planner 节点。
-- design 只是局部方案/接口设计节点，给下游 coder 明确任务；它不能继续规划整套 DAG。
-- 两个及以上并行 coder 后必须有 merge。
-- 关键 coder/merge 结果后必须有 review。
-- 末尾必须有 shell/test 验证节点。
-- 每个 coder/design 节点应输出：
-  - target_files：精确到文件路径，基于项目文件结构中的实际路径。
-  - interface_contract：API 签名/数据结构/函数签名。
-  - context_summary：子 agent 需要的现有代码模式和技术背景。
-- target_files 中的路径必须来自项目文件结构，不要猜测不存在的路径。
-- prompt 必须让子 agent 可直接工作：目标、上下文、具体要求、产出格式、验收标准、边界、协作规则。
-- 不确定支付渠道、第三方服务或技术取舍时，用 design 节点制定可执行默认方案；不要因此 blocked。
-- 每个节点必须有 id/type/label/prompt/depends_on；edges 必须与 depends_on 一致。
-"""
+PLANNER_SPEC_SYSTEM = PLANNER_OUTLINE_SYSTEM
 
 
 def _planner_alignment_tools() -> list[dict]:
@@ -524,86 +443,10 @@ def _planner_alignment_tools() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# New simplified planner: LLM outputs task list, compiler builds DAG
+# Director chat prompt (replaces old planner task system)
 # ---------------------------------------------------------------------------
 
-PLANNER_TASK_SYSTEM = """你是白盒多 Agent 编排系统的顶级 Planner。你负责将用户目标拆解为一组协作任务，每个任务由一个专职 agent 独立执行。所有任务完成后，整体目标必须达成。
-
-规划原则：
-- 像分配团队工作一样思考：每个人负责一块，各司其职，互不重复，最后拼在一起能交付完整结果。
-- 只拆必要的步骤，不为了流程而加流程。改一个按钮颜色只需要一个 coder，不需要 explore → design → review 全套。
-- 并行能加速就并行，有依赖就串行。两个 coder 同时改不冲突的文件可以直接并行，改同一文件则必须串行。
-- 每个 prompt 要写得让执行 agent 拿到就能干活：明确目标、相关上下文、具体要求、什么是完成。
-- 所有任务的产出拼起来要能完整交付用户目标，不能漏掉关键环节。
-
-一次性输出一个 `planner-tasks` fenced JSON 代码块，不要在代码块外输出其他结构化数据。你可以在代码块前写一段简短的自然语言说明。
-
-```planner-tasks
-{
-  "reply": "给用户看的中文规划说明。",
-  "task_object": {
-    "title": "任务标题",
-    "objective": "任务目标",
-    "background": "背景",
-    "constraints": ["约束"],
-    "success_criteria": ["验收标准"]
-  },
-  "project_summary": {
-    "project_type": "项目类型",
-    "tech_stack": ["技术栈"],
-    "startup": ["启动方式"],
-    "build": ["构建方式"],
-    "tests": ["测试方式"],
-    "key_directories": ["关键目录"],
-    "risk_points": ["风险点"]
-  },
-  "shared_doc": "# 项目规划\\n\\nMarkdown 项目文档",
-  "tasks": [
-    {
-      "id": "explore_requirements",
-      "type": "explore",
-      "label": "需求探索",
-      "prompt": "目标：...\\n具体要求：...\\n产出格式：...\\n验收标准：...",
-      "depends_on": [],
-      "target_files": ["path/to/file.py"],
-      "interface_contract": "GET /api/todos -> [{id, title, done}]",
-      "context_summary": "项目使用 FastAPI + SQLAlchemy"
-    },
-    {
-      "id": "design_architecture",
-      "type": "design",
-      "label": "架构设计",
-      "prompt": "...",
-      "depends_on": ["explore_requirements"]
-    },
-    {
-      "id": "implement_feature_a",
-      "type": "coder",
-      "label": "实现功能 A",
-      "prompt": "...",
-      "depends_on": ["design_architecture"]
-    },
-    {
-      "id": "implement_feature_b",
-      "type": "coder",
-      "label": "实现功能 B",
-      "prompt": "...",
-      "depends_on": ["design_architecture"]
-    }
-  ]
-}
-```
-
-格式规则：
-- 任务类型只允许 explore / design / coder / merge / review / shell。
-- 不要生成 human/人工节点，不要生成顶级 plan/planner 节点。
-- 每个任务必须有：id（唯一 snake_case）、type、label、prompt、depends_on（任务 id 列表）。
-- 不要生成 edges 数组、坐标、React Flow 字段——边由 depends_on 自动推导。
-- target_files 路径必须来自项目文件结构中的实际路径。
-- task_object 和 project_summary 为可选字段，不输出时系统自动填充默认值。
-
-重要：请确保 planner-tasks JSON 代码块完整输出，JSON 必须完整闭合。
-"""
+PLANNER_TASK_SYSTEM = PLANNER_OUTLINE_SYSTEM
 
 
 def _extract_task_plan(text: str, fallback_goal: str) -> dict | None:
@@ -888,8 +731,8 @@ def _build_minimal_planner_dag(title: str, objective: str) -> dict:
                 "type": "explore",
                 "label": "梳理需求与现状",
                 "prompt": (
-                    f"目标：围绕“{title}”梳理需求与当前上下文。\n"
-                    f"上下文：用户当前目标是“{objective}”。\n"
+                    f"目标：围绕'{title}'梳理需求与当前上下文。\n"
+                    f"上下文：用户当前目标是'{objective}'。\n"
                     "具体要求：总结关键范围、前置依赖、潜在风险和推荐切入点。\n"
                     "产出格式：research_note。\n"
                     "验收标准：给出明确的实施边界和后续编码输入。"
@@ -901,8 +744,8 @@ def _build_minimal_planner_dag(title: str, objective: str) -> dict:
                 "type": "coder",
                 "label": "实现核心改动",
                 "prompt": (
-                    f"目标：基于需求梳理结果，完成“{title}”的核心实现。\n"
-                    f"上下文：围绕用户目标“{objective}”落地最小闭环。\n"
+                    f"目标：基于需求梳理结果，完成'{title}'的核心实现。\n"
+                    f"上下文：围绕用户目标'{objective}'落地最小闭环。\n"
                     "具体要求：优先完成最核心的代码或配置改动，并记录关键变更点。\n"
                     "产出格式：file_change。\n"
                     "验收标准：产出可集成、可验证，不越权修改无关模块。"
@@ -914,7 +757,7 @@ def _build_minimal_planner_dag(title: str, objective: str) -> dict:
                 "type": "review",
                 "label": "审查结果与风险",
                 "prompt": (
-                    f"目标：审查“{title}”本轮实现结果。\n"
+                    f"目标：审查'{title}'本轮实现结果。\n"
                     "具体要求：检查功能闭环、明显回归风险、缺失验证项和需要补充的后续工作。\n"
                     "产出格式：review_report。\n"
                     "验收标准：指出高风险问题或确认当前草案可继续推进。"
@@ -1034,8 +877,8 @@ def _build_outline_based_dag(outline: str, title: str, objective: str) -> dict |
                 "type": node_type,
                 "label": label[:80],
                 "prompt": (
-                    f"目标：完成“{label}”。\n"
-                    f"上下文：这是“{title}”规划中“{phase_title}”阶段的子任务；整体目标是“{objective}”。\n"
+                    f"目标：完成'{label}'。\n"
+                    f"上下文：这是'{title}'规划中'{phase_title}'阶段的子任务；整体目标是'{objective}'。\n"
                     "具体要求：按当前项目结构定位相关文件或模块，完成该子任务所需的实现、配置或验证，并记录关键产物。\n"
                     "产出格式：给出变更摘要、涉及文件、验证方式和阻塞项。\n"
                     "验收标准：该子任务可被下游节点继续使用，且不越权修改无关范围。"
@@ -1304,8 +1147,8 @@ def _extract_outline_dag(text: str, title: str, objective: str) -> dict | None:
                     "type": str(item.get("type") or _infer_node_type_from_id(str(item.get("id")))),
                     "label": str(item.get("label") or _label_from_node_id(str(item.get("id")), text)),
                     "prompt": (
-                        f"目标：完成“{item.get('label') or item.get('id')}”。\n"
-                        f"上下文：这是“{title}”规划大纲中的子 agent 节点；整体目标是“{objective}”。\n"
+                        f"目标：完成'{item.get('label') or item.get('id')}'。\n"
+                        f"上下文：这是'{title}'规划大纲中的子 agent 节点；整体目标是'{objective}'。\n"
                         "具体要求：读取上游节点产物，按当前项目结构完成本节点职责；不要重新规划整个 DAG。\n"
                         "产出格式：说明完成内容、涉及文件、验证方式、风险和阻塞项。\n"
                         "验收标准：产物可被下游节点直接消费，且边界清晰。"
@@ -1467,8 +1310,8 @@ def _build_dag_from_planned_ids(text: str, title: str, objective: str) -> dict |
             "type": node_type,
             "label": label,
             "prompt": (
-                f"目标：完成“{label}”。\n"
-                f"上下文：这是“{title}”规划中的 {node_type} 子 agent 节点；整体目标是“{objective}”。\n"
+                f"目标：完成'{label}'。\n"
+                f"上下文：这是'{title}'规划中的 {node_type} 子 agent 节点；整体目标是'{objective}'。\n"
                 "具体要求：读取上游节点产物，按当前项目结构完成本节点职责；不要重新规划整个 DAG。\n"
                 "产出格式：说明完成内容、涉及文件、验证方式、风险和阻塞项。\n"
                 "验收标准：产物可被下游节点直接消费，且边界清晰。"
@@ -1825,7 +1668,7 @@ def _alignment_visible_summary(stage_label: str, alignment: dict, current_count:
     message = str(alignment.get("message") or "").strip()
     missing_items = alignment.get("missing_items") if isinstance(alignment.get("missing_items"), list) else []
     lines = [
-        f"{stage_label}",
+        f'{stage_label}',
         f"- aligned: {str(aligned).lower()}",
         f"- current_nodes: {current_count}",
     ]
@@ -2249,14 +2092,14 @@ async def planner_chat(
     if workflow.project_summary_json:
         messages[-1]["content"] += (
             "\n\n## 项目现状摘要\n"
-            f"{json.dumps(workflow.project_summary_json, ensure_ascii=False, indent=2)}"
+            f'{json.dumps(workflow.project_summary_json, ensure_ascii=False, indent=2)}'
         )
 
     metadata = existing_dag.get("metadata", {}) if isinstance(existing_dag.get("metadata"), dict) else {}
     if isinstance(metadata.get("planner_ui_state"), dict):
         messages[-1]["content"] += (
             "\n\n## 当前左侧面板结构化状态\n"
-            f"{json.dumps(metadata['planner_ui_state'], ensure_ascii=False, indent=2)}"
+            f'{json.dumps(metadata['planner_ui_state'], ensure_ascii=False, indent=2)}'
         )
 
     # 4.6. Inject workspace file tree so planner references real paths
@@ -2457,13 +2300,46 @@ async def planner_chat(
         # STAGE 2: compile_dag — deterministic compiler converts tasks → DAG
         # =====================================================================
         yield _sse({"type": "planner_stage_status", "stage": "compile_dag", "message": "正在编译任务列表为 DAG"})
-        from app.workflows.task_compiler import compile_task_list_to_dag
+        try:
+            from app.workflows.task_compiler import compile_task_list_to_dag
+        except ImportError:
+            compile_task_list_to_dag = None
 
         tasks_list = task_plan.get("tasks") or []
         title = str((draft_state.get("task_object") or {}).get("title") or workflow_goal)
         objective = str((draft_state.get("task_object") or {}).get("objective") or workflow_goal)
 
-        compiled_dag, compile_blockers = compile_task_list_to_dag(tasks_list, title, objective)
+        if compile_task_list_to_dag:
+            compiled_dag, compile_blockers = compile_task_list_to_dag(tasks_list, title, objective)
+        else:
+            # Fallback: create DAG from the task plan (fields: id, type, label, prompt, depends_on)
+            nodes = []
+            edges = []
+            node_id_set: set[str] = set()
+            type_aliases = {"code": "coder", "coding": "coder", "implement": "coder", "dev": "coder",
+                            "explore": "explore", "research": "explore", "scout": "explore",
+                            "review": "review", "test": "shell", "testing": "shell",
+                            "design": "design", "plan": "design", "merge": "merge"}
+            for i, task in enumerate(tasks_list):
+                task_id = str(task.get("id") or f"task-{i+1}").strip()
+                raw_type = str(task.get("type") or "coder").strip().lower()
+                resolved_type = type_aliases.get(raw_type, raw_type if raw_type in {"coder", "explore", "review", "shell", "design", "merge"} else "coder")
+                task_label = task.get("label") or task.get("title") or f"Task {i+1}"
+                task_prompt = task.get("prompt") or task.get("description") or ""
+                node_id_set.add(task_id)
+                nodes.append({
+                    "id": task_id,
+                    "type": resolved_type,
+                    "label": task_label,
+                    "prompt": task_prompt,
+                    "depends_on": task.get("depends_on") if isinstance(task.get("depends_on"), list) else [],
+                })
+            for node in nodes:
+                for dep in node.get("depends_on", []):
+                    if dep in node_id_set:
+                        edges.append({"source": dep, "target": node["id"]})
+            compiled_dag = {"nodes": nodes, "edges": edges}
+            compile_blockers = []
 
         # Normalize with existing function for model assignments
         dag = _normalize_dag(compiled_dag)

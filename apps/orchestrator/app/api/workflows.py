@@ -23,7 +23,6 @@ from app.models.schemas import (
     UpdateWorkflowRequest,
     WorkflowResponse,
 )
-from app.workflows.compiler import compile_dag
 
 router = APIRouter()
 
@@ -153,13 +152,6 @@ async def create_workflow(
     db: AsyncSession = Depends(get_db),
 ):
     """Create workflow from React Flow JSON."""
-    # Validate DAG if provided
-    if body.dag_json is not None:
-        try:
-            compile_dag(body.dag_json)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
     workflow = Workflow(
         name=body.name,
         description=body.description,
@@ -230,14 +222,6 @@ async def update_workflow(
     workflow = result.scalar_one_or_none()
     if workflow is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
-
-    # Validate DAG if being updated
-    new_dag = body.dag_json if body.dag_json is not None else workflow.dag_json
-    if new_dag is not None:
-        try:
-            compile_dag(new_dag)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     if body.name is not None:
         workflow.name = body.name

@@ -20,6 +20,7 @@ interface ChatMessage {
   role: "user" | "assistant";
   content: string;
   dag?: DagData | null;
+  thinking?: string;
 }
 
 interface DagData {
@@ -231,6 +232,7 @@ export default function PlannerChat() {
 
       const decoder = new TextDecoder();
       let assistantContent = "";
+      let thinkingContent = "";
       let latestDag: DagData | null = null;
 
       setMessages((prev) => [...prev, { role: "assistant", content: "" }]);
@@ -251,7 +253,19 @@ export default function PlannerChat() {
           try {
             const event = JSON.parse(data);
 
-            if (event.type === "text") {
+            if (event.type === "thinking_delta") {
+              thinkingContent += event.content || "";
+              setMessages((prev) => {
+                const updated = [...prev];
+                if (updated.length > 0 && updated[updated.length - 1].role === "assistant") {
+                  updated[updated.length - 1] = {
+                    ...updated[updated.length - 1],
+                    thinking: thinkingContent,
+                  };
+                }
+                return updated;
+              });
+            } else if (event.type === "text") {
               assistantContent += event.content;
               setStreamingChars(assistantContent.length);
               const parsed = parsePlannerObservableContent(assistantContent);
@@ -263,6 +277,7 @@ export default function PlannerChat() {
                   updated[updated.length - 1] = {
                     ...updated[updated.length - 1],
                     content: parsed.visibleContent,
+                    thinking: thinkingContent || undefined,
                   };
                 }
                 return updated;
@@ -452,6 +467,17 @@ export default function PlannerChat() {
                   : "bg-gray-50 text-gray-800 border border-gray-100"
               }`}
             >
+              {/* Thinking content */}
+              {msg.role === "assistant" && msg.thinking?.trim() && (
+                <details className="mb-2 rounded-lg border border-blue-100 bg-blue-50/50 text-xs">
+                  <summary className="cursor-pointer px-3 py-1.5 text-blue-600 font-medium select-none">
+                    思考过程
+                  </summary>
+                  <div className="px-3 pb-2 text-blue-900 whitespace-pre-wrap leading-relaxed max-h-60 overflow-y-auto">
+                    {msg.thinking.trim()}
+                  </div>
+                </details>
+              )}
               {/* Render text content */}
               <MarkdownMessage
                 content={msg.role === "assistant" ? parsePlannerObservableContent(msg.content).visibleContent : msg.content}

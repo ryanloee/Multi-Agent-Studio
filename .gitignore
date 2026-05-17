@@ -59,3 +59,4 @@ htmlcov/
 # Runtime data with secrets
 apps/data/
 .pid/
+CLAUDE.md

@@ -217,64 +217,37 @@ async def restart_task(
                     break
 
         if node_config:
-            from app.core.task_scheduler import ManagedTask, PROGRESS_MARKER
+            from app.core.node_runner import NodeRunner
 
             node_data = node_config.get("data", {}) or {}
-            managed = ManagedTask(
-                db_id=str(task.id),
-                run_id=str(run_id),
-                title=task.title,
-                description=task.description,
-                status="assigned",
-                assigned_node_id=node_id,
-                assigned_worker_label=task.assigned_worker_label or node_id,
-            )
 
-            # Build worker node from the stored node config
             worker_prompt = node_data.get("prompt", "") or task.description or task.title
-            worker_prompt += (
-                f"\n\n---\nTask ID: {node_id}\n"
-                f"To report progress, output a line:\n"
-                f"{PROGRESS_MARKER} <0-100>\n"
-            )
-
-            worker_node = {
-                "id": node_id,
-                "agent_type": node_data.get("agentType", "coder"),
-                "model_provider": node_data.get("modelProvider", ""),
-                "model_id": node_data.get("modelId", ""),
-                "prompt": worker_prompt,
-            }
 
             cancel_event = asyncio.Event()
+            node_runner = _engine._node_runner if hasattr(_engine, '_node_runner') else None
 
             # Start execution in background
             async def _run_task():
-                from app.core.task_scheduler import TaskScheduler
-                scheduler = TaskScheduler(
-                    sandbox=_engine._sandbox,
-                    event_bus=_event_bus,
-                    checkpoint=_engine._checkpoint,
-                    provisioner=_engine._provisioner,
-                    execute_node_fn=_engine._execute_node,
-                    emit_fn=_engine._emit,
-                )
-                result = await scheduler.run_worker_task(
-                    worker_node=worker_node,
-                    task=managed,
-                    global_config={"_workflow_id": str(run_obj.workflow_id) if run_obj else ""},
+                if node_runner is None:
+                    return
+                result = await node_runner.execute_node(
+                    run_id=str(run_id),
+                    node_id=node_id,
+                    agent_type=node_data.get("agentType", "coder"),
+                    prompt=worker_prompt,
                     cancel_event=cancel_event,
+                    model_provider=node_data.get("modelProvider", ""),
+                    model_id=node_data.get("modelId", ""),
                 )
-                if result.get("state") == "completed":
-                    await _engine._create_artifact_for_task(
-                        run_id=str(run_id),
-                        workflow_id=await _engine._get_run_workflow_id(str(run_id)),
-                        task_id=str(task.id),
-                        node_id=node_id,
-                        agent_type=worker_node.get("agent_type", "coder"),
-                        title=task.title,
-                        result=result,
-                    )
+                # Update task status from result
+                from app.core.database import async_session_factory
+                from app.models.task import Task as TaskModel
+                async with async_session_factory() as session:
+                    t = await session.get(TaskModel, task.id)
+                    if t:
+                        t.status = "completed" if result.state == "completed" else "failed"
+                        t.result_summary = result.result_summary[:500] if result.result_summary else result.error[:500]
+                        await session.commit()
 
             asyncio.create_task(_run_task(), name=f"restart-{task_id}")
 
@@ -331,64 +304,33 @@ async def assign_task(
 
     # If the engine is available, start the task execution in the background
     if _engine and _event_bus and body.prompt:
-        from app.core.task_scheduler import ManagedTask, PROGRESS_MARKER
-
-        managed = ManagedTask(
-            db_id=str(task.id),
-            run_id=str(run_id),
-            title=task.title,
-            description=task.description,
-            status="assigned",
-            assigned_node_id=body.node_id,
-            assigned_worker_label=body.node_label or body.node_id,
-        )
-
-        # Build worker node from the assignment request
         worker_prompt = body.prompt
-        worker_prompt += (
-            f"\n\n---\nTask ID: {body.node_id}\n"
-            f"To report progress, output a line:\n"
-            f"{PROGRESS_MARKER} <0-100>\n"
-        )
-
-        worker_node = {
-            "id": body.node_id,
-            "agent_type": body.agent_type or "coder",
-            "model_provider": body.model_provider or "",
-            "model_id": body.model_id or "",
-            "prompt": worker_prompt,
-        }
 
         cancel_event = asyncio.Event()
+        node_runner = _engine._node_runner if hasattr(_engine, '_node_runner') else None
 
         # Start execution in background
         async def _run_task():
-            from app.core.task_scheduler import TaskScheduler
-            scheduler = TaskScheduler(
-                sandbox=_engine._sandbox,
-                event_bus=_event_bus,
-                checkpoint=_engine._checkpoint,
-                provisioner=_engine._provisioner,
-                execute_node_fn=_engine._execute_node,
-                emit_fn=_engine._emit,
-            )
-            workflow_id = await _engine._get_run_workflow_id(str(run_id))
-            result = await scheduler.run_worker_task(
-                worker_node=worker_node,
-                task=managed,
-                global_config={"_workflow_id": workflow_id or ""},
+            if node_runner is None:
+                return
+            result = await node_runner.execute_node(
+                run_id=str(run_id),
+                node_id=body.node_id,
+                agent_type=body.agent_type or "coder",
+                prompt=worker_prompt,
                 cancel_event=cancel_event,
+                model_provider=body.model_provider or "",
+                model_id=body.model_id or "",
             )
-            if result.get("state") == "completed":
-                await _engine._create_artifact_for_task(
-                    run_id=str(run_id),
-                    workflow_id=workflow_id,
-                    task_id=str(task.id),
-                    node_id=body.node_id,
-                    agent_type=worker_node.get("agent_type", "coder"),
-                    title=task.title,
-                    result=result,
-                )
+            # Update task status from result
+            from app.core.database import async_session_factory
+            from app.models.task import Task as TaskModel
+            async with async_session_factory() as session:
+                t = await session.get(TaskModel, task.id)
+                if t:
+                    t.status = "completed" if result.state == "completed" else "failed"
+                    t.result_summary = result.result_summary[:500] if result.result_summary else result.error[:500]
+                    await session.commit()
 
         asyncio.create_task(_run_task(), name=f"assign-{task_id}")
 

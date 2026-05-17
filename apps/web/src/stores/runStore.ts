@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { useMemo } from "react";
 import type { RunStatus } from "@/types/workflow";
-import type { StreamEvent, StreamEventType, StatusEvent, ChildCreatedEvent, ChildCompletedEvent } from "@/types/events";
+import type { StreamEvent, StreamEventType, StatusEvent, ChildCreatedEvent, ChildCompletedEvent, DirectorDecisionEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -18,6 +18,8 @@ interface RunState {
   parentChildMap: Record<string, string[]>;
   /** Progress summary from DAG execution */
   progressSummary: { total: number; completed: number; failed: number } | null;
+  /** Director dispatch decisions for timeline display */
+  directorDecisions: DirectorDecisionEvent[];
 
   // Actions
   setRunId: (id: string | null) => void;
@@ -125,6 +127,11 @@ function _applyEvents(events: StreamEvent[]) {
       newProgressSummary = { total: ps.total, completed: ps.completed, failed: ps.failed };
     }
 
+    // -- director_decision --
+    if (event.type === "director_decision") {
+      // Handled below in state update
+    }
+
     // -- infer running from activity events --
     if (event.node_id) {
       const cur = newNodeStatuses[event.node_id];
@@ -135,12 +142,19 @@ function _applyEvents(events: StreamEvent[]) {
     }
   }
 
+  const directorDecisions = events.filter(
+    (e): e is DirectorDecisionEvent => e.type === "director_decision",
+  );
+
   useRunStore.setState({
     events: [...state.events, ...events],
     status: newStatus,
     nodeStatuses: mutatedStatuses ? newNodeStatuses : state.nodeStatuses,
     parentChildMap: mutatedParentChild ? newParentChildMap : state.parentChildMap,
     progressSummary: newProgressSummary,
+    directorDecisions: directorDecisions.length > 0
+      ? [...state.directorDecisions, ...directorDecisions]
+      : state.directorDecisions,
   });
 }
 
@@ -181,6 +195,7 @@ export const useRunStore = create<RunState>((set, get) => ({
   selectedRunNodeId: null,
   parentChildMap: {},
   progressSummary: null,
+  directorDecisions: [],
 
   setRunId: (id) => set({ runId: id }),
 
@@ -231,7 +246,7 @@ export const useRunStore = create<RunState>((set, get) => ({
       cancelAnimationFrame(_flushRaf);
       _flushRaf = null;
     }
-    set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {}, progressSummary: null });
+    set({ events: [], nodeStatuses: {}, selectedRunNodeId: null, parentChildMap: {}, progressSummary: null, directorDecisions: [] });
   },
 
   setNodeStatus: (nodeId: string, status: RunStatus) => {

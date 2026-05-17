@@ -40,7 +40,8 @@ from app.api.workflows import router as workflows_router
 from app.config import settings
 from app.core.database import engine as db_engine
 from app.core.local_bus import InProcessEventBus
-from app.core.local_engine import LocalDAGExecutor
+from app.core.director_loop import DirectorLoop
+from app.core.node_runner import NodeRunner
 from app.core.local_sandbox import LocalSandbox
 from app.models.db import Base
 from app.models.task import Artifact, Task, TaskMessage  # noqa: F401 — ensure tables are registered
@@ -165,17 +166,24 @@ async def lifespan(app: FastAPI):
     checkpoint = GitCheckpointManager(sandbox)
     provisioner = SandboxProvisioner(sandbox)
 
-    # DAG executor (replaces Temporal)
-    dag_executor = LocalDAGExecutor(
+    # Node runner + Director loop (replaces DAG executor)
+    node_runner = NodeRunner(
         sandbox=sandbox,
         event_bus=event_bus,
         checkpoint=checkpoint,
         provisioner=provisioner,
     )
-    init_runs_engine(dag_executor)
-    init_tasks_deps(dag_executor, event_bus)
-    logger.info("Local DAG executor initialised (no Docker/Temporal/Redis)")
-    await dag_executor.recover_interrupted_runs()
+    director_loop = DirectorLoop(
+        sandbox=sandbox,
+        event_bus=event_bus,
+        checkpoint=checkpoint,
+        provisioner=provisioner,
+        node_runner=node_runner,
+    )
+    init_runs_engine(director_loop)
+    init_tasks_deps(director_loop, event_bus)
+    logger.info("Director loop engine initialised (no Docker/Temporal/Redis)")
+    await director_loop.recover_interrupted_runs()
 
     yield
 

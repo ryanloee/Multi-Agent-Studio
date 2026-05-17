@@ -27,7 +27,7 @@ import type {
   PlannerStage,
   WorkflowDetail,
 } from "@/types/api";
-import { NODE_META, VALID_CONNECTIONS } from "@/lib/constants";
+import { NODE_META } from "@/lib/constants";
 import { translations } from "@/lib/i18n";
 import { useLocaleStore } from "./localeStore";
 import { api } from "@/lib/api";
@@ -445,47 +445,9 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     });
   },
 
-  // ---- Connection with validation ----
-  onConnect: (connection: Connection) => {
-    const { nodes, edges } = get();
-
-    // Look up source and target node types
-    const sourceNode = nodes.find((n) => n.id === connection.source);
-    const targetNode = nodes.find((n) => n.id === connection.target);
-
-    if (!sourceNode || !targetNode) return;
-
-    // Check against VALID_CONNECTIONS whitelist
-    const allowed = VALID_CONNECTIONS.some(
-      (rule) =>
-        rule.source === sourceNode.type &&
-        rule.target === targetNode.type
-    );
-
-    if (!allowed) return;
-
-    // Prevent duplicate edges
-    const duplicate = edges.some(
-      (edge) =>
-        edge.source === connection.source &&
-        edge.target === connection.target
-    );
-    if (duplicate) return;
-
-    const newEdge: WorkflowEdge = {
-      id: `e_${connection.source}-${connection.target}`,
-      source: connection.source,
-      target: connection.target,
-      data: {
-        transfer_files: true,
-        transfer_summary: true,
-        transfer_format: "summary",
-      },
-      ...(connection.sourceHandle && { sourceHandle: connection.sourceHandle }),
-      ...(connection.targetHandle && { targetHandle: connection.targetHandle }),
-    };
-
-    set({ edges: [...edges, newEdge] });
+  // ---- Connection (no-op in Director architecture) ----
+  onConnect: (_connection: Connection) => {
+    // No longer needed — Director manages dispatch, not user-wired edges
   },
 
   // ---- Edge configuration ----

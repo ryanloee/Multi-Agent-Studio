@@ -327,7 +327,7 @@ function Start-Services {
     $backendLog = Join-Path $LogDir "orchestrator.log"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = "cmd.exe"
-    $psi.Arguments = "/c cd /d `"$ProjectRoot\apps\orchestrator`" && `"$PoetryExe`" run python -m app.main > `"$backendLog`" 2>&1"
+    $psi.Arguments = "/c cd /d `"$ProjectRoot\apps\orchestrator`" && `"$PoetryExe`" run uvicorn app.main:app --host 0.0.0.0 --port 8000 --log-level info > `"$backendLog`" 2>&1"
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi.CreateNoWindow = $true
     $psi.UseShellExecute = $false
@@ -356,16 +356,25 @@ function Start-Services {
     # Quick health check (1 attempt, don't block)
     Start-Sleep -Seconds 3
 
+    # Get LAN IP for display
+    $lanIp = "0.0.0.0"
+    try {
+        $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+            Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.IPAddress -ne '127.0.0.1' } |
+            Select-Object -First 1 -ExpandProperty IPAddress)
+        if (-not $lanIp) { $lanIp = "0.0.0.0" }
+    } catch {}
+
     $health = curl.exe -s http://localhost:8000/health 2>$null
     if ($health -match "ok") {
-        Write-Host "  Backend:  OK  http://localhost:8000" -ForegroundColor Green
+        Write-Host "  Backend:  OK  http://${lanIp}:8000" -ForegroundColor Green
     } else {
         Write-Host "  Backend:  starting... see logs\orchestrator.log" -ForegroundColor Yellow
     }
 
     $feCode = curl.exe -s -o nul -w "%{http_code}" "http://localhost:3000" 2>$null
     if ($feCode -match "200|307") {
-        Write-Host "  Frontend: OK  http://localhost:3000" -ForegroundColor Green
+        Write-Host "  Frontend: OK  http://${lanIp}:3000" -ForegroundColor Green
     } else {
         Write-Host "  Frontend: starting... see logs\frontend.log" -ForegroundColor Yellow
     }
