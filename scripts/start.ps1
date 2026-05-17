@@ -1,7 +1,8 @@
-# Multi-Agent Studio - Start / Stop Services
+# Multi-Agent Studio - Start / Stop / Restart Services
 # Usage:
 #   .\scripts\start.ps1          # Start services
 #   .\scripts\start.ps1 stop     # Stop services
+#   .\scripts\start.ps1 restart  # Restart services
 
 param(
     [string]$Action = "start"
@@ -12,7 +13,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $ProjectRoot = Split-Path -Parent $ScriptDir
 $LogDir = Join-Path $ProjectRoot "logs"
-$Ports = @(8000, 3000)
+$Ports = @(8000, 3100)
 $PidDir = Join-Path $ProjectRoot ".pid"
 
 # ---------------------------------------------------------------------------
@@ -335,15 +336,15 @@ function Start-Services {
     Write-Host "    cmd.exe PID=$($backendProc.Id)" -ForegroundColor DarkGray
     Set-Content -Path (Join-Path $PidDir "backend.pid") -Value $backendProc.Id -Force
 
-    # Start frontend
-    Write-Host "  Starting frontend (port 3000)..." -ForegroundColor Gray
+    # Start frontend (port 3100 — 3000 is blocked by Hyper-V reservation on some systems)
+    Write-Host "  Starting frontend (port 3100)..." -ForegroundColor Gray
     $frontendLog = Join-Path $LogDir "frontend.log"
     $pnpm = (Get-Command pnpm -ErrorAction SilentlyContinue).Source
     $devCmd = if ($pnpm) { "pnpm dev" } else { "npm run dev" }
 
     $psi2 = New-Object System.Diagnostics.ProcessStartInfo
     $psi2.FileName = "cmd.exe"
-    $psi2.Arguments = "/c cd /d `"$ProjectRoot\apps\web`" && $devCmd > `"$frontendLog`" 2>&1"
+    $psi2.Arguments = "/c cd /d `"$ProjectRoot\apps\web`" && set PORT=3100&& $devCmd > `"$frontendLog`" 2>&1"
     $psi2.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
     $psi2.CreateNoWindow = $true
     $psi2.UseShellExecute = $false
@@ -357,31 +358,37 @@ function Start-Services {
     Start-Sleep -Seconds 3
 
     # Get LAN IP for display
-    $lanIp = "0.0.0.0"
+    $lanIp = "localhost"
     try {
-        $lanIp = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
             Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.IPAddress -ne '127.0.0.1' } |
             Select-Object -First 1 -ExpandProperty IPAddress)
-        if (-not $lanIp) { $lanIp = "0.0.0.0" }
+        if ($ip) { $lanIp = $ip }
     } catch {}
 
     $health = curl.exe -s http://localhost:8000/health 2>$null
     if ($health -match "ok") {
-        Write-Host "  Backend:  OK  http://${lanIp}:8000" -ForegroundColor Green
+        Write-Host "  Backend:  OK" -ForegroundColor Green
     } else {
         Write-Host "  Backend:  starting... see logs\orchestrator.log" -ForegroundColor Yellow
     }
 
-    $feCode = curl.exe -s -o nul -w "%{http_code}" "http://localhost:3000" 2>$null
+    $feCode = curl.exe -s -o nul -w "%{http_code}" "http://localhost:3100" 2>$null
     if ($feCode -match "200|307") {
-        Write-Host "  Frontend: OK  http://${lanIp}:3000" -ForegroundColor Green
+        Write-Host "  Frontend: OK" -ForegroundColor Green
     } else {
         Write-Host "  Frontend: starting... see logs\frontend.log" -ForegroundColor Yellow
     }
 
     Write-Host ""
-    Write-Host "Logs: $LogDir\" -ForegroundColor Gray
-    Write-Host "Stop: .\scripts\start.ps1 stop" -ForegroundColor Gray
+    Write-Host "  -----------------------------------------------" -ForegroundColor Cyan
+    Write-Host "    Local:  http://localhost:3100" -ForegroundColor White
+    Write-Host "    LAN:    http://${lanIp}:3100" -ForegroundColor White
+    Write-Host "    API:    http://${lanIp}:8000/docs" -ForegroundColor White
+    Write-Host "  -----------------------------------------------" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  Logs: $LogDir\" -ForegroundColor Gray
+    Write-Host "  Stop: .\scripts\start.ps1 stop" -ForegroundColor Gray
 }
 
 # ---------------------------------------------------------------------------
@@ -389,6 +396,11 @@ function Start-Services {
 # ---------------------------------------------------------------------------
 if ($Action -eq "stop") {
     Stop-Services
+} elseif ($Action -eq "restart") {
+    Write-Host "=== Restarting Multi-Agent Studio ===" -ForegroundColor Cyan
+    Stop-Services
+    Start-Sleep -Seconds 1
+    Start-Services
 } else {
     Start-Services
 }

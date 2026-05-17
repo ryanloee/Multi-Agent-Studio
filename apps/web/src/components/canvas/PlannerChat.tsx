@@ -6,6 +6,7 @@ import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
+import { useSettingsStore } from "@/stores/settingsStore";
 import { api } from "@/lib/api";
 import { authHeaders } from "@/lib/auth";
 import { parsePlannerObservableContent } from "@/lib/plannerObservable";
@@ -341,6 +342,14 @@ export default function PlannerChat() {
   const syncDagToStore = useCallback((dag: DagData) => {
     const store = useWorkflowStore.getState();
     const autoChildModelMap = store.autoChildModelMap ?? {};
+    const enabledModels = useSettingsStore.getState().settings.models?.filter(
+      (m: { enabled?: boolean }) => m.enabled !== false,
+    ) ?? [];
+    const enabledKeys = new Set(
+      enabledModels.map((m: { format?: string; default_model?: string; name?: string }) =>
+        `${m.format}/${m.default_model || m.name}`,
+      ),
+    );
     // Clear existing dynamic nodes (keep only user-created ones)
     // For auto mode, all nodes are planner-created
     const existingById = new Map(store.nodes.map((node) => [node.id, node]));
@@ -351,6 +360,11 @@ export default function PlannerChat() {
       const modelParts = strategyModel.split("/", 2);
       const strategyProvider = modelParts.length > 1 ? modelParts[0] : "";
       const strategyModelId = modelParts.length > 1 ? modelParts[1] : strategyModel;
+      // Use existing model only if it's still enabled; otherwise fall back to strategy
+      const existingProvider = existing?.data?.modelProvider || "";
+      const existingModelId = existing?.data?.modelId || "";
+      const existingKey = `${existingProvider}/${existingModelId}`;
+      const useExisting = existingProvider && existingModelId && enabledKeys.has(existingKey);
       return {
         id: n.id,
         type: n.type,
@@ -358,8 +372,8 @@ export default function PlannerChat() {
         data: {
           label: n.label || style.label,
           agentType: n.type,
-          modelProvider: existing?.data?.modelProvider || strategyProvider,
-          modelId: existing?.data?.modelId || strategyModelId,
+          modelProvider: useExisting ? existingProvider : strategyProvider,
+          modelId: useExisting ? existingModelId : strategyModelId,
           prompt: n.prompt || "",
           permissions: {},
           command: "",

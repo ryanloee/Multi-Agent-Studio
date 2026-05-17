@@ -434,4 +434,19 @@ export const api = {
   /** Load persisted chat history for a workflow + node */
   getChatHistory: (workflowId: string, nodeId: string = "planner"): Promise<import("@/types/settings").ChatHistoryItem[]> =>
     request<import("@/types/settings").ChatHistoryItem[]>(`/planner/history/${workflowId}?node_id=${nodeId}`),
+
+  // ---- Debug Logs ----
+
+  /** Fetch recent debug log entries */
+  getDebugLogs: (params: { lines?: number; level?: string }): Promise<import("@/types/settings").DebugLogResponse> =>
+    request<import("@/types/settings").DebugLogResponse>("/settings/debug-logs", {
+      method: "POST",
+      body: JSON.stringify({ lines: params.lines ?? 200, level: params.level ?? "" }),
+    }),
+
+  /** Clear debug logs */
+  clearDebugLogs: (): Promise<{ success: boolean }> =>
+    request<{ success: boolean }>("/settings/debug-logs/clear", {
+      method: "POST",
+    }),
 };

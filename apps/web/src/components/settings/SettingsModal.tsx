@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import {
   X,
   Settings,
@@ -19,6 +19,12 @@ import {
   WifiOff,
   Play,
   Layers,
+  ToggleLeft,
+  ToggleRight,
+  Bug,
+  RefreshCw,
+  Trash,
+  FileText,
 } from "lucide-react";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { useLocaleStore } from "@/stores/localeStore";
@@ -35,6 +41,7 @@ const TABS: { key: SettingsTab; icon: typeof Globe; labelKey: string }[] = [
   { key: "display", icon: Monitor, labelKey: "settings.tabDisplay" },
   { key: "models", icon: Cpu, labelKey: "settings.tabModels" },
   { key: "strategy", icon: Layers, labelKey: "settings.tabStrategy" },
+  { key: "debug", icon: Bug, labelKey: "settings.tabDebug" },
 ];
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -173,6 +180,7 @@ export default function SettingsModal() {
             )}
             {activeTab === "models" && <ModelsTab />}
             {activeTab === "strategy" && <ModelStrategyTab />}
+            {activeTab === "debug" && <DebugTab />}
           </div>
 
           <div className="px-6 py-4 border-t border-gray-100 flex items-center justify-between bg-gray-50/50">
@@ -446,6 +454,7 @@ function ModelsTab() {
         default_model: modelName,
         context_window: normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024),
         max_output_tokens: normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256),
+        enabled: true,
       });
       existingIds.add(dedupeKey);
     }
@@ -467,6 +476,7 @@ function ModelsTab() {
       default_model: customModelName.trim(),
       context_window: normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024),
       max_output_tokens: normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256),
+      enabled: true,
     });
     setCustomModelName("");
   }, [customModelName, formFormat, formBaseUrl, formApiKey, formContextWindow, formMaxOutputTokens, addModel]);
@@ -743,7 +753,11 @@ function ModelsTab() {
               return (
                 <div
                   key={model.id}
-                  className="p-3 rounded-lg border border-gray-200 bg-white hover:border-gray-300 transition-colors"
+                  className={`p-3 rounded-lg border transition-colors ${
+                    !model.enabled
+                      ? 'border-gray-100 bg-gray-50 opacity-60'
+                      : 'border-gray-200 bg-white hover:border-gray-300'
+                  }`}
                 >
                   <div className="flex items-center gap-2">
                     <span
@@ -755,12 +769,24 @@ function ModelsTab() {
                     >
                       {model.format.toUpperCase()}
                     </span>
-                    <span className="text-sm font-medium text-gray-800 truncate">
+                    <span className={`text-sm font-medium truncate ${!model.enabled ? 'text-gray-400 line-through' : 'text-gray-800'}`}>
                       {model.name || model.default_model}
                     </span>
                     <span className="text-xs text-gray-400 truncate flex-1">
                       {model.base_url}
                     </span>
+
+                    <button
+                      onClick={() => updateModel(model.id, { enabled: !model.enabled })}
+                      className={`shrink-0 p-1.5 rounded-lg transition-colors ${
+                        model.enabled
+                          ? 'text-green-600 hover:text-green-700 hover:bg-green-50'
+                          : 'text-gray-300 hover:text-gray-500 hover:bg-gray-50'
+                      }`}
+                      title={model.enabled ? t("settings.disableModel") : t("settings.enableModel")}
+                    >
+                      {model.enabled ? <ToggleRight size={18} /> : <ToggleLeft size={18} />}
+                    </button>
 
                     <button
                       onClick={() => handleTest(model)}
@@ -965,6 +991,184 @@ function ModelStrategyTab() {
           建议：Planner/Review 使用强模型（如 Claude Opus），Coder/Explore 使用快模型（如 GPT-4o-mini）
         </p>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Debug Tab — toggle debug mode + log viewer
+// ---------------------------------------------------------------------------
+
+const LOG_LEVEL_COLORS: Record<string, string> = {
+  DEBUG: "text-gray-500",
+  INFO: "text-blue-600",
+  WARNING: "text-yellow-600",
+  ERROR: "text-red-600",
+};
+
+function DebugTab() {
+  const t = useLocaleStore((s) => s.t);
+  const debugMode = useSettingsStore((s) => s.settings.debug_mode);
+  const updateDebugMode = useSettingsStore((s) => s.updateDebugMode);
+  const [logs, setLogs] = useState<import("@/types/settings").DebugLogEntry[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [levelFilter, setLevelFilter] = useState("");
+  const [autoRefresh, setAutoRefresh] = useState(false);
+  const logEndRef = useRef<HTMLDivElement>(null);
+
+  const fetchLogs = useCallback(async () => {
+    setLoading(true);
+    try {
+      const resp = await api.getDebugLogs({ lines: 300, level: levelFilter });
+      setLogs(resp.entries);
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, [levelFilter]);
+
+  const handleClear = useCallback(async () => {
+    await api.clearDebugLogs();
+    setLogs([]);
+  }, []);
+
+  const handleToggle = useCallback(async () => {
+    const newMode = !debugMode;
+    updateDebugMode(newMode);
+  }, [debugMode, updateDebugMode]);
+
+  useEffect(() => {
+    if (debugMode) {
+      fetchLogs();
+    }
+  }, [debugMode, fetchLogs]);
+
+  useEffect(() => {
+    if (!autoRefresh || !debugMode) return;
+    const timer = setInterval(fetchLogs, 3000);
+    return () => clearInterval(timer);
+  }, [autoRefresh, debugMode, fetchLogs]);
+
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [logs]);
+
+  return (
+    <div className="space-y-6">
+      {/* Toggle */}
+      <div className="flex items-center justify-between p-4 rounded-lg border border-gray-200 bg-white">
+        <div className="flex items-center gap-3">
+          <div className={`w-10 h-10 rounded-lg flex items-center justify-center ${
+            debugMode ? "bg-orange-100 text-orange-600" : "bg-gray-100 text-gray-400"
+          }`}>
+            <Bug size={20} />
+          </div>
+          <div>
+            <label className="text-sm font-semibold text-gray-800">
+              {t("settings.debugMode")}
+            </label>
+            <p className="text-xs text-gray-400 mt-0.5">{t("settings.debugModeDesc")}</p>
+          </div>
+        </div>
+        <button
+          onClick={handleToggle}
+          className={`relative inline-flex h-7 w-12 items-center rounded-full transition-colors ${
+            debugMode ? "bg-orange-500" : "bg-gray-300"
+          }`}
+        >
+          <span
+            className={`inline-block h-5 w-5 rounded-full bg-white transition-transform shadow-sm ${
+              debugMode ? "translate-x-6" : "translate-x-1"
+            }`}
+          />
+        </button>
+      </div>
+
+      {debugMode && (
+        <>
+          {/* Info banner */}
+          <div className="p-3 rounded-lg bg-orange-50 border border-orange-100">
+            <div className="flex items-center gap-2 text-xs text-orange-700">
+              <FileText size={14} />
+              <span>{t("settings.debugLogFile")}: data/debug.log</span>
+            </div>
+            <p className="text-xs text-orange-600 mt-1">{t("settings.debugNote")}</p>
+          </div>
+
+          {/* Controls */}
+          <div className="flex items-center gap-3">
+            <select
+              value={levelFilter}
+              onChange={(e) => setLevelFilter(e.target.value)}
+              className="rounded-lg border border-gray-300 bg-white px-3 py-1.5 text-xs focus:border-blue-500 focus:outline-none"
+            >
+              <option value="">{t("settings.allLevels")}</option>
+              <option value="DEBUG">DEBUG</option>
+              <option value="INFO">INFO</option>
+              <option value="WARNING">WARNING</option>
+              <option value="ERROR">ERROR</option>
+            </select>
+            <button
+              onClick={fetchLogs}
+              disabled={loading}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 bg-white hover:bg-gray-50 transition-colors disabled:opacity-50"
+            >
+              <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+              {t("settings.refreshLogs")}
+            </button>
+            <button
+              onClick={handleClear}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-gray-300 bg-white hover:bg-red-50 hover:text-red-600 hover:border-red-200 transition-colors"
+            >
+              <Trash size={12} />
+              {t("settings.clearLogs")}
+            </button>
+            <button
+              onClick={() => setAutoRefresh(!autoRefresh)}
+              className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
+                autoRefresh
+                  ? "border-green-300 bg-green-50 text-green-700"
+                  : "border-gray-300 bg-white hover:bg-gray-50"
+              }`}
+            >
+              {t("settings.autoRefresh")}
+            </button>
+            <span className="text-xs text-gray-400 ml-auto">
+              {logs.length} {t("settings.logEntries")}
+            </span>
+          </div>
+
+          {/* Log viewer */}
+          <div className="rounded-lg border border-gray-200 bg-gray-900 text-gray-200 font-mono text-xs max-h-[400px] overflow-y-auto">
+            {logs.length === 0 ? (
+              <div className="p-4 text-center text-gray-500">{t("settings.noLogs")}</div>
+            ) : (
+              <table className="w-full">
+                <tbody>
+                  {logs.map((entry, idx) => (
+                    <tr key={idx} className="border-b border-gray-800 hover:bg-gray-800/50">
+                      <td className="px-3 py-1 text-gray-500 whitespace-nowrap w-[140px]">
+                        {entry.timestamp.split(".")[0]}
+                      </td>
+                      <td className={`px-2 py-1 font-bold w-[70px] ${LOG_LEVEL_COLORS[entry.level] || "text-gray-400"}`}>
+                        {entry.level}
+                      </td>
+                      <td className="px-2 py-1 text-blue-400 w-[180px] truncate" title={entry.module}>
+                        {entry.module.split(".").slice(-2).join(".")}
+                      </td>
+                      <td className="px-3 py-1 text-gray-300 break-all">
+                        {entry.message}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div ref={logEndRef} />
+          </div>
+        </>
+      )}
     </div>
   );
 }

@@ -40,6 +40,9 @@ from app.sandbox.provision import SandboxProvisioner
 
 logger = logging.getLogger(__name__)
 
+# Debug logger — detailed runtime tracing
+import app.core.debug_logger as _dbg
+
 
 def _extract_structured_block(text: str, block_name: str) -> dict | None:
     """Extract a JSON block delimited by ===BLOCK_NAME=== ... ===END_BLOCK_NAME===."""
@@ -234,6 +237,24 @@ class DirectorLoop:
         if not goal:
             goal = "Complete the workflow tasks."
 
+        _dbg.info(__name__, "Director dispatch loop starting", run_id=run_id, goal=goal[:200])
+
+        # Build agent_type -> [node_id, ...] mapping from DAG so events use
+        # the same IDs as the canvas nodes (enables run-status animations).
+        dag_node_map: dict[str, list[str]] = {}
+        for n in dag_json.get("nodes", []):
+            if not isinstance(n, dict):
+                continue
+            at = str(
+                n.get("agent_type")
+                or (n.get("data") or {}).get("agentType")
+                or n.get("type")
+                or "coder"
+            ).lower()
+            dag_node_map.setdefault(at, []).append(n.get("id", ""))
+
+        _dbg.debug(__name__, "DAG node map built", dag_node_map={k: list(v) for k, v in dag_node_map.items()})
+
         # Create shared sandbox for trunk-based development
         sandbox_id: str | None = None
         try:
@@ -268,12 +289,19 @@ class DirectorLoop:
                 cancel_event=cancel_event,
                 model_provider=global_config.get("director_model_provider", ""),
                 model_id=global_config.get("director_model_id", ""),
+                dag_node_map=dag_node_map,
             )
 
             logger.info(
                 "Scout result for run %s: state=%s error=%s raw_output_len=%d",
                 run_id, scout_result.state, (scout_result.error or "")[:100],
                 len(scout_result.raw_output or ""),
+            )
+            _dbg.log_node_lifecycle(
+                __name__, node_id="init-scout", agent_type="explore",
+                event="completed" if scout_result.state == "completed" else "failed",
+                error=(scout_result.error or "")[:500],
+                raw_output_len=len(scout_result.raw_output or ""),
             )
             if scout_result.state == "completed" and scout_result.raw_output:
                 llm_text = _extract_llm_text(scout_result.raw_output)
@@ -360,6 +388,7 @@ class DirectorLoop:
                     cancel_event=cancel_event,
                     model_provider=global_config.get("worker_model_provider", ""),
                     model_id=global_config.get("worker_model_id", ""),
+                    dag_node_map=dag_node_map,
                 )
 
                 # Parse result
@@ -411,13 +440,27 @@ class DirectorLoop:
         cancel_event: asyncio.Event,
         model_provider: str = "",
         model_id: str = "",
+        dag_node_map: dict[str, list[str]] | None = None,
     ) -> NodeResult:
         """Dispatch a sub-agent via NodeRunner on the shared sandbox."""
-        node_id = f"{agent_type}-{uuid4().hex[:8]}"
+        # Prefer DAG node IDs so canvas status animations work
+        node_id = ""
+        if dag_node_map:
+            candidates = dag_node_map.get(agent_type, [])
+            if candidates:
+                node_id = candidates.pop(0)
+        if not node_id:
+            node_id = f"{agent_type}-{uuid4().hex[:8]}"
 
         full_prompt = f"{system_prompt}\n\n---\n\n## Task\n{prompt}"
 
-        return await self._node_runner.execute_node(
+        _dbg.log_node_lifecycle(
+            __name__, node_id=node_id, agent_type=agent_type, event="started",
+            model_provider=model_provider, model_id=model_id,
+            prompt_preview=prompt[:300],
+        )
+
+        result = await self._node_runner.execute_node(
             run_id=run_id,
             node_id=node_id,
             agent_type=agent_type,
@@ -428,6 +471,14 @@ class DirectorLoop:
             model_id=model_id,
             destroy_sandbox=False,  # trunk-based: never destroy shared sandbox
         )
+
+        _dbg.log_node_lifecycle(
+            __name__, node_id=node_id, agent_type=agent_type,
+            event=result.state, exit_code=result.exit_code,
+            error=(result.error or "")[:500],
+            raw_output_len=len(result.raw_output or ""),
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Director LLM call
@@ -518,10 +569,21 @@ class DirectorLoop:
             }
 
         try:
+            _dbg.log_llm_call(
+                __name__, provider=director_provider, model=director_model,
+                prompt_preview=f"[Director] iteration={world_model.iteration}",
+            )
+            t0 = time.monotonic()
             async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
                 resp = await client.post(endpoint, json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            _dbg.log_llm_call(
+                __name__, provider=director_provider, model=director_model,
+                duration_ms=elapsed_ms,
+                response_preview=str(data)[:500],
+            )
 
             # Extract tool call — handle both API formats
             if is_anthropic:

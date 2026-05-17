@@ -25,10 +25,12 @@ export default function ModelSelector({ value, onChange, disabled }: ModelSelect
   }, [loadFromServer, loading, models.length]);
 
   // Group models by (format + base_url) as provider key
+  // Only include enabled models
   const grouped: Record<string, { label: string; models: ModelEntry[] }> = {};
   const providerOrder: string[] = [];
 
   for (const model of models) {
+    if (!model.enabled) continue;
     // Use format + base_url as the provider group key
     const providerKey = `${model.format}:${model.base_url}`;
     if (!grouped[providerKey]) {

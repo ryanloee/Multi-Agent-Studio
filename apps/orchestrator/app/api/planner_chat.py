@@ -33,6 +33,8 @@ from app.models.db import SharedDocument, Workflow
 
 logger = logging.getLogger("uvicorn.error")
 
+import app.core.debug_logger as _dbg
+
 router = APIRouter()
 
 _THINKING_BUDGETS = {
@@ -149,7 +151,7 @@ async def _call_llm_stream(
                         m_fmt = m.get("format", "")
                         m_model = m.get("default_model", "") or m.get("name", "")
                         if m_fmt == model_provider and m_model == model_id_override:
-                            if m.get("base_url") and m.get("api_key"):
+                            if m.get("base_url") and m.get("api_key") and m.get("enabled", True):
                                 provider_url = m["base_url"].rstrip("/")
                                 provider_key = m["api_key"]
                                 model_id = m_model
@@ -165,13 +167,14 @@ async def _call_llm_stream(
             settings_data = json.loads(settings_path.read_text(encoding="utf-8"))
             settings_models = settings_data.get("models", [])
             if isinstance(settings_models, list) and settings_models:
-                # Use the first configured model
-                first = settings_models[0]
-                if isinstance(first, dict) and first.get("base_url") and first.get("api_key"):
-                    provider_url = first["base_url"].rstrip("/")
-                    provider_key = first["api_key"]
-                    model_id = first.get("default_model", "")
-                    fmt = first.get("format", "openai")
+                # Use the first enabled configured model
+                for m in settings_models:
+                    if isinstance(m, dict) and m.get("base_url") and m.get("api_key") and m.get("enabled", True):
+                        provider_url = m["base_url"].rstrip("/")
+                        provider_key = m["api_key"]
+                        model_id = m.get("default_model", "")
+                        fmt = m.get("format", "openai")
+                        break
         except (FileNotFoundError, json.JSONDecodeError, OSError):
             pass
 
@@ -256,10 +259,18 @@ async def _call_llm_stream(
             body["tools"] = tools
             if tool_choice_mode == "force_first":
                 body["tool_choice"] = {"type": "tool", "name": tools[0]["name"]}
+            elif tool_choice_mode == "required":
+                body["tool_choice"] = {"type": "any"}
             elif tool_choice_mode == "auto":
                 body["tool_choice"] = {"type": "auto"}
 
     timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
+
+    _dbg.log_llm_call(
+        "app.api.planner_chat", provider=fmt, model=model_id,
+        prompt_preview=str(messages[-1]["content"][:300] if messages else ""),
+        url=url, tool_choice_mode=tool_choice_mode,
+    )
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -388,6 +399,44 @@ async def _call_llm_stream(
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         yield {"type": "text", "content": f"\n\n[连接失败: {exc}]"}
     except Exception as exc:
+        # Connection dropped mid-stream (e.g. RemoteProtocolError) — yield any
+        # partial tool call we already received so the planner can still use it.
+        if current_tool_id and current_tool_name:
+            raw_json = partial_json_buffers.get(current_tool_id, "")
+            try:
+                tool_input = json.loads(raw_json or "{}")
+            except json.JSONDecodeError:
+                tool_input = {}
+            if tool_input:
+                logger.warning(
+                    "LLM stream dropped, yielding partial tool_call: name=%s json_len=%d",
+                    current_tool_name, len(raw_json),
+                )
+                yield {
+                    "type": "tool_call",
+                    "name": current_tool_name,
+                    "input": tool_input,
+                    "id": current_tool_id,
+                }
+                return
+        for slot in openai_tool_buffers.values():
+            if slot.get("name") and slot.get("arguments"):
+                try:
+                    tool_input = json.loads(slot["arguments"])
+                except json.JSONDecodeError:
+                    tool_input = {}
+                if tool_input:
+                    logger.warning(
+                        "LLM stream dropped, yielding partial openai tool_call: name=%s",
+                        slot["name"],
+                    )
+                    yield {
+                        "type": "tool_call",
+                        "name": slot["name"],
+                        "input": tool_input,
+                        "id": slot.get("id", ""),
+                    }
+                    return
         logger.exception("Planner chat LLM call failed")
         yield {"type": "text", "content": f"\n\n[内部错误: {exc}]"}
 
@@ -443,10 +492,147 @@ def _planner_alignment_tools() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Director chat prompt (replaces old planner task system)
+# Director chat prompt — tool calling based structured output
 # ---------------------------------------------------------------------------
 
-PLANNER_TASK_SYSTEM = PLANNER_OUTLINE_SYSTEM
+PLANNER_TASK_SYSTEM = (
+    "你是 Multi-Agent Studio 的技术负责人（Director）。你的职责是理解用户需求，"
+    "并将任务拆解为可执行的 Agent 工作流。\n"
+    "\n"
+    "工作流程：\n"
+    "1. 理解用户目标和当前上下文\n"
+    "2. 分析可行性，识别关键决策点\n"
+    "3. 将任务拆解为多个子任务（Explore → Coder → Review → Shell 等）\n"
+    "4. 调用 planner_task_plan 工具输出结构化规划\n"
+    "\n"
+    "任务拆解原则：\n"
+    "- 每个子任务对应一个 Agent 节点（explore/design/coder/review/merge/shell）\n"
+    "- 明确任务间的依赖关系（depends_on）\n"
+    "- 为每个任务编写清晰的 prompt，包含目标、上下文、具体要求、产出格式、验收标准\n"
+    "- 并行任务不互相依赖，串行任务正确指定依赖\n"
+    "\n"
+    "注意：你必须调用 planner_task_plan 工具来输出最终规划，不要只用文字回复。"
+    "在调用工具前，你可以先用文字解释你的思考过程。"
+)
+
+
+def _planner_task_plan_tool() -> list[dict]:
+    """Define the tool schema for structured task plan output.
+
+    This is the 'fill-in-the-blank' approach: the model must call this tool
+    with parameters that match the JSON Schema. The API layer enforces
+    schema compliance, so we always get valid structured output.
+    """
+    return [
+        {
+            "name": "planner_task_plan",
+            "description": (
+                "输出完整的任务规划。将用户需求拆解为可执行的 Agent 工作流，"
+                "包含任务目标、项目摘要和具体的子任务列表。"
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "reply": {
+                        "type": "string",
+                        "description": "对用户的自然语言回复，简要说明规划思路",
+                    },
+                    "task_object": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string", "description": "任务标题"},
+                            "objective": {"type": "string", "description": "任务目标描述"},
+                            "background": {"type": "string", "description": "任务背景信息"},
+                            "constraints": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "约束条件列表",
+                            },
+                            "success_criteria": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "验收标准列表",
+                            },
+                        },
+                        "required": ["title", "objective"],
+                    },
+                    "project_summary": {
+                        "type": "object",
+                        "properties": {
+                            "project_type": {"type": "string", "description": "项目类型"},
+                            "tech_stack": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "技术栈",
+                            },
+                            "startup": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "启动方式",
+                            },
+                            "build": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "构建方式",
+                            },
+                            "tests": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "测试方式",
+                            },
+                            "key_directories": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "关键目录",
+                            },
+                            "risk_points": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "风险点",
+                            },
+                        },
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "description": "子任务列表，按执行顺序排列",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "任务唯一标识，格式：类型_简短描述（如 explore_requirements, coder_api）",
+                                },
+                                "type": {
+                                    "type": "string",
+                                    "enum": ["explore", "design", "coder", "review", "merge", "shell"],
+                                    "description": "Agent 类型",
+                                },
+                                "label": {
+                                    "type": "string",
+                                    "description": "任务显示名称（中文）",
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": (
+                                        "任务执行 prompt，包含：目标、上下文、具体要求、"
+                                        "产出格式、验收标准。这是 Agent 实际执行时的指令。"
+                                    ),
+                                },
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "依赖的前置任务 ID 列表，无依赖则为空数组",
+                                },
+                            },
+                            "required": ["id", "type", "prompt", "depends_on"],
+                        },
+                        "minItems": 2,
+                    },
+                },
+                "required": ["tasks"],
+            },
+        }
+    ]
 
 
 def _extract_task_plan(text: str, fallback_goal: str) -> dict | None:
@@ -499,7 +685,12 @@ def _is_valid_task_plan(data: dict) -> bool:
 
 
 def _normalize_task_plan(data: dict, fallback_goal: str) -> dict:
-    """Ensure the task plan has all required fields with defaults."""
+    """Ensure the task plan has all required fields with defaults.
+
+    Handles both tool-call results and parsed JSON from text.
+    """
+    import json
+
     result = dict(data)
     if not result.get("reply"):
         result["reply"] = fallback_goal
@@ -514,6 +705,15 @@ def _normalize_task_plan(data: dict, fallback_goal: str) -> dict:
         }
     elif not task_obj.get("title"):
         task_obj["title"] = fallback_goal
+
+    # Ensure tasks have defaults
+    for task in result.get("tasks", []):
+        if isinstance(task, dict):
+            task.setdefault("label", task.get("id", ""))
+            task.setdefault("depends_on", [])
+            if not isinstance(task.get("depends_on"), list):
+                task["depends_on"] = []
+
     return result
 
 
@@ -1752,7 +1952,7 @@ def _load_configured_models() -> list[dict]:
     models = payload.get("models", [])
     if not isinstance(models, list):
         return []
-    return [item for item in models if isinstance(item, dict) and item.get("default_model")]
+    return [item for item in models if isinstance(item, dict) and item.get("default_model") and item.get("enabled", True)]
 
 
 def _load_model_strategy() -> dict[str, str]:
@@ -1888,9 +2088,15 @@ def _normalize_dag(dag: dict) -> dict:
                 data["agentType"] = "design"
             if node_id != "planner" and agent_type in {"design", "coder", "explore", "merge", "review", "shell"}:
                 fallback_provider, fallback_model_id = _choose_default_model(agent_type, metadata)
-                if not provider:
+                # Check if the node's current model is still enabled
+                configured = _load_configured_models()
+                model_still_enabled = any(
+                    item.get("format") == provider
+                    and (item.get("default_model") or item.get("name")) == model_id
+                    for item in configured
+                ) if provider and model_id else False
+                if not provider or not model_id or not model_still_enabled:
                     provider = fallback_provider
-                if not model_id:
                     model_id = fallback_model_id
                 if provider:
                     data["modelProvider"] = provider
@@ -2022,8 +2228,9 @@ async def planner_chat(
     db: AsyncSession = Depends(get_db),
 ):
     """Interactive Planner chat — streams LLM response and DAG updates."""
-
-    # 1. Fetch workflow
+    _dbg.info("app.api.planner_chat", "Planner chat request",
+              workflow_id=body.workflow_id, message_len=len(body.message),
+              node_id=body.node_id)
     result = await db.execute(
         select(Workflow).where(Workflow.id == uuid.UUID(body.workflow_id))
     )
@@ -2183,7 +2390,7 @@ async def planner_chat(
                 logger.warning("Failed to save planner draft checkpoint (%s): %s", reason, exc)
 
         # =====================================================================
-        # STAGE 1: generate_tasks — LLM outputs semantic task list (1 LLM call)
+        # STAGE 1: generate_tasks — LLM outputs semantic task list via tool call
         # =====================================================================
         yield _sse({"type": "planner_status", "message": "Planner 请求已发送，正在生成任务规划。"})
         draft_state["current_stage"] = "generate_tasks"
@@ -2199,26 +2406,40 @@ async def planner_chat(
             "draft_state": _draft_state_ui_payload(draft_state),
         })
 
-        task_messages: list[dict] = _recent_messages(messages, limit=4)
+        task_messages = _recent_messages(messages, limit=4)
         task_messages.append({
             "role": "user",
             "content": (
-                "请输出完整的任务规划，包含 planner-tasks JSON 代码块。\n\n"
                 f"## 用户最新需求\n{body.message}\n\n"
                 f"## 工作流目标\n{workflow_goal}\n\n"
-                f"## 当前结构化草稿摘要\n{json.dumps(_draft_state_ui_payload(draft_state), ensure_ascii=False, indent=2)}"
+                f"## 当前结构化草稿摘要\n{json.dumps(_draft_state_ui_payload(draft_state), ensure_ascii=False, indent=2)}\n\n"
+                "请分析需求并调用 planner_task_plan 工具输出结构化任务规划。"
             ),
         })
+
+        # --- Multi-turn research + planning via tool loop ---
+        from app.api.planner_tools import run_planner_tool_loop
+
+        research_system = PLANNER_TASK_SYSTEM + (
+            "\n\n你可以使用研究工具来收集信息：\n"
+            # "- planner_web_search: 搜索网络获取技术方案、API 文档\n"  # temporarily disabled
+            "- planner_read_file: 读取项目文件以了解现有代码\n"
+            "- planner_grep_files: 在项目中搜索文本模式\n"
+            "- planner_web_fetch: 抓取指定 URL 的文档内容\n\n"
+            "当你有足够信息后，调用 planner_task_plan 输出最终规划。"
+        )
+
         task_parts: list[str] = []
-        async for event in _call_llm_stream(
-            task_messages,
-            PLANNER_TASK_SYSTEM,
-            body.thinking_level,
-            tools=None,
-            tool_choice_mode="auto",
-            max_tokens=32768,
+        tool_call_result: dict | None = None
+        alignment_result: dict | None = None
+
+        async for event in run_planner_tool_loop(
+            messages=task_messages,
+            system=research_system,
+            workspace_directory=workflow.workspace_directory,
+            thinking_level=body.thinking_level,
             model_provider=body.model_provider,
-            model_id_override=body.model_id,
+            model_id=body.model_id,
         ):
             event_type = event.get("type")
             chunk = str(event.get("content") or "")
@@ -2230,9 +2451,49 @@ async def planner_chat(
                 continue
             if event_type == "text":
                 task_parts.append(chunk)
+                yield _sse({"type": "text", "content": chunk})
+            elif event_type == "tool_executing":
+                yield _sse({
+                    "type": "planner_tool_call",
+                    "name": event.get("name", ""),
+                    "status": "started",
+                    "input_preview": event.get("input_preview", ""),
+                    "iteration": event.get("iteration", 0),
+                })
+            elif event_type == "tool_result":
+                yield _sse({
+                    "type": "planner_tool_call",
+                    "name": event.get("name", ""),
+                    "status": "completed",
+                    "result_preview": event.get("result_preview", ""),
+                    "duration_ms": event.get("duration_ms", 0),
+                    "iteration": event.get("iteration", 0),
+                })
+            elif event_type == "tool_call":
+                if event.get("name") == "planner_task_plan":
+                    tool_call_result = event.get("input")
+                elif event.get("name") == "planner_alignment_check":
+                    alignment_result = event.get("input")
 
+        # Process tool call result
+        task_plan = None
         raw_response = "".join(task_parts)
-        task_plan = _extract_task_plan(raw_response, workflow_goal)
+
+        if tool_call_result and isinstance(tool_call_result, dict):
+            # Validate and normalize the tool call result
+            tasks_list = tool_call_result.get("tasks")
+            if isinstance(tasks_list, list) and len(tasks_list) > 0:
+                # Check each task has required fields
+                valid_tasks = all(
+                    isinstance(t, dict) and t.get("id") and t.get("type") and t.get("prompt")
+                    for t in tasks_list
+                )
+                if valid_tasks:
+                    task_plan = _normalize_task_plan(tool_call_result, workflow_goal)
+
+        # Fallback: try parsing task plan from raw text when tool call is missing
+        if not task_plan and raw_response:
+            task_plan = _extract_task_plan(raw_response, workflow_goal)
 
         # Single retry on parse failure
         if not task_plan:
@@ -2248,32 +2509,59 @@ async def planner_chat(
             })
             retry_messages = list(task_messages)
             retry_messages.append({"role": "assistant", "content": raw_response})
+            if tool_call_result:
+                retry_messages.append({"role": "tool", "content": "格式校验失败，请重新输出符合要求的任务规划。", "tool_call_id": "retry"})
             retry_messages.append({
                 "role": "user",
                 "content": (
-                    "你上次输出的 JSON 无法解析。请严格按照 planner-tasks 格式重新输出。\n"
-                    "注意：必须包含 tasks 数组，每个任务必须有 id、type、prompt、depends_on 字段。"
+                    "你上次输出的任务规划格式不正确。请严格按照以下要求重新输出：\n"
+                    "1. 必须调用 planner_task_plan 工具\n"
+                    "2. tasks 数组中每个任务必须包含 id、type、prompt、depends_on 字段\n"
+                    "3. type 必须是：explore、design、coder、review、merge、shell 之一\n"
+                    "4. 至少包含 2 个任务"
                 ),
             })
             retry_parts: list[str] = []
+            retry_tool_result: dict | None = None
+
             async for event in _call_llm_stream(
                 retry_messages,
                 PLANNER_TASK_SYSTEM,
                 body.thinking_level,
-                tools=None,
-                tool_choice_mode="auto",
+                tools=planner_tools,
+                tool_choice_mode="required",
                 max_tokens=32768,
                 model_provider=body.model_provider,
                 model_id_override=body.model_id,
             ):
                 if event.get("type") == "text":
                     retry_parts.append(str(event.get("content") or ""))
+                    yield _sse({"type": "text", "content": str(event.get("content") or "")})
                 elif event.get("type") == "thinking":
                     yield _sse({"type": "thinking_delta", "content": str(event.get("content") or "")})
-            retry_response = "".join(retry_parts)
-            task_plan = _extract_task_plan(retry_response, workflow_goal)
-            if task_plan:
-                raw_response = retry_response
+                elif event.get("type") == "tool_call":
+                    if event.get("name") == "planner_task_plan":
+                        retry_tool_result = event.get("input")
+                    elif event.get("name") == "planner_alignment_check":
+                        alignment_result = event.get("input")
+
+            if retry_tool_result and isinstance(retry_tool_result, dict):
+                tasks_list = retry_tool_result.get("tasks")
+                if isinstance(tasks_list, list) and len(tasks_list) > 0:
+                    valid_tasks = all(
+                        isinstance(t, dict) and t.get("id") and t.get("type") and t.get("prompt")
+                        for t in tasks_list
+                    )
+                    if valid_tasks:
+                        task_plan = _normalize_task_plan(retry_tool_result, workflow_goal)
+                        raw_response = "".join(retry_parts)
+
+            # Fallback: try parsing from retry text when tool call is missing
+            retry_raw = "".join(retry_parts)
+            if not task_plan and retry_raw:
+                task_plan = _extract_task_plan(retry_raw, workflow_goal)
+                if task_plan:
+                    raw_response = retry_raw
 
         if not task_plan:
             task_plan = _build_minimal_task_plan(workflow_goal)
@@ -2295,6 +2583,16 @@ async def planner_chat(
             "summary": f"已解析任务列表：{len(task_plan.get('tasks') or [])} 个任务。",
             "draft_state": _draft_state_ui_payload(draft_state),
         })
+
+        # Emit alignment check result if the model called it
+        if alignment_result and isinstance(alignment_result, dict):
+            yield _sse({
+                "type": "planner_alignment_check",
+                "aligned": alignment_result.get("aligned", True),
+                "missing_items": alignment_result.get("missing_items", []),
+                "message": alignment_result.get("message", ""),
+                "corrected_dag": alignment_result.get("corrected_dag"),
+            })
 
         # =====================================================================
         # STAGE 2: compile_dag — deterministic compiler converts tasks → DAG

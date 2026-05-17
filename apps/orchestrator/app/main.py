@@ -183,6 +183,11 @@ async def lifespan(app: FastAPI):
     init_runs_engine(director_loop)
     init_tasks_deps(director_loop, event_bus)
     logger.info("Director loop engine initialised (no Docker/Temporal/Redis)")
+
+    # Sync debug logging level from settings
+    from app.core.debug_logger import sync_log_levels
+    sync_log_levels()
+
     await director_loop.recover_interrupted_runs()
 
     yield

@@ -677,7 +677,6 @@ MAS_PORT=8001
 |------|------|------|
 | 3000 | 前端 (Next.js) | http://localhost:3000 |
 | 8000 | 后端 API (FastAPI) | http://localhost:8000 |
-| 8000 | API 文档 (Swagger) | http://localhost:8000/docs |
 
 ## License
 

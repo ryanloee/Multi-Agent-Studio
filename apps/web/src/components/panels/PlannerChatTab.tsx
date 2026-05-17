@@ -343,6 +343,48 @@ export default function PlannerChatTab() {
                 event.name || "unknown_tool",
                 Array.isArray(event.input_keys) ? event.input_keys : []
               );
+              // Show research tool execution progress inline
+              if (event.status === "started") {
+                const toolLabel: Record<string, string> = {
+                  planner_web_search: "搜索网络",
+                  planner_read_file: "读取文件",
+                  planner_grep_files: "搜索代码",
+                  planner_web_fetch: "获取网页",
+                };
+                const label = toolLabel[event.name || ""] || event.name || "工具";
+                setMessages((prev) => {
+                  const updated = [...prev];
+                  const last = updated[updated.length - 1];
+                  const preview = event.input_preview ? `: ${String(event.input_preview).slice(0, 80)}` : "";
+                  if (last?.role === "assistant") {
+                    updated[updated.length - 1] = {
+                      ...last,
+                      content: last.content + `\n> **${label}** 执行中${preview}...\n`,
+                    };
+                  }
+                  return updated;
+                });
+              } else if (event.status === "completed") {
+                const toolLabel: Record<string, string> = {
+                  planner_web_search: "搜索网络",
+                  planner_read_file: "读取文件",
+                  planner_grep_files: "搜索代码",
+                  planner_web_fetch: "获取网页",
+                };
+                const label = toolLabel[event.name || ""] || event.name || "工具";
+                const ms = event.duration_ms ? ` (${event.duration_ms}ms)` : "";
+                setMessages((prev) => {
+                  const updated = [...prev];
+                  const last = updated[updated.length - 1];
+                  if (last?.role === "assistant") {
+                    updated[updated.length - 1] = {
+                      ...last,
+                      content: last.content + `> **${label}** 完成${ms}\n`,
+                    };
+                  }
+                  return updated;
+                });
+              }
             } else if (event.type === "planner_contract_error") {
               const blockers = Array.isArray(event.blockers) ? event.blockers : [];
               setBlockers(blockers);
@@ -503,6 +545,7 @@ export default function PlannerChatTab() {
     const providerOrder: string[] = [];
 
     for (const model of models) {
+      if (!model.enabled) continue;
       const providerKey = `${model.format}:${model.base_url}`;
       if (!grouped[providerKey]) {
         grouped[providerKey] = {

@@ -64,6 +64,7 @@ class ModelEntry(BaseModel):
     default_model: str = Field(default="", description="默认模型 ID")
     context_window: int = Field(default=128000, ge=1024, description="模型上下文窗口 token 数")
     max_output_tokens: int = Field(default=4096, ge=256, description="单次输出 token 上限")
+    enabled: bool = Field(default=True, description="是否启用该模型")
 
 
 class GeneralSettings(BaseModel):
@@ -87,11 +88,18 @@ class ModelStrategy(BaseModel):
     shell: str = Field(default="", description="Shell 模型")
 
 
+class DebugSettings(BaseModel):
+    enabled: bool = Field(default=False, description="调试模式开关")
+    log_level: str = Field(default="DEBUG", description="日志级别: DEBUG/INFO/WARNING/ERROR")
+
+
 class SettingsResponse(BaseModel):
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     display: DisplaySettings = Field(default_factory=DisplaySettings)
     models: list[ModelEntry] = Field(default_factory=list)
     model_strategy: ModelStrategy = Field(default_factory=ModelStrategy)
+    debug_mode: bool = Field(default=False, description="调试模式开关")
+    debug_settings: DebugSettings = Field(default_factory=DebugSettings)
 
 
 class UpdateSettingsRequest(BaseModel):
@@ -99,6 +107,8 @@ class UpdateSettingsRequest(BaseModel):
     display: DisplaySettings | None = None
     models: list[ModelEntry] | None = None
     model_strategy: ModelStrategy | None = None
+    debug_mode: bool | None = None
+    debug_settings: DebugSettings | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -116,10 +126,14 @@ _DEFAULT_SETTINGS: dict[str, Any] = SettingsResponse().model_dump()
 async def get_settings() -> SettingsResponse:
     stored = _read_settings()
     merged = _deep_merge(_DEFAULT_SETTINGS, stored)
-    # Migration: old format had models as dict {openai: {}, claude: {}}
-    # New format expects models as a list of ModelEntry
     if not isinstance(merged.get("models"), list):
         merged["models"] = []
+    # Flatten debug_mode / debug_settings from stored data
+    merged["debug_mode"] = bool(stored.get("debug_mode", False))
+    ds = stored.get("debug_settings", {})
+    merged.setdefault("debug_settings", {})
+    merged["debug_settings"]["enabled"] = merged["debug_mode"]
+    merged["debug_settings"].setdefault("log_level", "DEBUG")
     return SettingsResponse(**merged)
 
 
@@ -137,13 +151,26 @@ async def update_settings(body: UpdateSettingsRequest) -> SettingsResponse:
         stored.setdefault("model_strategy", {}).update(
             body.model_strategy.model_dump(exclude_unset=True)
         )
+    if body.debug_mode is not None:
+        stored["debug_mode"] = body.debug_mode
+    if body.debug_settings is not None:
+        stored["debug_settings"] = body.debug_settings.model_dump(exclude_unset=True)
+        stored["debug_mode"] = body.debug_settings.enabled
 
     _write_settings(stored)
 
+    # Sync logger levels when debug mode changes
+    from app.core.debug_logger import sync_log_levels
+    sync_log_levels()
+
     merged = _deep_merge(_DEFAULT_SETTINGS, stored)
-    # Ensure models is always a list after merge
     if not isinstance(merged.get("models"), list):
         merged["models"] = []
+    merged["debug_mode"] = bool(stored.get("debug_mode", False))
+    ds = stored.get("debug_settings", {})
+    merged.setdefault("debug_settings", {})
+    merged["debug_settings"]["enabled"] = merged["debug_mode"]
+    merged["debug_settings"].setdefault("log_level", "DEBUG")
     return SettingsResponse(**merged)
 
 
@@ -458,6 +485,51 @@ async def list_directory(body: ListDirRequest) -> ListDirResponse:
         entries=entries,
         error=error,
     )
+
+
+# ---------------------------------------------------------------------------
+# Debug log endpoints
+# ---------------------------------------------------------------------------
+
+class DebugLogRequest(BaseModel):
+    lines: int = Field(default=200, ge=1, le=2000, description="读取行数")
+    level: str = Field(default="", description="按级别过滤: DEBUG/INFO/WARNING/ERROR")
+
+
+class DebugLogEntry(BaseModel):
+    timestamp: str
+    level: str
+    module: str
+    message: str
+
+
+class DebugLogResponse(BaseModel):
+    entries: list[DebugLogEntry] = Field(default_factory=list)
+    total: int = 0
+    debug_mode: bool = False
+    log_file: str = ""
+
+
+@router.post("/debug-logs", response_model=DebugLogResponse)
+async def get_debug_logs(body: DebugLogRequest) -> DebugLogResponse:
+    from app.core.debug_logger import read_recent_logs, _read_debug_mode, _DEBUG_LOG_PATH
+    entries = read_recent_logs(lines=body.lines, level_filter=body.level)
+    return DebugLogResponse(
+        entries=[DebugLogEntry(**e) for e in entries],
+        total=len(entries),
+        debug_mode=_read_debug_mode(),
+        log_file=str(_DEBUG_LOG_PATH),
+    )
+
+
+class DebugLogClearResponse(BaseModel):
+    success: bool
+
+
+@router.post("/debug-logs/clear", response_model=DebugLogClearResponse)
+async def clear_debug_logs() -> DebugLogClearResponse:
+    from app.core.debug_logger import clear_logs
+    return DebugLogClearResponse(success=clear_logs())
 
 
 # ---------------------------------------------------------------------------

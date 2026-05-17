@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Multi-Agent Studio - Start / Stop Services (Linux/macOS)
+# Multi-Agent Studio - Start / Stop / Restart Services (Linux/macOS)
 # Usage:
 #   bash scripts/start.sh          # Start services
 #   bash scripts/start.sh stop     # Stop services
+#   bash scripts/start.sh restart  # Restart services
 
 set -euo pipefail
 
@@ -269,6 +270,11 @@ start_services() {
 ACTION="${1:-start}"
 if [[ "$ACTION" == "stop" ]]; then
     stop_services
+elif [[ "$ACTION" == "restart" ]]; then
+    echo -e "${CYAN}=== Restarting Multi-Agent Studio ===${NC}"
+    stop_services
+    sleep 1
+    start_services
 else
     start_services
 fi

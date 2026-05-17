@@ -34,6 +34,8 @@ from app.sandbox.provision import SandboxProvisioner
 
 logger = logging.getLogger(__name__)
 
+import app.core.debug_logger as _dbg
+
 _repo_root = Path(__file__).resolve().parents[4]
 _OPENCODE_RUNNER = _repo_root / "apps" / "opencode-runner" / "run-node.ts"
 _OPENCODE_PACKAGE_DIR = Path(
@@ -238,6 +240,8 @@ class NodeRunner:
         If *sandbox_id* is provided the sandbox is reused (trunk-based);
         otherwise a fresh one is created from *workspace_directory*.
         """
+        _dbg.info(__name__, "execute_node starting", node_id=node_id, agent_type=agent_type,
+                  model_provider=model_provider, model_id=model_id, sandbox_id=(sandbox_id or "")[:12])
         if cancel_event is None:
             cancel_event = asyncio.Event()
         global_config = global_config or {}
@@ -307,6 +311,11 @@ class NodeRunner:
                         provider_url = provider_url or _pcfg["url"]
                         provider_key = provider_key or _pcfg["key"]
                         break
+
+            _dbg.debug(__name__, "Model config resolved", node_id=node_id,
+                       provider_url=provider_url, model_provider=model_provider,
+                       model_id=model_id, context_window=context_window,
+                       max_output_tokens=max_output_tokens)
 
             if not provider_url or not provider_key:
                 provider_url = provider_url or os.environ.get("MIMO_API_URL", "")
@@ -385,6 +394,10 @@ class NodeRunner:
                 forced_failure_reason = ""
 
             state = "failed" if (forced_failure_reason or exit_code != 0) else "completed"
+            _dbg.log_node_lifecycle(
+                __name__, node_id=node_id, agent_type=agent_type, event=state,
+                exit_code=exit_code, error=(forced_failure_reason or "")[:500],
+            )
 
             await self._emit(
                 "node_completed" if state == "completed" else "node_failed",

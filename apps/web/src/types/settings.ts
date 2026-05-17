@@ -10,6 +10,7 @@ export interface ModelEntry {
   default_model: string;
   context_window: number;
   max_output_tokens: number;
+  enabled: boolean;
 }
 
 export interface GeneralSettings {
@@ -20,6 +21,11 @@ export interface GeneralSettings {
 export interface DisplaySettings {
   theme: string;
   compact_mode: boolean;
+}
+
+export interface DebugSettings {
+  enabled: boolean;
+  log_level: string;
 }
 
 export interface ModelStrategy {
@@ -37,9 +43,11 @@ export interface AppSettings {
   display: DisplaySettings;
   models: ModelEntry[];
   model_strategy: ModelStrategy;
+  debug_mode: boolean;
+  debug_settings: DebugSettings;
 }
 
-export type SettingsTab = "general" | "display" | "models" | "strategy";
+export type SettingsTab = "general" | "display" | "models" | "strategy" | "debug";
 
 // ---------------------------------------------------------------------------
 // Path validation (from POST /api/settings/validate-path)
@@ -64,6 +72,24 @@ export interface ModelTestResult {
   models_count: number | null;
   model_names: string[];
   error: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Debug log entries (from POST /api/settings/debug-logs)
+// ---------------------------------------------------------------------------
+
+export interface DebugLogEntry {
+  timestamp: string;
+  level: string;
+  module: string;
+  message: string;
+}
+
+export interface DebugLogResponse {
+  entries: DebugLogEntry[];
+  total: number;
+  debug_mode: boolean;
+  log_file: string;
 }
 
 // ---------------------------------------------------------------------------

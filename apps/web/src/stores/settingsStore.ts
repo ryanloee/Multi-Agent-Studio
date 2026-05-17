@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import type { AppSettings, GeneralSettings, DisplaySettings, ModelEntry, ModelStrategy } from "@/types/settings";
+import type { AppSettings, GeneralSettings, DisplaySettings, ModelEntry, ModelStrategy, DebugSettings } from "@/types/settings";
 import { api } from "@/lib/api";
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -64,6 +64,8 @@ const DEFAULT_SETTINGS: AppSettings = {
     coder: "",
     shell: "",
   },
+  debug_mode: false,
+  debug_settings: { enabled: false, log_level: "DEBUG" },
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +88,7 @@ interface SettingsState {
   addModel: (model: ModelEntry) => void;
   updateModel: (id: string, patch: Partial<ModelEntry>) => void;
   removeModel: (id: string) => void;
+  updateDebugMode: (enabled: boolean) => void;
   save: () => Promise<void>;
 }
 
@@ -186,6 +189,17 @@ export const useSettingsStore = create<SettingsState>()(
             saveError: null,
           };
         });
+      },
+
+      updateDebugMode: (enabled) => {
+        set((s) => ({
+          settings: {
+            ...s.settings,
+            debug_mode: enabled,
+            debug_settings: { ...s.settings.debug_settings, enabled },
+          },
+          saveError: null,
+        }));
       },
 
       save: async () => {

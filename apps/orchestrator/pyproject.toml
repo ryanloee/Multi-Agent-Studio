@@ -16,6 +16,7 @@ pydantic = "^2.10.0"
 pydantic-settings = "^2.6.0"
 httpx = "^0.28.0"
 python-json-logger = "^3.1.0"
+duckduckgo-search = "^7.0.0"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

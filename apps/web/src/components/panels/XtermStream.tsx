@@ -78,17 +78,28 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
 
         term.open(container);
 
-        // Defer fit() to next frame so the browser has laid out the container
-        requestAnimationFrame(() => {
-          try { fitAddon.fit(); } catch {}
-        });
-
         termRef.current = term;
         fitAddonRef.current = fitAddon;
-        setXtermReady(true);
+
+        // Defer fit() to next frame so the browser has laid out the container.
+        // Use a second rAF to ensure xterm's internal renderer has fully
+        // initialised (otherwise Viewport.syncScrollArea may crash reading
+        // undefined `dimensions`).
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (cancelled || !container.isConnected) return;
+            try {
+              fitAddon.fit();
+            } catch {
+              // fit may fail during transitions or hidden containers
+            }
+            if (!cancelled) setXtermReady(true);
+          });
+        });
 
         // ResizeObserver to keep the terminal fitted to its container
         observer = new ResizeObserver(() => {
+          if (!term.element || !fitAddon) return;
           try {
             fitAddon.fit();
           } catch {
@@ -127,9 +138,13 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
       renderedCountRef.current = 0;
       const text = events.map((ev) => ev.content).join("\n");
       if (termRef.current) {
-        termRef.current.clear();
-        if (text) termRef.current.write(text + "\n");
-        termRef.current.scrollToBottom();
+        try {
+          termRef.current.clear();
+          if (text) termRef.current.write(text + "\n");
+          termRef.current.scrollToBottom();
+        } catch {
+          // terminal may not be fully initialised yet
+        }
       } else if (fallbackRef.current) {
         const pre = fallbackRef.current;
         pre.textContent = text ? `${text}\n` : "";
@@ -151,8 +166,12 @@ export default function XtermStream({ nodeId = "" }: XtermStreamProps) {
     const text = newEvents.map((ev) => ev.content).join("\n");
 
     if (termRef.current) {
-      termRef.current.write(text + "\n");
-      termRef.current.scrollToBottom();
+      try {
+        termRef.current.write(text + "\n");
+        termRef.current.scrollToBottom();
+      } catch {
+        // terminal may not be fully initialised yet
+      }
     } else if (fallbackRef.current) {
       const pre = fallbackRef.current;
       pre.textContent += text + "\n";

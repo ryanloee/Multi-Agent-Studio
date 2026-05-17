@@ -132,7 +132,7 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
 
   return (
     <div ref={scrollRef} className="w-full h-full overflow-y-auto bg-white">
-      <div className="mx-auto max-w-5xl px-4 py-3">
+      <div className="max-w-5xl px-4 py-3">
         <MarkdownMessage content={markdown} />
       </div>
     </div>

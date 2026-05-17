@@ -61,6 +61,11 @@ def _load_models_from_settings() -> list[dict]:
     for m in settings_models:
         if not isinstance(m, dict):
             continue
+        
+        # Skip disabled models
+        if m.get("enabled", True) is False:
+            continue
+            
         model_id = m.get("id", "")
         name = m.get("name", "") or m.get("default_model", "")
         fmt = m.get("format", "openai")
