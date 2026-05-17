@@ -149,7 +149,7 @@ function Kill-PortProcesses {
         }
         Write-Host "  Port ${Port}: root=$rootName[$rootPid] (holders: $($portHolderNames -join ', '))" -ForegroundColor Yellow
         # taskkill /T kills the entire process tree from root down
-        & taskkill /F /T /PID $rootPid 2>&1 | Out-Null
+        try { & taskkill /F /T /PID $rootPid 2>&1 | Out-Null } catch {}
         # Belt-and-suspenders: also walk the tree manually
         Kill-ProcessTree -ParentPid $rootPid
     }

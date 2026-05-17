@@ -247,17 +247,15 @@ const BaseNode = memo(function BaseNode({ id, data, selected, children }: BaseNo
       {nodeStatus !== "idle" && (
         <div className="mx-3 mb-1 flex items-center gap-1.5">
           {nodeStatus === "running" && (
-            <>
-              {/* Blue pulsing dot */}
-              <span className="relative flex h-2 w-2">
+            <div className="flex items-center gap-1.5 rounded-sm bg-blue-50 px-1.5 py-1">
+              <span className="relative flex h-2.5 w-2.5">
                 <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75" />
-                <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500" />
+                <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-blue-500" />
               </span>
-              {/* Current action text */}
-              <span className="text-xs text-blue-600 font-medium truncate">
+              <span className="text-xs text-blue-700 font-semibold truncate">
                 {currentAction}
               </span>
-            </>
+            </div>
           )}
           {nodeStatus === "completed" && (
             <>

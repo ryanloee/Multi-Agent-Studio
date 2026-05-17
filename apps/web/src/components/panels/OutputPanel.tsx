@@ -7,7 +7,6 @@ import {
   Maximize2,
   Minimize2,
   Brain,
-  Terminal,
   Layers,
   Filter,
   X,
@@ -17,10 +16,8 @@ import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
 import { usePlannerChatStore } from "@/stores/plannerChatStore";
 import { useLocaleStore } from "@/stores/localeStore";
-import { NODE_META, STATUS_COLORS } from "@/lib/constants";
 import type { RunStatus, NodeData } from "@/types/workflow";
 import LLMOutput from "./LLMOutput";
-import XtermStream from "./XtermStream";
 import EventsTab from "./EventsTab";
 import PlannerChatTab from "./PlannerChatTab";
 
@@ -28,14 +25,13 @@ import PlannerChatTab from "./PlannerChatTab";
 // Tab definitions
 // ---------------------------------------------------------------------------
 const BASE_TABS = [
-  { key: "llm", labelKey: "output.tab.llm", icon: Brain },
-  { key: "shell", labelKey: "output.tab.shell", icon: Terminal },
   { key: "events", labelKey: "output.tab.events", icon: Layers },
+  { key: "llm", labelKey: "output.tab.llm", icon: Brain },
 ] as const;
 
 const CHAT_TAB = { key: "chat", labelKey: "output.tab.chat", icon: MessageCircle } as const;
 
-type TabKey = "llm" | "shell" | "events" | "chat";
+type TabKey = "events" | "llm" | "chat";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -74,12 +70,12 @@ function StatusDot({ status }: { status: RunStatus }) {
 }
 
 // ---------------------------------------------------------------------------
-// OutputPanel — collapsible bottom panel with Agent / Shell / Events tabs
+// OutputPanel — collapsible bottom panel with Events / Agent tabs
 // ---------------------------------------------------------------------------
 export default function OutputPanel() {
   const [expanded, setExpanded] = useState(false);
   const [fullscreen, setFullscreen] = useState(false);
-  const [activeTab, setActiveTab] = useState<TabKey>("shell");
+  const [activeTab, setActiveTab] = useState<TabKey>("events");
   const autoExpandedRef = useRef(false);
 
   // Node list from workflow store for the filter dropdown
@@ -204,11 +200,11 @@ export default function OutputPanel() {
 
   return (
     <div
-      className={`w-full border-t border-gray-200 flex flex-col overflow-hidden ${
+      className={`w-full border-t border-gray-200 flex flex-col overflow-hidden bg-white ${
         fullscreen
           ? "fixed inset-0 z-[80] border-0 shadow-2xl"
           : "transition-[height] duration-200 ease-in-out"
-      } ${activeTab === "shell" && expanded ? "bg-[#1e1e1e]" : "bg-white"}`}
+      }`}
       style={panelHeight ? { height: panelHeight } : undefined}
     >
       {/* ---- Header bar (always visible) ---- */}
@@ -328,10 +324,9 @@ export default function OutputPanel() {
             </div>
           )}
           {/* Tab content */}
-          <div className={`flex-1 overflow-hidden ${activeTab === "shell" ? "bg-[#1e1e1e]" : ""}`}>
+          <div className="flex-1 overflow-hidden">
+            {activeTab === "events" && <EventsTab />}
             {activeTab === "llm" && <LLMOutput nodeId={filterNodeId} />}
-            {activeTab === "shell" && <XtermStream nodeId={filterNodeId} />}
-            {activeTab === "events" && <EventsTab nodeId={filterNodeId} />}
             {activeTab === "chat" && <PlannerChatTab />}
           </div>
         </>

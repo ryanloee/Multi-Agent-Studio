@@ -165,6 +165,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     "llm.statusRetry": "🔄 重试中",
     "llm.statusIdle": "✅ 完成",
     "llm.permissionRequest": "🔒 权限请求：",
+    "llm.selectNode": "请在画布中选择一个节点或使用筛选下拉菜单查看输出",
 
     // ─── CommandEditor ───
     "command.label": "命令",
@@ -563,6 +564,7 @@ export const translations: Record<Locale, Record<string, string>> = {
     "llm.statusRetry": "🔄 Retrying",
     "llm.statusIdle": "✅ Done",
     "llm.permissionRequest": "🔒 Permission: ",
+    "llm.selectNode": "Select a node on the canvas or use the filter dropdown to view output",
 
     // ─── CommandEditor ───
     "command.label": "Command",

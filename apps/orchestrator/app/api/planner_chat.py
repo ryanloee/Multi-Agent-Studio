@@ -2524,11 +2524,14 @@ async def planner_chat(
             retry_parts: list[str] = []
             retry_tool_result: dict | None = None
 
+            from app.api.planner_tools import planner_research_tools
+            _retry_tools = planner_research_tools() + _planner_task_plan_tool() + _planner_alignment_tools()
+
             async for event in _call_llm_stream(
                 retry_messages,
                 PLANNER_TASK_SYSTEM,
                 body.thinking_level,
-                tools=planner_tools,
+                tools=_retry_tools,
                 tool_choice_mode="required",
                 max_tokens=32768,
                 model_provider=body.model_provider,

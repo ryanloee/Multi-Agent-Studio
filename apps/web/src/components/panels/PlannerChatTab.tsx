@@ -724,17 +724,6 @@ export default function PlannerChatTab() {
                         {thinkingContent.trim() ? thinkingContent : t("planner.waitingForThinking")}
                       </div>
                     </details>
-                    {rawTextContent.trim() && (
-                      <div className="mt-2 rounded bg-white px-2 py-1">
-                        <div className="mb-1 font-medium text-slate-700">{t("planner.liveReply")}</div>
-                        <div
-                          ref={liveReplyRef}
-                          className="max-h-24 overflow-y-auto whitespace-pre-wrap font-mono text-[10px] leading-relaxed text-slate-700"
-                        >
-                          {rawTextContent}
-                        </div>
-                      </div>
-                    )}
                   </div>
                   {stageHistory.length > 0 && (
                     <div className="rounded border border-blue-100 bg-white px-2 py-1.5 text-[10px] text-blue-800">

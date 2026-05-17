@@ -125,7 +125,9 @@ export default function LLMOutput({ nodeId = "" }: LLMOutputProps) {
   if (events.length === 0) {
     return (
       <div className="flex items-center justify-center h-full text-sm text-gray-400">
-        {t("llm.waiting")}
+        {nodeId
+          ? t("llm.waiting")
+          : t("llm.selectNode")}
       </div>
     );
   }
