@@ -290,6 +290,7 @@ class DirectorLoop:
                 model_provider=global_config.get("director_model_provider", ""),
                 model_id=global_config.get("director_model_id", ""),
                 dag_node_map=dag_node_map,
+                workspace_directory=workspace_directory,
             )
 
             logger.info(
@@ -321,9 +322,10 @@ class DirectorLoop:
 
             # Step 2: Main dispatch loop
             consecutive_no_decision = 0
+            last_decision_error = ""
             while world.iteration <= world.max_iterations and not cancel_event.is_set():
                 # Call Director LLM
-                decision = await self._call_director_llm(
+                decision, decision_error = await self._call_director_llm(
                     run_id=run_id,
                     world_model=world,
                     global_config=global_config,
@@ -331,9 +333,10 @@ class DirectorLoop:
 
                 if decision is None:
                     consecutive_no_decision += 1
-                    logger.warning("Director LLM returned no decision for run %s (consecutive=%d)", run_id, consecutive_no_decision)
+                    last_decision_error = decision_error
+                    logger.warning("Director LLM returned no decision for run %s (consecutive=%d, error=%s)", run_id, consecutive_no_decision, decision_error[:200])
                     if consecutive_no_decision >= 3:
-                        await self._finish_run(run_id, "failed", "Director LLM failed to return a decision 3 times in a row")
+                        await self._finish_run(run_id, "failed", f"Director LLM 连续 3 次未返回有效决策\n{last_decision_error}")
                         return
                     world.iteration += 1
                     continue
@@ -389,6 +392,7 @@ class DirectorLoop:
                     model_provider=global_config.get("worker_model_provider", ""),
                     model_id=global_config.get("worker_model_id", ""),
                     dag_node_map=dag_node_map,
+                    workspace_directory=workspace_directory,
                 )
 
                 # Parse result
@@ -421,6 +425,11 @@ class DirectorLoop:
             await self._finish_run(run_id, "failed", "Internal error in director loop")
         finally:
             if sandbox_id:
+                if workspace_directory:
+                    try:
+                        await self._sandbox.sync_back(sandbox_id, workspace_directory)
+                    except Exception:
+                        logger.warning("Final sync_back failed for director run %s", run_id, exc_info=True)
                 try:
                     await self._sandbox.destroy(sandbox_id)
                 except Exception:
@@ -441,6 +450,7 @@ class DirectorLoop:
         model_provider: str = "",
         model_id: str = "",
         dag_node_map: dict[str, list[str]] | None = None,
+        workspace_directory: str | None = None,
     ) -> NodeResult:
         """Dispatch a sub-agent via NodeRunner on the shared sandbox."""
         # Prefer DAG node IDs so canvas status animations work
@@ -466,6 +476,7 @@ class DirectorLoop:
             agent_type=agent_type,
             prompt=full_prompt,
             sandbox_id=sandbox_id,
+            workspace_directory=workspace_directory,
             cancel_event=cancel_event,
             model_provider=model_provider,
             model_id=model_id,
@@ -489,7 +500,7 @@ class DirectorLoop:
         run_id: str,
         world_model: WorldModel,
         global_config: dict,
-    ) -> dict | None:
+    ) -> tuple[dict | None, str]:
         """Call the Director (strong model) with world model context + tool-use."""
         import httpx
 
@@ -509,7 +520,7 @@ class DirectorLoop:
 
         if not url or not api_key:
             logger.error("No API URL/key for Director LLM (provider=%s, model=%s)", director_provider, director_model)
-            return None
+            return None, f"未配置 API URL 或密钥 (provider={director_provider}, model={director_model})"
 
         system_content = DIRECTOR_SYSTEM.format(
             max_iterations=world_model.max_iterations,
@@ -587,13 +598,16 @@ class DirectorLoop:
 
             # Extract tool call — handle both API formats
             if is_anthropic:
-                return self._parse_anthropic_tool_response(data)
+                result = self._parse_anthropic_tool_response(data)
             else:
-                return self._parse_openai_tool_response(data)
+                result = self._parse_openai_tool_response(data)
+            if result is None:
+                return None, f"LLM 未返回有效决策 (model={director_model}, response={str(data)[:300]})"
+            return result, ""
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Director LLM call failed for run %s", run_id)
-            return None
+            return None, f"Director LLM 调用失败: {str(exc)[:300]}"
 
     def _parse_anthropic_tool_response(self, data: dict) -> dict | None:
         """Parse tool call from Anthropic-format response."""

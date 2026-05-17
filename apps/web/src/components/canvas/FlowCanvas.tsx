@@ -23,6 +23,7 @@ function DagView() {
   const storeNodes = useWorkflowStore((s) => s.nodes);
   const storeEdges = useWorkflowStore((s) => s.edges);
   const setSelectedRunNode = useRunStore((s) => s.setSelectedRunNode);
+  const setSelectedNode = useWorkflowStore((s) => s.setSelectedNode);
 
   const [nodes, setNodes, onNodesChange] = useNodesState(storeNodes as any[]);
   const [edges, setEdges, onEdgesChange] = useEdgesState(storeEdges as any[]);
@@ -38,8 +39,9 @@ function DagView() {
   const onNodeClick = useCallback(
     (_: React.MouseEvent, node: any) => {
       setSelectedRunNode(node.id);
+      setSelectedNode(node.id);
     },
-    [setSelectedRunNode],
+    [setSelectedRunNode, setSelectedNode],
   );
 
   if (storeNodes.length === 0) {

@@ -165,7 +165,7 @@ def _load_settings_models() -> list[dict[str, Any]]:
         _model_config_cache = {"models": []}
         _model_config_cache_time = now
         return []
-    result = [m for m in models if isinstance(m, dict)]
+    result = [m for m in models if isinstance(m, dict) and m.get("enabled", True)]
     _model_config_cache = {"models": result}
     _model_config_cache_time = now
     return result
@@ -312,17 +312,17 @@ class NodeRunner:
                         provider_key = provider_key or _pcfg["key"]
                         break
 
-            _dbg.debug(__name__, "Model config resolved", node_id=node_id,
-                       provider_url=provider_url, model_provider=model_provider,
-                       model_id=model_id, context_window=context_window,
-                       max_output_tokens=max_output_tokens)
-
             if not provider_url or not provider_key:
                 provider_url = provider_url or os.environ.get("MIMO_API_URL", "")
                 provider_key = provider_key or os.environ.get("MIMO_API_KEY", "")
 
             context_window = int(model_cfg.get("context_window") or 128000)
             max_output_tokens = int(model_cfg.get("max_output_tokens") or 4096)
+
+            _dbg.debug(__name__, "Model config resolved", node_id=node_id,
+                       provider_url=provider_url, model_provider=model_provider,
+                       model_id=model_id, context_window=context_window,
+                       max_output_tokens=max_output_tokens)
 
             # Write prompt
             prompt_file = "/workspace/.agent/prompt.txt"
@@ -399,9 +399,31 @@ class NodeRunner:
                 exit_code=exit_code, error=(forced_failure_reason or "")[:500],
             )
 
+            # Collect error details before emitting the event
+            error_detail = forced_failure_reason or ""
+            if state == "failed" and not error_detail:
+                try:
+                    shim = self._sandbox._find_process(exec_id)
+                    if shim and shim._proc.stderr:
+                        stderr_text = await asyncio.to_thread(
+                            lambda: shim._proc.stderr.read().decode("utf-8", errors="replace")[:2000]
+                        )
+                        if stderr_text.strip():
+                            error_detail = stderr_text.strip()
+                except Exception:
+                    pass
+
+            # Build a useful failure message
+            if state == "failed":
+                fail_content = f"exit_code={exit_code}"
+                if error_detail:
+                    fail_content += f"\n{error_detail}"
+            else:
+                fail_content = f"exit_code={exit_code}"
+
             await self._emit(
                 "node_completed" if state == "completed" else "node_failed",
-                run_id, node_id, content=f"exit_code={exit_code}",
+                run_id, node_id, content=fail_content,
             )
             await self._emit("status", run_id, node_id, content=state)
 
@@ -412,20 +434,8 @@ class NodeRunner:
                 exec_id=exec_id,
                 sandbox_id=sandbox_id,
             )
-            if forced_failure_reason:
-                result.error = forced_failure_reason
-
-            if state == "failed":
-                try:
-                    shim = self._sandbox._find_process(exec_id)
-                    if shim and shim._proc.stderr:
-                        stderr_text = await asyncio.to_thread(
-                            lambda: shim._proc.stderr.read().decode("utf-8", errors="replace")[:2000]
-                        )
-                        if stderr_text.strip():
-                            result.error = stderr_text.strip()
-                except Exception:
-                    pass
+            if error_detail:
+                result.error = error_detail
 
             # Capture raw output
             try:
