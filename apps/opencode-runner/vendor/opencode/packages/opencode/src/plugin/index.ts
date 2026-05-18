@@ -57,16 +57,9 @@ export interface Interface {
 export class Service extends Context.Service<Service, Interface>()("@opencode/Plugin") {}
 
 // Built-in plugins that are directly imported (not installed from npm)
-const INTERNAL_PLUGINS: PluginInstance[] = [
-  CodexAuthPlugin,
-  CopilotAuthPlugin,
-  GitlabAuthPlugin,
-  PoeAuthPlugin,
-  CloudflareWorkersAuthPlugin,
-  CloudflareAIGatewayAuthPlugin,
-  AzureAuthPlugin,
-  DigitalOceanAuthPlugin,
-]
+// MAS only uses API key auth — OAuth plugins (Codex, Copilot, GitLab, etc.)
+// are removed to prevent stale auth.json tokens from causing refresh loops.
+const INTERNAL_PLUGINS: PluginInstance[] = []
 
 function isServerPlugin(value: unknown): value is PluginInstance {
   return typeof value === "function"

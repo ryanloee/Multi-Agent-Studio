@@ -769,7 +769,8 @@ async def run_planner_tool_loop(
 
     all_tools = planner_research_tools() + _planner_task_plan_tool() + _planner_alignment_tools()
 
-    _, _, _, fmt = resolve_llm_provider(model_provider, model_id)
+    # Will be overwritten by the first provider_info event from _call_llm_stream
+    fmt = "openai"
 
     for iteration in range(max_iterations):
         tool_calls_this_turn: list[dict] = []
@@ -788,7 +789,10 @@ async def run_planner_tool_loop(
         ):
             etype = event.get("type")
 
-            if etype == "text":
+            if etype == "provider_info":
+                fmt = event.get("format", fmt)
+                continue
+            elif etype == "text":
                 turn_text.append(str(event.get("content") or ""))
                 yield event
             elif etype == "thinking":
@@ -858,14 +862,73 @@ async def run_planner_tool_loop(
 
         # If no tool calls at all (text-only), nudge the model
         if not tool_calls_this_turn:
-            messages.append({
-                "role": "user",
-                "content": (
+            if iteration >= max_iterations - 3:
+                # Last few iterations: be forceful
+                nudge = "请立即调用 planner_task_plan 工具输出最终任务规划，不要输出其他内容。"
+            else:
+                nudge = (
                     "请继续你的分析。如果你已经有足够的信息，请调用 planner_task_plan 工具输出最终规划。"
                     "如果还需要更多信息，请使用可用的研究工具。"
-                ),
-            })
+                )
+            messages.append({"role": "user", "content": nudge})
 
-    # Max iterations reached — force a final call
+    # Max iterations reached — force a final call with tool_choice required
     logger.warning("Planner tool loop reached max iterations (%d), forcing final call", max_iterations)
     yield {"type": "status", "content": "研究轮次已达上限，正在生成最终规划"}
+
+    messages.append({
+        "role": "user",
+        "content": (
+            "研究轮次已达上限。请立即调用 planner_task_plan 工具输出最终任务规划，不要再使用其他工具。"
+        ),
+    })
+
+    forced_tool_calls: list[dict] = []
+    forced_text_parts: list[str] = []
+
+    # Filter to only planner_task_plan tool
+    plan_tool = [t for t in all_tools if t.get("name") == "planner_task_plan"]
+
+    if plan_tool:
+        async for event in _call_llm_stream(
+            messages,
+            system,
+            thinking_level,
+            tools=plan_tool,
+            tool_choice_mode="required",
+            max_tokens=32768,
+            model_provider=model_provider,
+            model_id_override=model_id,
+        ):
+            etype = event.get("type")
+            if etype == "text":
+                forced_text_parts.append(str(event.get("content") or ""))
+                yield event
+            elif etype == "thinking":
+                yield event
+            elif etype == "status":
+                yield event
+            elif etype == "tool_call":
+                forced_tool_calls.append(event)
+
+    for tc in forced_tool_calls:
+        if tc.get("name") == "planner_task_plan":
+            yield tc
+            return
+
+    # Forced call returned other tools — yield them so caller can still use them
+    for tc in forced_tool_calls:
+        yield tc
+        return
+
+    # No tool calls at all — yield a synthetic planner_task_plan from text as last resort
+    forced_text = "".join(forced_text_parts).strip()
+    if forced_text:
+        logger.warning("Forced final call produced no tool_call, synthesizing from text (len=%d)", len(forced_text))
+        yield {"type": "status", "content": "模型未输出结构化工具调用，尝试从文本提取规划"}
+        yield {
+            "type": "tool_call",
+            "name": "planner_task_plan",
+            "input": {"tasks": [], "reply": forced_text},
+            "id": "forced_from_text",
+        }

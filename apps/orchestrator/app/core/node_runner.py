@@ -328,32 +328,58 @@ class NodeRunner:
             prompt_file = "/workspace/.agent/prompt.txt"
             await self._sandbox.write_file(sandbox_id, prompt_file, prompt)
 
-            runner_path = str(_OPENCODE_RUNNER)
-            cmd = (
-                f"mkdir -p /workspace/.agent /workspace/.workflow && "
-                f"cd /workspace && bun {shlex.quote(runner_path)} "
-                f"--provider {shlex.quote(model_provider)} "
-                f"--model {shlex.quote(model_id)} "
-                f"--agent-type {shlex.quote(agent_type)} "
-                f"--run-id {shlex.quote(run_id)} "
-                f"--node-id {shlex.quote(node_id)} "
-                f"--workspace /workspace "
-                f"--prompt-file {shlex.quote(prompt_file)} "
-                f"--stream-dir /workspace/.agent "
-                f"--max-tokens {max_output_tokens} "
-                f"--context-window {context_window} "
+            # Verify prompt file was actually written
+            verify_content = await self._sandbox.read_file(sandbox_id, prompt_file)
+            if not verify_content.strip():
+                logger.error("Prompt file is empty after write for node %s in sandbox %s", node_id, sandbox_id[:12])
+            else:
+                logger.info("Prompt file written OK for node %s (%d bytes)", node_id, len(verify_content))
+
+            # Resolve native paths for bun args
+            native_workspace = self._sandbox.resolve_virtual_path(sandbox_id, "/workspace")
+            native_prompt = self._sandbox.resolve_virtual_path(sandbox_id, prompt_file)
+            native_stream_dir = self._sandbox.resolve_virtual_path(sandbox_id, "/workspace/.agent")
+
+            # Prepare directories via sandbox shell (needs bash for mkdir -p)
+            await self._sandbox.exec(
+                sandbox_id, "mkdir -p /workspace/.agent /workspace/.workflow",
             )
+
+            # Build bun args - launched directly via Popen, NOT via bash -c
+            # bash -c on Windows corrupts paths and causes bun to fail silently
+            bun_exe = shutil.which("bun") or "bun"
+            runner_path = str(_OPENCODE_RUNNER)
+            bun_args = [
+                bun_exe, runner_path,
+                "--provider", model_provider,
+                "--model", model_id,
+                "--agent-type", agent_type,
+                "--run-id", run_id,
+                "--node-id", node_id,
+                "--workspace", native_workspace,
+                "--prompt-file", native_prompt,
+                "--stream-dir", native_stream_dir,
+                "--max-tokens", str(max_output_tokens),
+                "--context-window", str(context_window),
+            ]
             if provider_url:
-                cmd += f"--provider-url {shlex.quote(provider_url)} "
+                bun_args += ["--provider-url", provider_url]
 
             runner_env = dict(subprocess_env)
             if provider_key:
                 runner_env["MAS_OPENCODE_PROVIDER_KEY"] = provider_key
+            runner_env["MAS_WORKSPACE"] = native_workspace
+            runner_env["MAS_PROMPT_FILE"] = native_prompt
+            runner_env["MAS_STREAM_DIR"] = native_stream_dir
 
-            await self._emit("shell_stdout", run_id, node_id, content=f"$ {cmd}")
+            # Display command for UI
+            display_cmd = "bun " + " ".join(shlex.quote(a) for a in bun_args[2:])
+            await self._emit("shell_stdout", run_id, node_id, content=f"$ mkdir -p .agent .workflow && {display_cmd}")
 
-            # Launch
-            exec_id = await self._sandbox.exec_async(sandbox_id, cmd, env=runner_env)
+            # Launch bun directly via Popen (no bash -c)
+            exec_id = await self._sandbox.launch_native_process(
+                sandbox_id, bun_args, env=runner_env, cwd=native_workspace,
+            )
             logger.info("Started runner exec %s in sandbox %s", exec_id[:12], sandbox_id[:12])
 
             # Stream events
@@ -404,10 +430,8 @@ class NodeRunner:
             if state == "failed" and not error_detail:
                 try:
                     shim = self._sandbox._find_process(exec_id)
-                    if shim and shim._proc.stderr:
-                        stderr_text = await asyncio.to_thread(
-                            lambda: shim._proc.stderr.read().decode("utf-8", errors="replace")[:2000]
-                        )
+                    if shim and hasattr(shim, "get_stderr"):
+                        stderr_text = shim.get_stderr()[:2000]
                         if stderr_text.strip():
                             error_detail = stderr_text.strip()
                 except Exception:

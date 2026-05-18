@@ -264,6 +264,9 @@ async def _call_llm_stream(
             elif tool_choice_mode == "auto":
                 body["tool_choice"] = {"type": "auto"}
 
+    # Yield provider info so callers can use the actual format for message injection
+    yield {"type": "provider_info", "format": fmt, "model": model_id}
+
     timeout = httpx.Timeout(connect=15, read=300, write=30, pool=15)
 
     _dbg.log_llm_call(

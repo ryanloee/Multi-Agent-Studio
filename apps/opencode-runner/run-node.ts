@@ -368,7 +368,19 @@ async function main() {
     process.env.OPENCODE_SERVER_ENTRY ||
     path.join(vendoredRoot, "packages/opencode/src/server/server.ts")
   const opencodeCwd = process.env.OPENCODE_PACKAGE_DIR || path.dirname(path.dirname(opencodeEntry))
-  const prompt = await Bun.file(promptFile).text()
+  let prompt: string
+  try {
+    prompt = await Bun.file(promptFile).text()
+  } catch {
+    // Fallback: read from env var in case the virtual path was mangled
+    const envPath = process.env.MAS_PROMPT_FILE
+    if (envPath) {
+      prompt = await Bun.file(envPath).text()
+    } else {
+      await appendEvent(streamFile, { type: "error", content: `Cannot read prompt file: ${promptFile}`, metadata: { source: "opencode-runner" } })
+      process.exit(1)
+    }
+  }
   const config = buildConfig({
     provider: effective.provider,
     configuredProvider: provider,

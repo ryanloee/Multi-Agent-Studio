@@ -283,8 +283,9 @@ function normalizeMessages(
     return result
   }
 
-  // Deepseek requires all assistant messages to have reasoning on them
-  if (model.api.id.toLowerCase().includes("deepseek")) {
+  // Deepseek and MiMo require all assistant messages to have reasoning on them
+  // so that reasoning_content is always preserved in multi-turn tool-call conversations.
+  if (model.api.id.toLowerCase().includes("deepseek") || model.api.id.toLowerCase().includes("mimo")) {
     msgs = msgs.map((msg) => {
       if (msg.role !== "assistant") return msg
       if (Array.isArray(msg.content)) {

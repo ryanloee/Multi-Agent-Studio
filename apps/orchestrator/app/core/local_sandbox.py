@@ -144,18 +144,21 @@ class LocalSandbox:
     def _rewrite_cmd(self, state: _SandboxState, cmd: str) -> str:
         """Replace virtual paths in *cmd* with real host paths.
 
-        ``/workspace`` and ``/sandbox-meta`` are replaced with the actual
-        directories so that git commands, shell redirects, etc. all work on
-        the host filesystem.
+        Uses word-boundary-aware replacement so that only standalone
+        ``/workspace`` and ``/sandbox-meta`` tokens are replaced, not
+        substrings inside other paths (e.g. ``D:\\...\\workspace``).
 
         On Windows the real paths are converted to POSIX style (/c/foo/bar)
         so they work inside Git Bash without backslash/escaping issues.
         """
-        # Replace longer prefix first to avoid partial matches.
+        import re
         meta_posix = self._to_posix(state.meta_dir)
         work_posix = self._to_posix(state.workspace_dir)
-        cmd = cmd.replace("/sandbox-meta", meta_posix)
-        cmd = cmd.replace("/workspace", work_posix)
+        # Replace /sandbox-meta first (longer prefix), then /workspace.
+        # Only match when followed by end-of-string, /, or whitespace —
+        # this avoids corrupting paths like D:\...\workspace\...
+        cmd = re.sub(r"/sandbox-meta(?=/|\s|$)", meta_posix, cmd)
+        cmd = re.sub(r"/workspace(?=/|\s|$)", work_posix, cmd)
         return cmd
 
     def _map_path(self, state: _SandboxState, path: str) -> Path:
@@ -170,6 +173,18 @@ class LocalSandbox:
             return state.meta_dir
         # For any other absolute path, treat as relative to workspace
         return state.workspace_dir / path.lstrip("/")
+
+    def resolve_virtual_path(self, sandbox_id: str, virtual_path: str) -> str:
+        """Map a virtual path to a **native** host path string.
+
+        Unlike ``_map_path`` which returns a ``Path``, this returns a string
+        using the platform's native separator.  This is intended for passing
+        to tools like ``bun`` that run natively on Windows and do not
+        understand Git Bash / POSIX paths (``/d/foo/bar``).
+        """
+        state = self._state(sandbox_id)
+        host = self._map_path(state, virtual_path)
+        return str(host)
 
     @staticmethod
     def _shell_prefix() -> list[str]:
@@ -469,6 +484,57 @@ class LocalSandbox:
         shim = _AsyncProcessShim(proc, stdout_buf, stderr_buf)
         state.processes[exec_id] = shim
         logger.debug("Started async exec %s: %s", exec_id[:12], cmd[:80])
+        return exec_id
+
+    async def launch_native_process(
+        self,
+        sandbox_id: str,
+        args: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> str:
+        """Launch a process directly (no shell wrapping) and return exec_id.
+
+        Unlike ``exec_async`` which wraps commands in ``bash -c``, this launches
+        the process with the exact ``args`` list via ``subprocess.Popen``.
+        This is essential for tools like ``bun`` on Windows where the
+        ``bash -c`` intermediary corrupts file paths and causes silent failures.
+        """
+        state = self._state(sandbox_id)
+        exec_id = uuid4().hex
+        work_dir = cwd or str(state.workspace_dir)
+
+        def _start_proc():
+            import subprocess as sp
+            import threading
+
+            proc = sp.Popen(
+                args,
+                cwd=work_dir,
+                stdout=sp.PIPE,
+                stderr=sp.PIPE,
+                env=env,
+            )
+            stdout_buf: list[bytes] = []
+            stderr_buf: list[bytes] = []
+
+            def _drain(stream, buf: list[bytes]) -> None:
+                for line in iter(stream.readline, b""):
+                    buf.append(line)
+
+            threading.Thread(
+                target=_drain, args=(proc.stdout, stdout_buf), daemon=True,
+            ).start()
+            threading.Thread(
+                target=_drain, args=(proc.stderr, stderr_buf), daemon=True,
+            ).start()
+            return proc, stdout_buf, stderr_buf
+
+        proc, stdout_buf, stderr_buf = await asyncio.to_thread(_start_proc)
+        shim = _AsyncProcessShim(proc, stdout_buf, stderr_buf)
+        state.processes[exec_id] = shim
+        logger.debug("Started native process %s: %s", exec_id[:12], args[0] if args else "")
         return exec_id
 
     async def exec_stream(self, sandbox_id: str, cmd: str) -> AsyncIterator[str]:

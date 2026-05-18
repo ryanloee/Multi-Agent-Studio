@@ -184,7 +184,9 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
       Effect.succeed({
         autoload: false,
         async getModel(sdk: any, modelID: string, _options?: Record<string, any>) {
-          return sdk.responses(modelID)
+          if (sdk.responses) return sdk.responses(modelID)
+          if (sdk.chat) return sdk.chat(modelID)
+          return sdk.languageModel(modelID)
         },
         options: {},
       }),
@@ -192,7 +194,9 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
       Effect.succeed({
         autoload: false,
         async getModel(sdk: any, modelID: string, _options?: Record<string, any>) {
-          return sdk.responses(modelID)
+          if (sdk.responses) return sdk.responses(modelID)
+          if (sdk.chat) return sdk.chat(modelID)
+          return sdk.languageModel(modelID)
         },
         options: {},
       }),
@@ -1255,7 +1259,7 @@ const layer: Layer.Layer<
                 interleaved:
                   model.interleaved ??
                   existingModel?.capabilities.interleaved ??
-                  (!existingModel && apiNpm === "@ai-sdk/openai-compatible" && apiID.includes("deepseek")
+                  (!existingModel && apiNpm === "@ai-sdk/openai-compatible" && (apiID.includes("deepseek") || apiID.includes("mimo"))
                     ? { field: "reasoning_content" }
                     : false),
               },
