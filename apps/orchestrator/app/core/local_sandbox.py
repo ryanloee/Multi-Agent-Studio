@@ -1,8 +1,13 @@
 """Local sandbox: subprocess + host filesystem.
 
 Path mapping:
-    /workspace   -> {sandbox_root}/{workspace_id}/workspace
-    /sandbox-meta -> {sandbox_root}/{workspace_id}/sandbox-meta
+    /workspace                    -> {sandbox_root}/{workspace_id}/workspace
+    /workspace/.mas/containers/{id} -> 节点容器（独立工作目录）
+    /sandbox-meta                 -> {sandbox_root}/{workspace_id}/sandbox-meta
+
+Each node gets an isolated container under .mas/containers/{node_id}/ with its own
+.agent/ directory for runtime state. After node completion, changes are committed
+and merged back to the main workspace via git.
 """
 
 from __future__ import annotations
@@ -83,12 +88,34 @@ class ProcessInfo:
 class _SandboxState:
     """Bookkeeping for one local sandbox."""
 
-    def __init__(self, root: Path, workspace_id: str) -> None:
+    def __init__(self, root: Path, workspace_id: str,
+                 user_workspace: Path | None = None) -> None:
         self.root = root
         self.workspace_id = workspace_id
         self.workspace_dir = root / "workspace"
         self.meta_dir = root / "sandbox-meta"
+        self.user_workspace = user_workspace
+        if user_workspace is not None:
+            self.containers_dir = user_workspace / ".mas" / "containers"
+        else:
+            self.containers_dir = root / "workspace" / ".mas" / "containers"
         self.processes: dict[str, asyncio.subprocess.Process] = {}
+
+    def node_container(self, node_id: str) -> Path:
+        """Return the container path for a specific node."""
+        return self.containers_dir / node_id
+
+    def node_agent_dir(self, node_id: str) -> Path:
+        """Return the .agent directory for a specific node."""
+        return self.containers_dir / node_id / ".agent"
+
+    def node_stream_file(self, node_id: str) -> Path:
+        """Return the stream.jsonl path for a specific node."""
+        return self.containers_dir / node_id / ".agent" / "stream.jsonl"
+
+    def node_runner_port(self, node_id: str) -> Path:
+        """Return the runner.port path for a specific node."""
+        return self.containers_dir / node_id / ".agent" / "runner.port"
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +238,7 @@ class LocalSandbox:
         template: str = "base",
         template_dir: str | None = None,
         storage_root: str | Path | None = None,
+        user_workspace: str | None = None,
     ) -> str:
         """Create a local sandbox directory layout.
 
@@ -218,6 +246,11 @@ class LocalSandbox:
         its contents are copied into the sandbox workspace (overwriting any
         existing files).  A git repository is then initialised with an initial
         commit so that ``sync_back`` can later compute a diff.
+
+        If *user_workspace* is provided, a directory junction (Windows) or
+        symlink (Linux/Mac) is created from the sandbox's ``.mas`` directory
+        to ``{user_workspace}/.mas`` so that runtime state persists in the
+        user's actual workspace.
 
         Returns *workspace_id* as the sandbox identifier (matching the
         convention that callers treat the return value as an opaque sandbox
@@ -244,15 +277,32 @@ class LocalSandbox:
             # Initialise git and create an initial commit so we can diff later
             await self._git_init_with_commit(root / "workspace")
 
-        state = _SandboxState(root, workspace_id)
+        # Create .mas junction to user workspace (if requested)
+        resolved_user_ws: Path | None = None
+        if user_workspace:
+            resolved_user_ws = Path(user_workspace).resolve()
+            user_mas = resolved_user_ws / ".mas"
+            sandbox_mas = root / "workspace" / ".mas"
+            try:
+                user_mas.mkdir(parents=True, exist_ok=True)
+                if not sandbox_mas.exists():
+                    _create_dir_link(sandbox_mas, user_mas)
+                logger.info("Linked sandbox .mas -> %s", user_mas)
+            except Exception:
+                logger.warning("Failed to create .mas junction, using sandbox-local .mas",
+                               exc_info=True)
+                resolved_user_ws = None
+
+        state = _SandboxState(root, workspace_id, user_workspace=resolved_user_ws)
         self._sandboxes[sandbox_id] = state
 
         logger.info(
-            "Created local sandbox %s at %s (template=%s, template_dir=%s)",
+            "Created local sandbox %s at %s (template=%s, template_dir=%s, user_ws=%s)",
             sandbox_id,
             root,
             template,
             template_dir,
+            user_workspace,
         )
         return sandbox_id
 
@@ -299,8 +349,21 @@ class LocalSandbox:
                 dirs_exist_ok=True,
             )
 
+        # Rebuild .mas junction if source had one
+        resolved_user_ws: Path | None = None
+        if source_state.user_workspace is not None:
+            user_mas = source_state.user_workspace / ".mas"
+            sandbox_mas = root / "workspace" / ".mas"
+            try:
+                user_mas.mkdir(parents=True, exist_ok=True)
+                if not sandbox_mas.exists():
+                    _create_dir_link(sandbox_mas, user_mas)
+                resolved_user_ws = source_state.user_workspace
+            except Exception:
+                logger.warning("Failed to rebuild .mas junction in clone", exc_info=True)
+
         # Register the new sandbox state
-        state = _SandboxState(root, new_workspace_id)
+        state = _SandboxState(root, new_workspace_id, user_workspace=resolved_user_ws)
         self._sandboxes[sandbox_id] = state
 
         logger.info(
@@ -313,20 +376,22 @@ class LocalSandbox:
         return self._state(sandbox_id).workspace_dir
 
     async def _git_init_with_commit(self, workspace_path: Path) -> None:
-        """Initialise a git repo in *workspace_path* and commit all contents."""
-        shell = self._shell_prefix()
+        """Initialise a git repo in *workspace_path* and commit all contents.
 
-        def _run(cmd: str) -> subprocess.CompletedProcess:
+        Uses subprocess directly — no shell invocation.
+        """
+        def _run_git(*args: str) -> subprocess.CompletedProcess:
             return subprocess.run(
-                [*shell, cmd],
+                ["git", *args],
                 cwd=str(workspace_path),
                 capture_output=True,
+                text=True,
             )
 
-        await asyncio.to_thread(_run, "git init")
-        await asyncio.to_thread(_run, "git add -A")
+        await asyncio.to_thread(_run_git, "init")
+        await asyncio.to_thread(_run_git, "add", "-A")
         await asyncio.to_thread(
-            _run, 'git commit -m "initial snapshot from template" --allow-empty',
+            _run_git, "commit", "-m", "initial snapshot from template", "--allow-empty",
         )
 
     async def sync_back(self, sandbox_id: str, target_dir: str) -> bool:
@@ -388,6 +453,14 @@ class LocalSandbox:
                     except Exception:
                         pass
         state.processes.clear()
+
+        # Remove .mas junction first (so rmtree doesn't fail on the junction entry)
+        mas_link = state.workspace_dir / ".mas"
+        if mas_link.exists():
+            try:
+                _remove_dir_link(mas_link)
+            except Exception:
+                logger.debug("Could not remove .mas junction at %s", mas_link, exc_info=True)
 
         # Remove directories
         try:
@@ -695,6 +768,36 @@ def _sync_changed_files(source: Path, target: Path) -> tuple[int, int]:
                 skipped += 1
 
     return copied, skipped
+
+
+# ---------------------------------------------------------------------------
+# Directory junction / symlink helpers
+# ---------------------------------------------------------------------------
+
+def _create_dir_link(src: Path, dst: Path) -> None:
+    """Create a directory junction (Windows) or symlink (Linux/Mac) from *src* to *dst*.
+
+    *src* is the link path, *dst* is the target directory.
+    """
+    if platform.system() == "Windows":
+        subprocess.run(
+            ["cmd", "/C", "mklink", "/J", str(src), str(dst)],
+            check=True, capture_output=True,
+        )
+    else:
+        os.symlink(str(dst), str(src), target_is_directory=True)
+
+
+def _remove_dir_link(link: Path) -> None:
+    """Remove a directory junction or symlink without deleting the target.
+
+    On Windows, ``os.rmdir`` removes the junction entry but leaves the target
+    directory intact.  On Linux/Mac, ``Path.unlink`` does the same for symlinks.
+    """
+    if platform.system() == "Windows":
+        os.rmdir(str(link))
+    else:
+        link.unlink()
 
 
 # ---------------------------------------------------------------------------

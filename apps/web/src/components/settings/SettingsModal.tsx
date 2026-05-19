@@ -454,6 +454,7 @@ function ModelsTab() {
         default_model: modelName,
         context_window: normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024),
         max_output_tokens: normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256),
+        reasoning_passthrough: true,
         enabled: true,
       });
       existingIds.add(dedupeKey);
@@ -476,6 +477,7 @@ function ModelsTab() {
       default_model: customModelName.trim(),
       context_window: normalizeNumericInput(formContextWindow, DEFAULT_CONTEXT_WINDOW, 1024),
       max_output_tokens: normalizeNumericInput(formMaxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 256),
+      reasoning_passthrough: true,
       enabled: true,
     });
     setCustomModelName("");
@@ -874,6 +876,18 @@ function ModelsTab() {
                         className="mt-1 w-full rounded border border-gray-200 px-2 py-1 text-xs text-gray-700 focus:border-blue-400 focus:outline-none"
                       />
                     </label>
+                  </div>
+
+                  <div className="flex items-center gap-2 mt-2">
+                    <button
+                      type="button"
+                      onClick={() => updateModel(model.id, { reasoning_passthrough: !model.reasoning_passthrough })}
+                      className="flex items-center gap-1 text-xs text-gray-500 hover:text-gray-700 transition-colors"
+                      title={model.reasoning_passthrough !== false ? t("settings.reasoningPassthroughOn") : t("settings.reasoningPassthroughOff")}
+                    >
+                      {model.reasoning_passthrough !== false ? <ToggleRight size={16} className="text-blue-500" /> : <ToggleLeft size={16} />}
+                      <span>{t("settings.reasoningPassthrough")}</span>
+                    </button>
                   </div>
 
                   {testResult && (

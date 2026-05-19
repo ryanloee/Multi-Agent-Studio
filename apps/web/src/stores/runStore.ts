@@ -80,12 +80,14 @@ function _applyEvents(events: StreamEvent[]) {
       event.node_id &&
       (event.type === "node_started" ||
         event.type === "node_completed" ||
-        event.type === "node_failed")
+        event.type === "node_failed" ||
+        event.type === "node_retried")
     ) {
       const map: Record<string, RunStatus> = {
         node_started: "running",
         node_completed: "completed",
         node_failed: "failed",
+        node_retried: "running",
       };
       newNodeStatuses[event.node_id] = map[event.type];
       mutatedStatuses = true;

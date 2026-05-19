@@ -10,6 +10,7 @@ export interface ModelEntry {
   default_model: string;
   context_window: number;
   max_output_tokens: number;
+  reasoning_passthrough: boolean;
   enabled: boolean;
 }
 

@@ -18,6 +18,7 @@ export type StreamEventType =
   | "node_started"
   | "node_completed"
   | "node_failed"
+  | "node_retried"
   | "child_created"
   | "child_completed"
   | "task_created"

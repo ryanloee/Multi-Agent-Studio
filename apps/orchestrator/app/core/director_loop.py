@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -51,6 +52,30 @@ def _extract_structured_block(text: str, block_name: str) -> dict | None:
     start_idx = text.find(start_marker)
     if start_idx == -1:
         return None
+
+    end_idx = text.find(end_marker, start_idx)
+    if end_idx == -1:
+        # Try to grab everything after start marker to end of text
+        json_text = text[start_idx + len(start_marker):]
+    else:
+        json_text = text[start_idx + len(start_marker):end_idx]
+    json_text = json_text.strip()
+    if not json_text:
+        return None
+    try:
+        return json.loads(json_text)
+    except json.JSONDecodeError:
+        # Try to find the first { ... } block
+        brace_start = json_text.find("{")
+        if brace_start == -1:
+            return None
+        brace_end = json_text.rfind("}")
+        if brace_end == -1:
+            return None
+        try:
+            return json.loads(json_text[brace_start:brace_end + 1])
+        except json.JSONDecodeError:
+            return None
 
 
 def _parse_free_text_decision(text: str) -> dict | None:
@@ -87,34 +112,16 @@ def _parse_free_text_decision(text: str) -> dict | None:
 
     # Default: dispatch a worker with the full text as prompt
     return {"action": "worker", "reasoning": "Director free-text fallback", "prompt": text[:1000], "task_id": "fallback"}
-    end_idx = text.find(end_marker, start_idx)
-    if end_idx == -1:
-        # Try to grab everything after start marker to end of text
-        json_text = text[start_idx + len(start_marker):]
-    else:
-        json_text = text[start_idx + len(start_marker):end_idx]
-    json_text = json_text.strip()
-    if not json_text:
-        return None
-    try:
-        return json.loads(json_text)
-    except json.JSONDecodeError:
-        # Try to find the first { ... } block
-        brace_start = json_text.find("{")
-        if brace_start == -1:
-            return None
-        brace_end = json_text.rfind("}")
-        if brace_end == -1:
-            return None
-        try:
-            return json.loads(json_text[brace_start:brace_end + 1])
-        except json.JSONDecodeError:
-            return None
 
 
 def _extract_llm_text(jsonl_content: str) -> str:
-    """Extract plain LLM text from stream.jsonl event lines."""
+    """Extract LLM text and tool call results from stream.jsonl event lines.
+
+    If *jsonl_content* is not valid JSONL (i.e. no lines parsed successfully),
+    the raw text is returned as-is — it is the agent's final LLM output.
+    """
     parts: list[str] = []
+    parsed_any = False
     for line in jsonl_content.strip().split("\n"):
         line = line.strip()
         if not line:
@@ -123,8 +130,27 @@ def _extract_llm_text(jsonl_content: str) -> str:
             ev = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if ev.get("type", "") in ("llm_token", "llm_chunk", "text"):
-            parts.append(ev.get("content", ""))
+        parsed_any = True
+        event_type = ev.get("type", "")
+        content = ev.get("content", "")
+
+        # Extract LLM text chunks
+        if event_type in ("llm_token", "llm_chunk", "text"):
+            parts.append(content)
+        # Extract tool call results for context
+        elif event_type == "tool_call":
+            tool_name = ev.get("tool_name", "tool")
+            parts.append(f"\n[Tool Call: {tool_name}]\n{content}\n")
+        elif event_type == "tool_result":
+            tool_name = ev.get("tool_name", "tool")
+            parts.append(f"\n[Tool Result: {tool_name}]\n{content}\n")
+        elif event_type in ("shell_stdout", "shell_stderr"):
+            parts.append(f"\n[Shell Output]\n{content}\n")
+
+    # If no JSONL lines were parsed, input is plain text (agent's final output)
+    if not parsed_any:
+        return jsonl_content
+
     return "".join(parts)
 
 
@@ -242,7 +268,7 @@ class DirectorLoop:
         # Build agent_type -> [node_id, ...] mapping from DAG so events use
         # the same IDs as the canvas nodes (enables run-status animations).
         dag_node_map: dict[str, list[str]] = {}
-        for n in dag_json.get("nodes", []):
+        for n in (dag_json.get("nodes") or []):
             if not isinstance(n, dict):
                 continue
             at = str(
@@ -261,6 +287,7 @@ class DirectorLoop:
             sandbox_id = await self._sandbox.create(
                 f"ws-director-{run_id[:8]}",
                 template_dir=workspace_directory,
+                user_workspace=workspace_directory,
             )
             logger.info("Created shared sandbox %s for director run %s", sandbox_id[:12], run_id)
         except Exception:
@@ -291,6 +318,7 @@ class DirectorLoop:
                 model_id=global_config.get("director_model_id", ""),
                 dag_node_map=dag_node_map,
                 workspace_directory=workspace_directory,
+                world=world,
             )
 
             logger.info(
@@ -393,6 +421,7 @@ class DirectorLoop:
                     model_id=global_config.get("worker_model_id", ""),
                     dag_node_map=dag_node_map,
                     workspace_directory=workspace_directory,
+                    world=world,
                 )
 
                 # Parse result
@@ -420,9 +449,9 @@ class DirectorLoop:
 
         except asyncio.CancelledError:
             await self._finish_run(run_id, "cancelled", "Cancelled")
-        except Exception:
+        except Exception as exc:
             logger.exception("Director loop crashed for run %s", run_id)
-            await self._finish_run(run_id, "failed", "Internal error in director loop")
+            await self._finish_run(run_id, "failed", f"Director loop error: {exc}")
         finally:
             if sandbox_id:
                 if workspace_directory:
@@ -451,6 +480,7 @@ class DirectorLoop:
         model_id: str = "",
         dag_node_map: dict[str, list[str]] | None = None,
         workspace_directory: str | None = None,
+        world: WorldModel | None = None,
     ) -> NodeResult:
         """Dispatch a sub-agent via NodeRunner on the shared sandbox."""
         # Prefer DAG node IDs so canvas status animations work
@@ -459,8 +489,21 @@ class DirectorLoop:
             candidates = dag_node_map.get(agent_type, [])
             if candidates:
                 node_id = candidates.pop(0)
+
+        # Reuse failed node ID when Director retries the same action type
+        if not node_id and world:
+            for attempt in reversed(world.failed_attempts):
+                if attempt.action == agent_type:
+                    node_id = attempt.task_id
+                    break
+
         if not node_id:
             node_id = f"{agent_type}-{uuid4().hex[:8]}"
+
+        # Emit retry event so frontend resets node status from "failed" to "running"
+        is_retry = world and any(a.task_id == node_id for a in world.failed_attempts)
+        if is_retry:
+            await self._emit("node_retried", run_id, node_id)
 
         full_prompt = f"{system_prompt}\n\n---\n\n## Task\n{prompt}"
 
@@ -611,7 +654,7 @@ class DirectorLoop:
 
     def _parse_anthropic_tool_response(self, data: dict) -> dict | None:
         """Parse tool call from Anthropic-format response."""
-        content_blocks = data.get("content", [])
+        content_blocks = data.get("content") or []
         for block in content_blocks:
             if block.get("type") == "tool_use":
                 try:
@@ -630,12 +673,12 @@ class DirectorLoop:
 
     def _parse_openai_tool_response(self, data: dict) -> dict | None:
         """Parse tool call from OpenAI-format response."""
-        choices = data.get("choices", [])
+        choices = data.get("choices") or []
         if not choices:
             return None
 
         message = choices[0].get("message", {})
-        tool_calls = message.get("tool_calls", [])
+        tool_calls = message.get("tool_calls") or []
         if not tool_calls:
             content = message.get("content", "") or ""
             decision = _parse_free_text_decision(content)
@@ -713,13 +756,25 @@ class DirectorLoop:
     # ------------------------------------------------------------------
 
     async def _git_diff_stat(self, sandbox_id: str) -> str:
-        """Get a compact git diff --stat for the world model."""
+        """Get a compact git diff --stat for the world model.
+
+        Uses subprocess directly — no shell invocation.
+        """
         try:
-            stdout, _ = await self._sandbox.exec(
-                sandbox_id,
-                'git --git-dir="/sandbox-meta/.git" --work-tree="/workspace" '
-                'diff --stat HEAD 2>/dev/null || true',
-            )
+            git_dir = self._sandbox.resolve_virtual_path(sandbox_id, "/sandbox-meta/.git")
+            work_tree = self._sandbox.resolve_virtual_path(sandbox_id, "/workspace")
+
+            def _run():
+                return subprocess.run(
+                    ["git", f"--git-dir={git_dir}", f"--work-tree={work_tree}",
+                     "diff", "--stat", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    cwd=work_tree,
+                )
+
+            result = await asyncio.to_thread(_run)
+            stdout = result.stdout
             if len(stdout) > 1500:
                 stdout = stdout[:1500] + "..."
             return stdout.strip()

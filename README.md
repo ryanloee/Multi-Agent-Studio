@@ -34,18 +34,8 @@ Multi-Agent Studio 是一个开源的 AI 多智能体工作流编排系统。用
 │  └────────────────┘  └────────────────┘  └───────────────────┘  │
 │  ┌─────────────────────────────────────────────────────────────┐ │
 │  │  Streaming Pipeline                                         │ │
-│  │  文件 JSONL → 解析 → 事件总线 → WebSocket 推送              │ │
+│  │  AgentRunner → 事件回调 → 事件总线 → WebSocket 推送          │ │
 │  └─────────────────────────────────────────────────────────────┘ │
-└───────────┬──────────────────────────────────────────────────────┘
-            │ 子进程调用
-┌───────────▼──────────────────────────────────────────────────────┐
-│         opencode-runner (Bun / TypeScript)                        │
-│                                                                   │
-│  ┌───────────────────┐  ┌───────────────────┐                    │
-│  │   SSE Server      │  │   OpenCode CLI    │                    │
-│  │   (事件流式推送)   │──│   (子进程执行)    │                    │
-│  │   :0 随机端口      │  │   stream.jsonl    │                    │
-│  └───────────────────┘  └───────────────────┘                    │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -74,10 +64,9 @@ Multi-Agent Studio 是一个开源的 AI 多智能体工作流编排系统。用
 | | SQLite + aiosqlite | 本地持久化存储 |
 | | SQLAlchemy 2 (async) | 异步 ORM |
 | | Pydantic v2 | 数据校验与配置 |
-| | httpx | 异步 HTTP 客户端（SSE 订阅） |
-| **Agent 引擎** | OpenCode CLI | 封装为子 Agent，MIT 协议 |
-| | opencode-runner (Bun/TS) | Node 执行器，SSE 事件推送 |
-| | Bun | TypeScript 运行时，启动 opencode 子进程 |
+| | httpx | 异步 HTTP 客户端（LLM API 调用） |
+| **Agent 引擎** | AgentRunner (Python) | Agent 循环，直接调用 LLM API |
+| | AgentTools | 6 核心工具：shell/read/write/edit/glob/grep |
 
 ## 快速开始
 
@@ -86,31 +75,12 @@ Multi-Agent Studio 是一个开源的 AI 多智能体工作流编排系统。用
 | 依赖 | 最低版本 | 检查命令 | 说明 |
 |------|----------|----------|------|
 | Node.js | 18+ | `node --version` | 前端构建 |
-| Bun | 最新 | `bun --version` | opencode-runner 运行时 |
 | Python | 3.11+ | `python3 --version` | 后端运行 |
 | pnpm | 任意 | `pnpm --version` | 前端包管理 |
 | Poetry | 最新 | `poetry --version` | 后端包管理 |
 | Git | 任意 | `git --version` | Checkpoint / 回滚 |
 
 > **Windows 用户**：推荐安装 [Git for Windows](https://git-scm.com/download/win)，Shell 节点依赖 Git Bash。
-
-### 安装 Bun
-
-opencode-runner 使用 Bun 运行时执行 OpenCode CLI：
-
-```bash
-# 通过 npm 安装
-npm install -g bun
-
-# 或通过官方安装脚本
-# Windows (PowerShell):
-powershell -c "irm bun.sh/install.ps1 | iex"
-# Linux / macOS:
-curl -fsSL https://bun.sh/install | bash
-
-# 验证
-bun --version
-```
 
 ### 安装依赖
 
@@ -337,11 +307,6 @@ multi-agent-studio/
 │   │   │       └── task.py             # 任务 ORM 模型
 │   │   ├── data/                       # SQLite 数据库文件
 │   │   └── .sandboxes/                 # 沙盒工作目录
-│   │
-│   └── opencode-runner/                # Node 执行器（Bun / TypeScript）
-│       ├── run-node.ts                 # 主入口：SSE Server + OpenCode 子进程
-│       └── vendor/
-│           └── opencode/               # OpenCode CLI 源码（vendored）
 │
 ├── packages/
 │   └── shared-types/                   # 共享 JSON Schema
@@ -358,38 +323,38 @@ multi-agent-studio/
 └── README.md
 ```
 
-## opencode-runner 架构
+## Agent 执行架构
 
-opencode-runner 是节点执行的核心组件，负责启动 OpenCode CLI 并通过 SSE 实时推送执行事件。
+Agent 执行完全在 Python 进程内完成，无需外部子进程。
 
 ### 执行流程
 
 ```
-LocalDAGExecutor (Python)
+NodeRunner (Python)
     │
-    ├─ 1. 构建 CLI 参数（--model, --provider-url, --provider-key, --prompt 等）
+    ├─ 1. 创建/复用沙盒，初始化工作区
     │
-    ├─ 2. 通过 LocalSandbox.exec_async() 启动子进程
-    │      └─ bun run-node.ts [args...]
+    ├─ 2. 解析模型配置（provider, model, url, key）
     │
-    ├─ 3. run-node.ts 启动 Bun.serve() SSE Server（随机端口）
-    │      └─ 读取 stream.jsonl，实时推送事件到 SSE 连接
+    ├─ 3. 调用 AgentRunner.run()
+    │      ├─ 构建系统提示词（环境信息 + 工具说明 + 自定义 prompt）
+    │      ├─ 循环：
+    │      │   ├─ 调用 LLM API（AgentLLM，支持 Anthropic / OpenAI 格式）
+    │      │   ├─ 解析响应：文本输出 + tool_use 调用
+    │      │   ├─ 通过回调 emit 事件（llm_token, tool_call, tool_result）
+    │      │   ├─ 执行工具（AgentTools：shell/read/write/edit/glob/grep）
+    │      │   └─ 追加工具结果，继续循环
+    │      └─ 返回 AgentResult
     │
-    ├─ 4. run-node.ts 启动 opencode 子进程
-    │      └─ opencode run --format json --model [model] --prompt [prompt]
-    │
-    ├─ 5. Engine 通过 httpx 订阅 SSE（trust_env=False，绕过系统代理）
-    │      └─ 解析事件：llm_token, tool_call, shell_stdout, node_completed 等
-    │
-    └─ 6. 事件 → InProcessEventBus → WebSocketHub → 前端实时渲染
+    └─ 4. 事件 → InProcessEventBus → WebSocketHub → 前端实时渲染
 ```
 
-### SSE 事件类型
+### 事件类型
 
 | 事件 | 说明 | 前端渲染 |
 |------|------|----------|
 | `llm_token` | LLM 逐 Token 输出 | Monaco Editor 打字机效果 |
-| `tool_call` | 工具调用（edit/bash/grep 等） | 工具调用面板 |
+| `tool_call` | 工具调用（shell/edit/grep 等） | 工具调用面板 |
 | `tool_result` | 工具调用结果 | 工具调用面板 |
 | `shell_stdout` | Shell 标准输出 | Xterm.js 终端 |
 | `node_completed` | 节点执行完成 | 节点状态变更 |
@@ -397,10 +362,10 @@ LocalDAGExecutor (Python)
 
 ### 关键设计
 
-- **代理绕过**：Engine 使用 `trust_env=False` 避免系统 HTTP_PROXY 干扰 localhost SSE 连接
-- **进程等待**：Engine 在检查 exit code 前先 `wait_process()` 等待进程退出
-- **终端事件检查**：SSE 断连时检查是否已收到 `node_completed`，避免误判为失败
-- **Windows 兼容**：`process.execPath` 替代硬编码 `"bun"`，支持全局或项目级 bun 安装
+- **纯 Python**：无外部子进程依赖，无需 Bun/Node.js 运行时
+- **直接 API 调用**：通过 httpx 直接调用 LLM API，支持 Anthropic 和 OpenAI 格式
+- **6 核心工具**：shell、read、write、edit、glob、grep，全部 Python 实现
+- **Windows 兼容**：所有 shell 命令通过 Git Bash 或 cmd 执行，文件操作使用 pathlib
 
 ## 节点类型
 

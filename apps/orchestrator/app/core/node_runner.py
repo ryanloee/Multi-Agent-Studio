@@ -6,8 +6,7 @@ dispatch individual sub-agents without pulling in the entire DAG machinery.
 Responsibilities:
   - Create/reuse sandbox
   - Provision workspace + git checkpoint
-  - Launch the opencode runner subprocess
-  - Stream events via SSE or file polling
+  - Run the Python agent loop (AgentRunner) directly
   - Collect raw output and return a NodeResult
 """
 
@@ -17,8 +16,6 @@ import asyncio
 import json
 import logging
 import os
-import shlex
-import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -35,37 +32,6 @@ from app.sandbox.provision import SandboxProvisioner
 logger = logging.getLogger(__name__)
 
 import app.core.debug_logger as _dbg
-
-_repo_root = Path(__file__).resolve().parents[4]
-_OPENCODE_RUNNER = _repo_root / "apps" / "opencode-runner" / "run-node.ts"
-_OPENCODE_PACKAGE_DIR = Path(
-    os.environ.get(
-        "MAS_OPENCODE_PACKAGE_DIR",
-        str(_repo_root / "apps" / "opencode-runner" / "vendor" / "opencode" / "packages" / "opencode"),
-    )
-)
-_OPENCODE_SOURCE_ENTRY = Path(
-    os.environ.get(
-        "MAS_OPENCODE_SOURCE_ENTRY",
-        str(_OPENCODE_PACKAGE_DIR / "src" / "index.ts"),
-    )
-)
-
-_KNOWN_EVENT_TYPES = frozenset({
-    "llm_token", "llm_chunk", "tool_call", "tool_result", "shell_stdout",
-    "shell_stderr", "status", "error", "node_started", "node_completed",
-    "node_failed", "child_created", "child_completed",
-    "task_created", "task_updated", "task_message",
-    "artifact_created", "worker_message",
-    "idle_warning", "agent_status",
-})
-
-_NODE_IDLE_TIMEOUT: dict[str, int] = {
-    "explore": 600, "scout": 600, "plan": 600, "design": 600,
-    "coder": 480, "worker": 480, "shell": 300, "tester": 300,
-    "review": 300, "human": 0, "merge": 300,
-}
-_DEFAULT_IDLE_TIMEOUT = 480
 
 _db_semaphore: asyncio.Semaphore | None = None
 
@@ -105,14 +71,6 @@ class NodeResult:
         }
 
 
-def _build_subprocess_env() -> dict[str, str]:
-    env = dict(os.environ)
-    env["OPENCODE_PACKAGE_DIR"] = str(_OPENCODE_PACKAGE_DIR)
-    env["OPENCODE_SOURCE_ENTRY"] = str(_OPENCODE_SOURCE_ENTRY)
-    env.setdefault("OPENCODE_DISABLE_MODELS_FETCH", "1")
-    return env
-
-
 def _summarize(text: str, max_len: int = 2400) -> str:
     """Produce a compact summary of raw agent output."""
     if not text:
@@ -123,20 +81,6 @@ def _summarize(text: str, max_len: int = 2400) -> str:
     return text[:max_len] + f"\n... (truncated, {len(text)} chars total)"
 
 
-def _extract_llm_text(jsonl_content: str) -> str:
-    """Extract plain LLM text from stream.jsonl event lines."""
-    parts: list[str] = []
-    for line in jsonl_content.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if ev.get("type", "") in ("llm_token", "llm_chunk", "text"):
-            parts.append(ev.get("content", ""))
-    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +123,7 @@ def _normalize_model_config(entry: dict[str, Any]) -> dict[str, str | int]:
         "key": str(entry.get("api_key") or ""),
         "context_window": int(entry.get("context_window") or 128000),
         "max_output_tokens": int(entry.get("max_output_tokens") or 4096),
+        "thinking_mode": bool(entry.get("reasoning_passthrough", True)),
     }
 
 
@@ -220,6 +165,8 @@ class NodeRunner:
         self._event_bus = event_bus
         self._checkpoint = checkpoint
         self._provisioner = provisioner
+        # Maps "run_id:node_id" -> host path of stream.jsonl for active nodes
+        self._stream_files: dict[str, str] = {}
 
     async def execute_node(
         self,
@@ -239,13 +186,15 @@ class NodeRunner:
 
         If *sandbox_id* is provided the sandbox is reused (trunk-based);
         otherwise a fresh one is created from *workspace_directory*.
+        
+        Each node gets an isolated container under .mas/containers/{node_id}/.
+        After completion, changes are committed and merged to the main workspace.
         """
         _dbg.info(__name__, "execute_node starting", node_id=node_id, agent_type=agent_type,
                   model_provider=model_provider, model_id=model_id, sandbox_id=(sandbox_id or "")[:12])
         if cancel_event is None:
             cancel_event = asyncio.Event()
         global_config = global_config or {}
-        subprocess_env = _build_subprocess_env()
 
         await self._emit("node_started", run_id, node_id)
         await self._emit("status", run_id, node_id, content="running")
@@ -256,23 +205,28 @@ class NodeRunner:
             sandbox_id = await self._sandbox.create(
                 workspace_id,
                 template_dir=workspace_directory,
+                user_workspace=workspace_directory,
             )
             _owns_sandbox = True
             logger.info("Created sandbox %s for node %s", sandbox_id[:12], node_id)
         else:
             logger.info("Reusing sandbox %s for node %s", sandbox_id[:12], node_id)
-            await self._sandbox.exec(
-                sandbox_id,
-                "mkdir -p /workspace/.agent && : > /workspace/.agent/stream.jsonl",
-            )
 
-        stream_file = "/workspace/.agent/stream.jsonl"
+        # Node container path: .mas/containers/{node_id}
+        node_container = f"/workspace/.mas/containers/{node_id}"
+        node_agent_dir = f"{node_container}/.agent"
+        stream_file = f"{node_agent_dir}/stream.jsonl"
 
         try:
-            try:
-                await self._provisioner.provision(sandbox_id, {"agent_type": agent_type})
-            except Exception as exc:
-                logger.warning("Provisioning failed for %s: %s", node_id, exc)
+            # Create node container directory structure (Python, no shell)
+            node_agent_host = self._sandbox.resolve_virtual_path(sandbox_id, node_agent_dir)
+            Path(node_agent_host).mkdir(parents=True, exist_ok=True)
+            stream_host = self._sandbox.resolve_virtual_path(sandbox_id, stream_file)
+            Path(stream_host).write_text("", encoding="utf-8")
+            # Register stream file for _emit to write events
+            _stream_key = f"{run_id}:{node_id}"
+            self._stream_files[_stream_key] = stream_host
+            logger.info("Created node container %s for node %s", node_container, node_id)
 
             try:
                 await self._checkpoint.auto_commit(sandbox_id, message=f"before node [{node_id}]")
@@ -324,157 +278,80 @@ class NodeRunner:
                        model_id=model_id, context_window=context_window,
                        max_output_tokens=max_output_tokens)
 
-            # Write prompt
-            prompt_file = "/workspace/.agent/prompt.txt"
-            await self._sandbox.write_file(sandbox_id, prompt_file, prompt)
+            # Resolve native workspace path for agent runner
+            native_workspace = self._sandbox.resolve_virtual_path(sandbox_id, node_container)
 
-            # Verify prompt file was actually written
-            verify_content = await self._sandbox.read_file(sandbox_id, prompt_file)
-            if not verify_content.strip():
-                logger.error("Prompt file is empty after write for node %s in sandbox %s", node_id, sandbox_id[:12])
-            else:
-                logger.info("Prompt file written OK for node %s (%d bytes)", node_id, len(verify_content))
+            # Build model config for agent runner
+            agent_model_config = {
+                "provider": model_provider,
+                "model": model_id,
+                "url": provider_url,
+                "key": provider_key,
+                "context_window": context_window,
+                "max_output_tokens": max_output_tokens,
+                "thinking_mode": bool(model_cfg.get("reasoning_passthrough", True)),
+            }
 
-            # Resolve native paths for bun args
-            native_workspace = self._sandbox.resolve_virtual_path(sandbox_id, "/workspace")
-            native_prompt = self._sandbox.resolve_virtual_path(sandbox_id, prompt_file)
-            native_stream_dir = self._sandbox.resolve_virtual_path(sandbox_id, "/workspace/.agent")
-
-            # Prepare directories via sandbox shell (needs bash for mkdir -p)
-            await self._sandbox.exec(
-                sandbox_id, "mkdir -p /workspace/.agent /workspace/.workflow",
-            )
-
-            # Build bun args - launched directly via Popen, NOT via bash -c
-            # bash -c on Windows corrupts paths and causes bun to fail silently
-            bun_exe = shutil.which("bun") or "bun"
-            runner_path = str(_OPENCODE_RUNNER)
-            bun_args = [
-                bun_exe, runner_path,
-                "--provider", model_provider,
-                "--model", model_id,
-                "--agent-type", agent_type,
-                "--run-id", run_id,
-                "--node-id", node_id,
-                "--workspace", native_workspace,
-                "--prompt-file", native_prompt,
-                "--stream-dir", native_stream_dir,
-                "--max-tokens", str(max_output_tokens),
-                "--context-window", str(context_window),
-            ]
-            if provider_url:
-                bun_args += ["--provider-url", provider_url]
-
-            runner_env = dict(subprocess_env)
-            if provider_key:
-                runner_env["MAS_OPENCODE_PROVIDER_KEY"] = provider_key
-            runner_env["MAS_WORKSPACE"] = native_workspace
-            runner_env["MAS_PROMPT_FILE"] = native_prompt
-            runner_env["MAS_STREAM_DIR"] = native_stream_dir
-
-            # Display command for UI
-            display_cmd = "bun " + " ".join(shlex.quote(a) for a in bun_args[2:])
-            await self._emit("shell_stdout", run_id, node_id, content=f"$ mkdir -p .agent .workflow && {display_cmd}")
-
-            # Launch bun directly via Popen (no bash -c)
-            exec_id = await self._sandbox.launch_native_process(
-                sandbox_id, bun_args, env=runner_env, cwd=native_workspace,
-            )
-            logger.info("Started runner exec %s in sandbox %s", exec_id[:12], sandbox_id[:12])
-
-            # Stream events
-            idle_timeout = _NODE_IDLE_TIMEOUT.get(agent_type, _DEFAULT_IDLE_TIMEOUT)
-            env_timeout = os.environ.get("MAS_NODE_IDLE_TIMEOUT_SECONDS")
-            if env_timeout:
-                idle_timeout = int(env_timeout)
-            forced_failure_reason = ""
-
-            sse_port = await self._read_runner_port(sandbox_id, timeout=15)
-            if sse_port:
-                forced_failure_reason = await self._consume_runner_sse(
-                    sse_port, run_id, node_id, exec_id, cancel_event, idle_timeout,
-                )
-                if forced_failure_reason:
-                    forced_failure_reason = await self._poll_stream_file(
-                        sandbox_id, stream_file, run_id, node_id, exec_id,
-                        cancel_event, idle_timeout, agent_type,
-                    )
-            else:
-                forced_failure_reason = await self._poll_stream_file(
-                    sandbox_id, stream_file, run_id, node_id, exec_id,
-                    cancel_event, idle_timeout, agent_type,
-                )
-
+            # Run agent loop directly (replaces Bun subprocess)
+            from app.core.agent_runner import AgentRunner
+            runner = AgentRunner()
             try:
-                exit_code = await asyncio.wait_for(
-                    self._sandbox.wait_process(exec_id), timeout=30,
+                agent_result = await runner.run(
+                    prompt=prompt,
+                    model_config=agent_model_config,
+                    agent_type=agent_type,
+                    workspace=native_workspace,
+                    emit=self._emit,
+                    run_id=run_id,
+                    node_id=node_id,
+                    cancel_event=cancel_event,
                 )
-            except asyncio.TimeoutError:
-                proc_info = await self._sandbox.get_process(exec_id)
-                exit_code = proc_info.exit_code if proc_info.exit_code is not None else -1
+            finally:
+                await runner.close()
 
-            # Final read
-            await self._stream_log_lines(sandbox_id, stream_file, 0, run_id, node_id)
-
-            if forced_failure_reason and exit_code == 0:
-                forced_failure_reason = ""
-
-            state = "failed" if (forced_failure_reason or exit_code != 0) else "completed"
+            state = "completed" if agent_result.success else "failed"
             _dbg.log_node_lifecycle(
                 __name__, node_id=node_id, agent_type=agent_type, event=state,
-                exit_code=exit_code, error=(forced_failure_reason or "")[:500],
+                exit_code=0 if agent_result.success else 1,
+                error=agent_result.error[:500] if agent_result.error else "",
             )
-
-            # Collect error details before emitting the event
-            error_detail = forced_failure_reason or ""
-            if state == "failed" and not error_detail:
-                try:
-                    shim = self._sandbox._find_process(exec_id)
-                    if shim and hasattr(shim, "get_stderr"):
-                        stderr_text = shim.get_stderr()[:2000]
-                        if stderr_text.strip():
-                            error_detail = stderr_text.strip()
-                except Exception:
-                    pass
-
-            # Build a useful failure message
-            if state == "failed":
-                fail_content = f"exit_code={exit_code}"
-                if error_detail:
-                    fail_content += f"\n{error_detail}"
-            else:
-                fail_content = f"exit_code={exit_code}"
-
-            await self._emit(
-                "node_completed" if state == "completed" else "node_failed",
-                run_id, node_id, content=fail_content,
-            )
-            await self._emit("status", run_id, node_id, content=state)
 
             result = NodeResult(
                 state=state,
-                exit_code=exit_code,
+                exit_code=0 if agent_result.success else 1,
                 node_id=node_id,
-                exec_id=exec_id,
                 sandbox_id=sandbox_id,
             )
-            if error_detail:
-                result.error = error_detail
-
-            # Capture raw output
-            try:
-                raw_log, _ = await self._sandbox.exec(
-                    sandbox_id, f"cat {stream_file} 2>/dev/null || true",
-                    env=subprocess_env,
-                )
-                result.raw_output = raw_log
-            except Exception:
-                pass
-
-            result.result_summary = _summarize(result.raw_output) if result.raw_output else result.error
+            result.raw_output = agent_result.output
+            result.error = agent_result.error
+            result.files_changed = agent_result.files_changed
+            result.result_summary = _summarize(agent_result.output) if agent_result.output else agent_result.error
+            
+            # Commit node changes and merge to main workspace if successful
+            if state == "completed":
+                try:
+                    # Commit changes in the node container
+                    commit_hash = await self._checkpoint.commit_node_changes(
+                        sandbox_id, node_id, 
+                        message=f"node {node_id} completed"
+                    )
+                    logger.info("Committed node %s changes: %s", node_id, commit_hash[:12])
+                    
+                    # Merge node changes to main workspace
+                    merged = await self._checkpoint.merge_node_to_main(sandbox_id, node_id)
+                    if merged:
+                        logger.info("Merged node %s changes to main workspace", node_id)
+                    else:
+                        logger.warning("Failed to merge node %s changes", node_id)
+                except Exception as exc:
+                    logger.warning("Git sync failed for node %s: %s", node_id, exc)
+            
             return result
 
         finally:
+            # Unregister stream file
+            self._stream_files.pop(f"{run_id}:{node_id}", None)
+
             if workspace_directory:
                 try:
                     await self._sandbox.sync_back(sandbox_id, workspace_directory)
@@ -501,6 +378,17 @@ class NodeRunner:
             **extra,
         }
         await self._persist_run_event(event)
+
+        # Append event to stream.jsonl (JSONL format, one JSON per line)
+        _stream_key = f"{run_id}:{node_id}"
+        stream_path = self._stream_files.get(_stream_key)
+        if stream_path:
+            try:
+                with open(stream_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            except OSError:
+                logger.debug("Failed to write to stream file %s", stream_path, exc_info=True)
+
         channel = f"run:{run_id}:stream"
         try:
             await self._event_bus.publish(channel, event)
@@ -529,252 +417,3 @@ class NodeRunner:
             except Exception:
                 logger.warning("Failed to persist run event %s", event.get("type"), exc_info=True)
 
-    # ------------------------------------------------------------------
-    # SSE + file polling (adapted from local_engine.py)
-    # ------------------------------------------------------------------
-
-    async def _read_runner_port(self, sandbox_id: str, timeout: int = 15) -> int | None:
-        port_path: Path | None = None
-        try:
-            state = self._sandbox._state(sandbox_id)
-            port_path = state.workspace_dir / ".agent" / "runner.port"
-        except KeyError:
-            pass
-        except Exception:
-            pass
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if port_path is not None:
-                try:
-                    content = await asyncio.to_thread(lambda: port_path.read_text().strip())
-                    if content and content.isdigit():
-                        return int(content)
-                except FileNotFoundError:
-                    pass
-                except Exception:
-                    pass
-            try:
-                content, _ = await self._sandbox.exec(
-                    sandbox_id, "cat /workspace/.agent/runner.port 2>/dev/null || true",
-                )
-                if content.strip().isdigit():
-                    return int(content.strip())
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-        return None
-
-    async def _consume_runner_sse(
-        self, port: int, run_id: str, node_id: str, exec_id: str,
-        cancel_event: asyncio.Event, idle_timeout_seconds: int,
-    ) -> str:
-        import httpx
-
-        url = f"http://127.0.0.1:{port}/events"
-        forced_failure_reason = ""
-        last_activity = time.monotonic()
-        last_busy_time: float | None = None
-        idle_warnings_sent: set[int] = set()
-        hard_timeout = idle_timeout_seconds * 2 if idle_timeout_seconds > 0 else 0
-
-        async def _idle_monitor() -> str:
-            nonlocal last_activity, last_busy_time, forced_failure_reason
-            while True:
-                await asyncio.sleep(5)
-                if cancel_event.is_set():
-                    break
-                now = time.monotonic()
-                idle_seconds = int(now - last_activity)
-                if last_busy_time is not None and (now - last_busy_time) < idle_timeout_seconds:
-                    if hard_timeout > 0 and (now - last_busy_time) > hard_timeout:
-                        last_busy_time = None
-                    continue
-                if hard_timeout > 0 and idle_seconds >= hard_timeout:
-                    forced_failure_reason = f"node hard timeout after {idle_seconds}s"
-                    self._kill_process(exec_id)
-                    return forced_failure_reason
-                if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
-                    forced_failure_reason = f"node idle timeout after {idle_seconds}s"
-                    self._kill_process(exec_id)
-                    return forced_failure_reason
-                if idle_timeout_seconds > 0 and idle_seconds > 0:
-                    pct = int(idle_seconds / idle_timeout_seconds * 100)
-                    for threshold in (50, 75, 90):
-                        if pct >= threshold and threshold not in idle_warnings_sent:
-                            idle_warnings_sent.add(threshold)
-                            await self._emit(
-                                "idle_warning", run_id, node_id,
-                                content=f"节点无活动 {idle_seconds}s，超过 {threshold}%",
-                                idle_seconds=idle_seconds,
-                                timeout_seconds=idle_timeout_seconds,
-                                threshold_pct=threshold,
-                            )
-            return ""
-
-        try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=5, read=None, write=5, pool=5),
-                trust_env=False,
-            ) as client:
-                async with client.stream("GET", url) as response:
-                    if response.status_code != 200:
-                        return ""
-                    logger.info("SSE connected to runner on port %d for node %s", port, node_id)
-                    monitor_task = asyncio.create_task(_idle_monitor())
-                    try:
-                        async for raw_line in response.aiter_lines():
-                            if cancel_event.is_set() or forced_failure_reason:
-                                break
-                            if not raw_line.startswith("data:"):
-                                continue
-                            raw_line = raw_line[5:].strip()
-                            if not raw_line:
-                                continue
-                            try:
-                                ev = json.loads(raw_line)
-                            except json.JSONDecodeError:
-                                continue
-                            event_type = ev.get("type", "")
-                            if event_type in _KNOWN_EVENT_TYPES:
-                                extra: dict[str, Any] = {
-                                    "content": ev.get("content", ""),
-                                    "tool_name": ev.get("tool_name", ""),
-                                    "timestamp": ev.get("timestamp", 0),
-                                }
-                                if isinstance(ev.get("metadata"), dict):
-                                    extra["metadata"] = ev["metadata"]
-                                await self._emit(event_type, run_id, node_id, **extra)
-                                last_activity = time.monotonic()
-                            elif event_type == "agent_status":
-                                last_activity = time.monotonic()
-                                if ev.get("status_type") == "busy":
-                                    last_busy_time = time.monotonic()
-                                await self._emit(
-                                    "agent_status", run_id, node_id,
-                                    content=ev.get("content", ""),
-                                    status_type=ev.get("status_type", ""),
-                                )
-                    finally:
-                        monitor_task.cancel()
-                        try:
-                            await monitor_task
-                        except asyncio.CancelledError:
-                            pass
-        except Exception:
-            logger.warning("SSE subscription error for node %s", node_id, exc_info=True)
-            if not forced_failure_reason:
-                forced_failure_reason = f"SSE stream error for node {node_id}"
-
-        return forced_failure_reason
-
-    async def _poll_stream_file(
-        self, sandbox_id: str, stream_file: str, run_id: str, node_id: str,
-        exec_id: str, cancel_event: asyncio.Event, idle_timeout_seconds: int,
-        agent_type: str,
-    ) -> str:
-        log_pos = 0
-        last_stream_activity = time.monotonic()
-        last_heartbeat = 0.0
-        idle_warnings_sent: set[int] = set()
-
-        while not cancel_event.is_set():
-            new_log_pos = await self._stream_log_lines(
-                sandbox_id, stream_file, log_pos, run_id, node_id,
-            )
-            if new_log_pos != log_pos:
-                last_stream_activity = time.monotonic()
-            log_pos = new_log_pos
-
-            proc_info = await self._sandbox.get_process(exec_id)
-            if not proc_info.running:
-                break
-
-            now = time.monotonic()
-            idle_seconds = int(now - last_stream_activity)
-
-            if idle_seconds >= 20 and now - last_heartbeat >= 20:
-                await self._emit(
-                    "agent_heartbeat", run_id, node_id,
-                    content=f"节点仍在运行，等待模型或工具输出 {idle_seconds}s",
-                    idle_seconds=idle_seconds,
-                )
-                last_heartbeat = now
-
-            if idle_timeout_seconds > 0:
-                pct = int(idle_seconds / idle_timeout_seconds * 100)
-                for threshold in (50, 75, 90):
-                    if pct >= threshold and threshold not in idle_warnings_sent:
-                        idle_warnings_sent.add(threshold)
-                        await self._emit(
-                            "idle_warning", run_id, node_id,
-                            content=f"节点已空闲 {idle_seconds}s，超过 {threshold}%",
-                            idle_seconds=idle_seconds,
-                            timeout_seconds=idle_timeout_seconds,
-                            threshold_pct=threshold,
-                        )
-
-            if idle_timeout_seconds > 0 and idle_seconds >= idle_timeout_seconds:
-                self._kill_process(exec_id)
-                return f"node idle timeout after {idle_seconds}s"
-
-            await asyncio.sleep(1.0)
-        return ""
-
-    async def _stream_log_lines(
-        self, sandbox_id: str, stream_file: str, start_pos: int,
-        run_id: str, node_id: str,
-    ) -> int:
-        try:
-            if start_pos == 0:
-                log_content, _ = await self._sandbox.exec(
-                    sandbox_id, f"cat {stream_file} 2>/dev/null || true",
-                )
-            else:
-                log_content, _ = await self._sandbox.exec(
-                    sandbox_id, f"tail -c +{start_pos + 1} {stream_file} 2>/dev/null || true",
-                )
-        except Exception:
-            return start_pos
-
-        if len(log_content) <= start_pos:
-            return start_pos
-
-        for line in log_content.strip().split("\n"):
-            if not line.strip():
-                continue
-            try:
-                ev = json.loads(line)
-                event_type = ev.get("type", "")
-                if event_type in _KNOWN_EVENT_TYPES:
-                    extra: dict[str, Any] = {
-                        "content": ev.get("content", ""),
-                        "tool_name": ev.get("tool_name", ""),
-                        "timestamp": ev.get("timestamp", 0),
-                    }
-                    if isinstance(ev.get("metadata"), dict):
-                        extra["metadata"] = ev["metadata"]
-                    await self._emit(event_type, run_id, node_id, **extra)
-                elif event_type == "text":
-                    await self._emit("llm_token", run_id, node_id, content=ev.get("content", ""))
-                elif event_type:
-                    extra = {k: v for k, v in ev.items() if k not in {"type", "run_id", "node_id"}}
-                    await self._emit(event_type, run_id, node_id, **extra)
-            except json.JSONDecodeError:
-                await self._emit("shell_stdout", run_id, node_id, content=line)
-
-        return len(log_content)
-
-    def _kill_process(self, exec_id: str) -> None:
-        try:
-            shim = self._sandbox._find_process(exec_id)
-            if shim is not None:
-                try:
-                    shim.terminate()
-                except Exception:
-                    try:
-                        shim.kill()
-                    except Exception:
-                        pass
-        except Exception:
-            pass

@@ -1,0 +1,2 @@
+{"timestamp":1779027614862,"type":"node_started","run_id":"","node_id":"","content":"opencode runner started","sse_port":6766}
+{"timestamp":1779027614864,"type":"error","content":"ENOENT: no such file or directory, open\nError: ENOENT: no such file or directory, open\n    at async main (D:\\codex\\agent\\mat\\apps\\opencode-runner\\run-node.ts:371:45)","metadata":{"source":"opencode-runner"}}
