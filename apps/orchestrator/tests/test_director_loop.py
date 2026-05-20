@@ -123,9 +123,9 @@ class TestExtractLlmText:
         jsonl = '{"type":"llm_token","content":"hello"}\n{"type":"llm_token","content":" world"}'
         assert _extract_llm_text(jsonl) == "hello world"
 
-    def test_skips_non_text(self):
+    def test_includes_shell_and_text(self):
         jsonl = '{"type":"shell_stdout","content":"$ ls"}\n{"type":"llm_token","content":"hi"}'
-        assert _extract_llm_text(jsonl) == "hi"
+        assert _extract_llm_text(jsonl) == "\n[Shell Output]\n$ ls\nhi"
 
     def test_empty_input(self):
         assert _extract_llm_text("") == ""

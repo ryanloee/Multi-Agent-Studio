@@ -4,124 +4,148 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Multi-Agent Studio is a visual AI multi-agent workflow orchestration platform. Users build DAG workflows by dragging node types (Coder, Plan, Explore, Shell, Review, Human) onto a React Flow canvas, then run them with real-time streaming output. It supports two workflow modes: **manual** (user designs the DAG on canvas) and **auto** (planner agent builds the DAG from a goal description). The monorepo has a Next.js 14 frontend, a Python FastAPI backend, and uses a vendored opencode TypeScript CLI for node execution.
+Multi-Agent Studio is a visual AI multi-agent workflow orchestration platform. Users drag node types (Coder, Planner, Designer, Explorer, Merger, Shell, Reviewer, Human) onto a React Flow canvas to build DAG workflows, then run them with real-time streaming output. Two workflow modes: **manual** (user designs DAG on canvas) and **auto** (Planner Agent generates DAG from goal description). The repo uses Next.js 14 frontend, Python FastAPI backend, and an in-process Python AgentRunner for node execution. Monorepo managed with pnpm workspaces + Turborepo.
 
 ## Common Commands
 
 ### Frontend (apps/web)
 ```bash
 cd apps/web
-pnpm install              # install deps
-pnpm dev                  # dev server on :3000
-pnpm build                # production build
+pnpm install              # Install dependencies
+pnpm dev                  # Dev server :3000
+pnpm build                # Production build
 pnpm lint                 # ESLint
 pnpm type-check           # tsc --noEmit
+pnpm test                 # Vitest unit tests
 ```
 
 ### Backend (apps/orchestrator)
 ```bash
 cd apps/orchestrator
-poetry install            # install deps
-poetry run python -m app.main   # API server on :8000 (with hot reload)
-poetry run pytest               # run all tests
-poetry run pytest tests/test_specific.py -v   # run single test file
-poetry run pytest tests/test_specific.py::test_name -v  # run single test
-poetry run ruff check app/      # lint
-poetry run mypy app/            # type check
+poetry install                            # Install dependencies
+poetry run python -m app.main             # API server :8000 (hot reload)
+poetry run pytest                         # Run all tests
+poetry run pytest tests/test_specific.py -v   # Run single test file
+poetry run pytest tests/test_specific.py::test_name -v  # Run single test
+poetry run ruff check app/                # Lint
+poetry run mypy app/                      # Type check
 ```
 
-### Dev environment (both services)
+### End-to-End Test (root)
+```bash
+# Requires a running backend with valid API key in apps/orchestrator/.env
+python tests/e2e_test.py
+```
+
+### Dev Environment (start both frontend and backend)
 ```bash
 # Windows
-powershell scripts/dev.ps1
+powershell scripts/start.ps1
 # Linux/macOS
-bash scripts/dev.sh
+bash scripts/start.sh
+# Or from repo root via Turborepo
+pnpm dev
 ```
 
 ## Architecture
 
-### Monorepo Layout
+### Repo Structure
 - `apps/web/` — Next.js 14 frontend (App Router, TypeScript)
 - `apps/orchestrator/` — Python FastAPI backend (Poetry, Python 3.11+)
-- `apps/gateway/` — Go API gateway (Phase 2, not yet active)
-- `packages/shared-types/` — JSON schemas for workflow/events/node-config
-- `scripts/` — Setup and dev shell scripts (setup.sh/ps1, dev.sh/ps1)
-- `doc/` — Technical planning documents
+- `packages/shared-types/` — JSON Schema definitions for workflows, events, node config
+- `scripts/` — Setup and dev launch scripts (setup.sh/ps1, start.sh/ps1, build.ps1)
+- `tests/` — Root-level e2e test
 
 ### Frontend Stack
-- **React Flow v12** (`@xyflow/react`) for the DAG canvas
-- **Zustand v5** for state (`workflowStore.ts`, `runStore.ts`, `taskStore.ts`, `settingsStore.ts`, `localeStore.ts`)
-- **Monaco Editor** for prompt editing
+- **React Flow v12** (`@xyflow/react`) DAG canvas
+- **Zustand v5** state management (6 stores: `workflowStore`, `runStore`, `taskStore`, `settingsStore`, `localeStore`, `plannerChatStore`)
+- **Monaco Editor** for prompt editing and LLM output rendering
 - **Xterm.js** for terminal output rendering
 - **TailwindCSS** for styling
-- **i18n** — Full Chinese/English support (`src/lib/i18n.ts`, 220+ keys, locale persisted in localStorage)
-- Next.js rewrites proxy `/api/*` to the backend at `localhost:8000`
+- **i18n** — Full Chinese/English support (`src/lib/i18n.ts`, 270+ translation keys, language preference persisted to localStorage)
+- **Vitest** + Testing Library for unit tests
+- Next.js rewrites proxy `/api/*` to backend `localhost:8000`
 - Path alias: `@/*` maps to `./src/*`
 
-Key frontend paths:
+Frontend key paths:
 - `src/components/canvas/` — Flow canvas and custom node components
-- `src/components/panels/` — Config, output, and tool call panels
-- `src/stores/` — Zustand stores
+- `src/components/panels/` — Config, output, tool call panels
+- `src/stores/` — Zustand state stores
 - `src/hooks/useWebSocket.ts` — WebSocket connection to `/ws/runs/{runId}/stream`
 - `src/lib/api.ts` — Typed API client with structured error handling
-- `src/lib/i18n.ts` — Translation keys and locale management
-- `src/lib/constants.ts` — Node connection rules (`VALID_CONNECTIONS` whitelist: shell↔review blocked, human is sink-only)
+- `src/lib/i18n.ts` — Translation keys and language management
+- `src/lib/constants.ts` — Node connection rules (`VALID_CONNECTIONS` whitelist: shell↔review cannot connect, human can only be a sink)
 
-### Backend Stack (MVP — local-only, no Docker/Redis/Temporal)
+### Backend Stack (MVP Local Mode — no Docker/Redis/Temporal)
 
-The MVP replaces the production infrastructure with local equivalents:
+MVP replaces production infra with local components:
 
-| Production (README describes) | MVP (actual code) |
+| Production | MVP Local Replacement |
 |---|---|
-| PostgreSQL | SQLite via aiosqlite |
+| PostgreSQL | SQLite (aiosqlite) |
 | Redis Pub/Sub | `core/local_bus.py` — InProcessEventBus |
-| Temporal.io | `core/local_engine.py` — LocalDAGExecutor |
-| Docker sandbox | `core/local_sandbox.py` — LocalSandbox (filesystem) |
+| Temporal.io | `core/director_loop.py` — DirectorLoop (agentic dispatch loop) |
+| Docker Sandbox | `core/local_sandbox.py` — LocalSandbox (filesystem isolation) |
+
+#### Director Loop Architecture
+
+The execution engine uses an agentic Director Loop pattern, not a static DAG executor:
+
+1. **DirectorLoop** (`core/director_loop.py`) — Scheduler. Director Agent reads compressed World Model, uses tool-use to call a strong LLM to decide next action, dispatches sub-agents, parses results, loops until done or max iterations.
+2. **NodeRunner** (`core/node_runner.py`) — Executes a single Agent node. Creates/reuses sandbox, initializes workspace, calls Python AgentRunner for the LLM loop.
+3. **AgentRunner** (`core/agent_runner.py`) — Python agent loop. Directly calls LLM API via httpx, executes tools, manages conversation history. Replaces the former Bun/TypeScript opencode CLI subprocess.
+4. **AgentLLM** (`core/agent_llm.py`) — LLM API client. Supports both Anthropic Messages API and OpenAI Chat Completions API formats, streaming and non-streaming.
+5. **AgentTools** (`core/agent_tools.py`) — 6 core tool implementations: shell, read, write, edit, glob, grep. Compatible with Anthropic/OpenAI tool_use format. Includes a 9-strategy fuzzy edit engine.
+6. **WorldModel** (`core/world_model.py`) — Compressed project state (2-4 KB), tracking completed tasks, findings, and TODOs, updated each iteration.
+7. **Director Prompts** (`core/director_prompts.py`) — Role-specific system prompts for Director, Scout, Worker, Tester sub-agents.
+8. **Director Tools** (`core/director_tools.py`) — Director's `decide` tool schema (actions: scout, worker, test, done, failed).
+9. **SandboxBackend** (`core/sandbox_backend.py`) — Multi-backend sandbox abstraction supporting local, bubblewrap, and Docker isolation.
+10. **DebugLogger** (`core/debug_logger.py`) — Detailed runtime logging, toggled via `debug_mode` in settings.json, writes to `data/debug.log` (with rotation).
 
 Backend module responsibilities:
-- `app/main.py` — FastAPI app with lifespan (creates tables, wires up event bus + sandbox + executor)
-- `app/config.py` — Pydantic Settings, env vars prefixed with `MAS_`
-- `app/api/` — REST routers: `workflows.py` (CRUD), `runs.py` (execute/cancel), `models.py` (available models), `planner_chat.py` (interactive workflow design with SSE), `settings.py` (global settings), `tasks.py` (task board CRUD)
-- `app/ws/hub.py` — WebSocket hub, subscribes to event bus per run
-- `app/core/local_bus.py` — In-process async pub/sub
-- `app/core/local_engine.py` — DAG executor: compiles React Flow JSON → topological layers, runs nodes with concurrency control
-- `app/core/local_sandbox.py` — Filesystem-based sandbox (workspace directories under `.sandboxes/`)
-- `app/core/task_scheduler.py` — Task execution scheduler with doom-loop detection and planner escalation
-- `app/workflows/compiler.py` — DAG compiler (React Flow JSON → topo-sorted execution layers)
-- `app/workflows/plan_parser.py` — Plan node output → child node creation
-- `app/sandbox/checkpoint.py` — Git-based checkpoint/rollback
-- `app/sandbox/provision.py` — Sandbox workspace setup
+- `app/main.py` — FastAPI entry point (lifespan creates tables, connects event bus + sandbox + DirectorLoop + NodeRunner)
+- `app/config.py` — Pydantic Settings, all env vars use `MAS_` prefix
+- `app/api/` — REST routes: `workflows.py` (CRUD), `runs.py` (execute/cancel), `models.py` (available models), `planner_chat.py` (SSE interactive planning), `planner_tools.py` (planner research tools: web search, file read, grep), `settings.py` (global settings), `tasks.py` (task board CRUD), `artifacts.py` (run artifacts), `shared_doc.py` (workflow shared doc)
+- `app/ws/hub.py` — WebSocket Hub, subscribes to event bus by run ID
+- `app/core/local_bus.py` — In-process async pub/sub event bus
+- `app/sandbox/checkpoint.py` — Git checkpoint / rollback
+- `app/sandbox/provision.py` — Sandbox workspace initialization
 - `app/models/db.py` — SQLAlchemy ORM models
-- `app/models/schemas.py` — Pydantic request/response schemas
+- `app/models/schemas.py` — Pydantic request/response models
 
-### Event Streaming Pipeline
-Agent output → InProcessEventBus → WebSocketHub → WebSocket → Frontend renders in Monaco (llm_token), Xterm.js (shell_stdout), or tool call panels.
+### Event Stream Pipeline
+AgentRunner calls LLM API directly → emit events via callback → InProcessEventBus → WebSocketHub → WebSocket → frontend real-time rendering (Monaco renders llm_token, Xterm.js renders shell_stdout, tool call panel renders tool_call)
 
-WebSocket behavior: 30-second heartbeat pings, max 500 buffered events per run for late-connecting clients, 3-second auto-reconnect with 10-second fallback polling.
+WebSocket behavior: 30s heartbeat ping, max buffer 500 events (for late-connecting clients to replay), 3s auto-reconnect, 10s fallback polling.
 
 ### Key Configuration
 - Backend env vars use `MAS_` prefix, loaded from `apps/orchestrator/.env`
-  - `MAS_HOST` / `MAS_PORT` — Server binding
+  - `MAS_HOST` / `MAS_PORT` — Service bind address/port
   - `MAS_DATABASE_URL` — SQLite path (default: `sqlite+aiosqlite:///data/multi_agent_studio.db`)
-  - `MAS_ACCESS_PASSWORD` — Optional app access password for LAN deployments; when set, API and WebSocket requests require the password
+  - `MAS_ACCESS_PASSWORD` — Optional access password (for LAN deployment; API and WebSocket requests must carry it when set)
 - Frontend env vars:
-  - `BACKEND_URL` — Backend URL for Next.js rewrites (default: `http://localhost:8000`)
-  - `NEXT_PUBLIC_API_URL` — API base URL (default: `/api`)
-  - `NEXT_PUBLIC_WS_URL` — WebSocket URL (default: `ws://localhost:8000`)
-  - `MAS_STATIC_EXPORT=1` — Enable static export for EXE packaging
-- Backend data stored in `apps/orchestrator/data/` (SQLite DB + settings JSON)
-- Ports: Frontend 3000, Backend API 8000, Swagger docs at `/docs`
+  - `BACKEND_URL` — Backend URL, Next.js rewrites proxy target (default: `http://localhost:8000`)
+  - `NEXT_PUBLIC_API_URL` — API base path (default: `/api`)
+  - `NEXT_PUBLIC_WS_URL` — WebSocket address (default: `ws://localhost:8000`)
+  - `MAS_STATIC_EXPORT=1` — Enable static export (EXE packaging)
+- Backend data stored in `apps/orchestrator/data/` (SQLite database + settings JSON)
+- Model providers configured in `apps/orchestrator/app/api/models.json`
+- Ports: frontend 3000, backend API 8000, Swagger docs at `/docs`
 
 ### CI/CD
-GitHub Actions (`main` branch pushes and PRs):
+GitHub Actions (push/PR to `main`):
 - **Frontend** — lint, type-check, build (Node 20, pnpm)
 - **Backend** — pytest, ruff (Python 3.12, Poetry)
+- **Agent** — pytest (Python 3.12)
+- **Release** — On `v*` tags: PyInstaller builds Windows EXE, publishes GitHub Release
 
 ## Development Notes
 
-- The `apps/orchestrator/app/workflows/` directory has `compiler.py` and `plan_parser.py` but the deleted files (dag_workflow.py, activities.py, worker.py) were Temporal-specific and no longer exist — the local engine in `core/local_engine.py` handles execution.
-- `apps/agent/` (mas_agent) has been removed — node execution is handled entirely by the vendored opencode TypeScript CLI via `apps/opencode-runner/run-node.ts`.
-- Similarly, `agents/`, `mcp_server/`, `memory/`, `streaming/`, and `sandbox/manager.py` are deleted (git status shows `D`) — their functionality is collapsed into the local engine/sandbox modules.
-- Ruff config: target Python 3.11, line length 100, rules E/F/I/N/W
+- The execution engine is **DirectorLoop** (`core/director_loop.py`), not a static DAG executor. The Director Agent dynamically dispatches sub-agents (scout/worker/tester) based on the World Model.
+- Planner chat uses real research tools (`api/planner_tools.py`): web search, file read, grep, URL fetch — server-side execution, multi-turn tool loop.
+- Ruff config: target Python 3.11, line-length 100, rules E/F/I/N/W
 - pytest-asyncio mode is `auto`
-- TypeScript strict mode enabled in the frontend
+- Frontend has TypeScript strict mode enabled
+- Debug logging: enable via `debug_mode: true` in settings.json, logs write to `data/debug.log` (with rotation)
+- `CLAUDE.md` is gitignored — it's a local-only file for AI guidance
+- Package manager: pnpm 9.15.0, Python 3.11+, Node 20

@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,15 @@ logger = logging.getLogger(__name__)
 import app.core.debug_logger as _dbg
 
 
+def _try_parse_json_dict(text: str) -> dict | None:
+    """Parse JSON text, returning a dict or None if the result is not a dict."""
+    try:
+        result = json.loads(text)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
 def _extract_structured_block(text: str, block_name: str) -> dict | None:
     """Extract a JSON block delimited by ===BLOCK_NAME=== ... ===END_BLOCK_NAME===."""
     start_marker = f"==={block_name}==="
@@ -55,27 +65,21 @@ def _extract_structured_block(text: str, block_name: str) -> dict | None:
 
     end_idx = text.find(end_marker, start_idx)
     if end_idx == -1:
-        # Try to grab everything after start marker to end of text
         json_text = text[start_idx + len(start_marker):]
     else:
         json_text = text[start_idx + len(start_marker):end_idx]
     json_text = json_text.strip()
     if not json_text:
         return None
-    try:
-        return json.loads(json_text)
-    except json.JSONDecodeError:
-        # Try to find the first { ... } block
-        brace_start = json_text.find("{")
-        if brace_start == -1:
-            return None
-        brace_end = json_text.rfind("}")
-        if brace_end == -1:
-            return None
-        try:
-            return json.loads(json_text[brace_start:brace_end + 1])
-        except json.JSONDecodeError:
-            return None
+    result = _try_parse_json_dict(json_text)
+    if result is not None:
+        return result
+    # Fallback: try to extract the first { ... } substring
+    brace_start = json_text.find("{")
+    brace_end = json_text.rfind("}")
+    if brace_start == -1 or brace_end == -1 or brace_end <= brace_start:
+        return None
+    return _try_parse_json_dict(json_text[brace_start:brace_end + 1])
 
 
 def _parse_free_text_decision(text: str) -> dict | None:
@@ -129,6 +133,8 @@ def _extract_llm_text(jsonl_content: str) -> str:
         try:
             ev = json.loads(line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
             continue
         parsed_any = True
         event_type = ev.get("type", "")
@@ -370,6 +376,12 @@ class DirectorLoop:
                     continue
                 consecutive_no_decision = 0
 
+                if not isinstance(decision, dict):
+                    logger.warning("Director returned non-dict decision: %s", type(decision).__name__)
+                    consecutive_no_decision += 1
+                    world.iteration += 1
+                    continue
+
                 action = decision.get("action", "")
                 prompt = decision.get("prompt", "")
                 task_id = decision.get("task_id", f"step-{world.iteration}")
@@ -450,8 +462,9 @@ class DirectorLoop:
         except asyncio.CancelledError:
             await self._finish_run(run_id, "cancelled", "Cancelled")
         except Exception as exc:
-            logger.exception("Director loop crashed for run %s", run_id)
-            await self._finish_run(run_id, "failed", f"Director loop error: {exc}")
+            tb = traceback.format_exc()
+            logger.error("Director loop crashed for run %s:\n%s", run_id, tb)
+            await self._finish_run(run_id, "failed", f"Director loop error: {exc}\n{tb[:500]}")
         finally:
             if sandbox_id:
                 if workspace_directory:
@@ -655,14 +668,24 @@ class DirectorLoop:
     def _parse_anthropic_tool_response(self, data: dict) -> dict | None:
         """Parse tool call from Anthropic-format response."""
         content_blocks = data.get("content") or []
+        if isinstance(content_blocks, str):
+            decision = _parse_free_text_decision(content_blocks)
+            if decision:
+                logger.info("Director free-text decision parsed (anthropic string content): action=%s", decision.get("action"))
+                return decision
+            return None
+        text_parts: list[str] = []
         for block in content_blocks:
+            if not isinstance(block, dict):
+                continue
             if block.get("type") == "tool_use":
-                try:
-                    return block.get("input", {})
-                except Exception:
-                    pass
+                inp = block.get("input", {})
+                if isinstance(inp, str):
+                    inp = _try_parse_json_dict(inp) or {}
+                return inp if isinstance(inp, dict) and inp.get("action") else None
+            if block.get("type") == "text":
+                text_parts.append(block.get("text", ""))
         # No tool_use block — try free-text from text blocks
-        text_parts = [b.get("text", "") for b in content_blocks if b.get("type") == "text"]
         full_text = "".join(text_parts)
         decision = _parse_free_text_decision(full_text)
         if decision:
@@ -690,11 +713,10 @@ class DirectorLoop:
 
         tool_call = tool_calls[0]
         function_args = tool_call.get("function", {}).get("arguments", "{}")
-        try:
-            return json.loads(function_args)
-        except json.JSONDecodeError:
+        result = _try_parse_json_dict(function_args)
+        if result is None:
             logger.warning("Failed to parse Director tool call arguments: %s", function_args[:200])
-            return None
+        return result
 
     # ------------------------------------------------------------------
     # World model updates

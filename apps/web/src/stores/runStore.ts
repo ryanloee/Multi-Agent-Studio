@@ -1,7 +1,8 @@
 import { create } from "zustand";
 import { useMemo } from "react";
-import type { RunStatus } from "@/types/workflow";
+import type { RunStatus, WorkflowLifecyclePhase } from "@/types/workflow";
 import type { StreamEvent, StreamEventType, StatusEvent, ChildCreatedEvent, ChildCompletedEvent, DirectorDecisionEvent } from "@/types/events";
+import { useWorkflowStore } from "@/stores/workflowStore";
 
 // ---------------------------------------------------------------------------
 // State shape
@@ -52,26 +53,58 @@ const _eventIds = new Set<string>();
 let _pendingEvents: StreamEvent[] = [];
 let _flushRaf: number | null = null;
 const MAX_PENDING = 100;
+const MAX_EVENT_IDS = 5000;
+
+let _lastSyncedPhase: WorkflowLifecyclePhase | null = null;
+
+/** Update workflowStore.lifecyclePhase when run reaches a terminal state. */
+function _syncWorkflowPhase(phase: WorkflowLifecyclePhase) {
+  if (_lastSyncedPhase === phase) return;
+  const ws = useWorkflowStore.getState();
+  if (ws.lifecyclePhase !== phase) {
+    ws.setLifecyclePhase(phase);
+  }
+  _lastSyncedPhase = phase;
+}
+
+/** Trim _eventIds if it exceeds the cap. */
+function _trimEventIds() {
+  if (_eventIds.size <= MAX_EVENT_IDS) return;
+  const state = useRunStore.getState();
+  const keep = new Set<string>();
+  for (let i = state.events.length - MAX_EVENT_IDS; i < state.events.length; i++) {
+    const eid = state.events[i]?.event_id;
+    if (eid) keep.add(eid);
+  }
+  _eventIds.clear();
+  for (const id of keep) _eventIds.add(id);
+}
 
 /** Apply a batch of events to the store in a single setState call */
 function _applyEvents(events: StreamEvent[]) {
   if (events.length === 0) return;
   const state = useRunStore.getState();
 
-  const newNodeStatuses = { ...state.nodeStatuses };
-  const newParentChildMap = { ...state.parentChildMap };
+  let newNodeStatuses: Record<string, RunStatus> | null = null;
+  let newParentChildMap: Record<string, string[]> | null = null;
   let newStatus = state.status;
   let newProgressSummary = state.progressSummary;
-  let mutatedStatuses = false;
-  let mutatedParentChild = false;
+
+  function statuses(): Record<string, RunStatus> {
+    if (!newNodeStatuses) newNodeStatuses = { ...state.nodeStatuses };
+    return newNodeStatuses;
+  }
+  function childMap(): Record<string, string[]> {
+    if (!newParentChildMap) newParentChildMap = { ...state.parentChildMap };
+    return newParentChildMap;
+  }
 
   for (const event of events) {
     // -- status --
     if (event.type === "status" && event.node_id) {
       const parsed = parseRunStatus((event as StatusEvent).content);
       if (parsed !== null) {
-        newNodeStatuses[event.node_id] = parsed;
-        mutatedStatuses = true;
+        statuses()[event.node_id] = parsed;
       }
     }
 
@@ -89,8 +122,7 @@ function _applyEvents(events: StreamEvent[]) {
         node_failed: "failed",
         node_retried: "running",
       };
-      newNodeStatuses[event.node_id] = map[event.type];
-      mutatedStatuses = true;
+      statuses()[event.node_id] = map[event.type];
     }
 
     // -- run lifecycle --
@@ -104,12 +136,10 @@ function _applyEvents(events: StreamEvent[]) {
       const parentId = event.node_id;
       const childId = ce.child_node_id;
       if (parentId && childId) {
-        const existing = newParentChildMap[parentId] ?? [];
-        newParentChildMap[parentId] = [...existing, childId];
-        mutatedParentChild = true;
-        if (!newNodeStatuses[childId]) {
-          newNodeStatuses[childId] = "pending";
-          mutatedStatuses = true;
+        const existing = childMap()[parentId] ?? [];
+        childMap()[parentId] = [...existing, childId];
+        if (!statuses()[childId]) {
+          statuses()[childId] = "pending";
         }
       }
     }
@@ -118,8 +148,7 @@ function _applyEvents(events: StreamEvent[]) {
     if (event.type === "child_completed") {
       const ce = event as ChildCompletedEvent;
       if (ce.child_node_id) {
-        newNodeStatuses[ce.child_node_id] = "completed";
-        mutatedStatuses = true;
+        statuses()[ce.child_node_id] = "completed";
       }
     }
 
@@ -129,17 +158,12 @@ function _applyEvents(events: StreamEvent[]) {
       newProgressSummary = { total: ps.total, completed: ps.completed, failed: ps.failed };
     }
 
-    // -- director_decision --
-    if (event.type === "director_decision") {
-      // Handled below in state update
-    }
-
     // -- infer running from activity events --
     if (event.node_id) {
-      const cur = newNodeStatuses[event.node_id];
+      const ns = newNodeStatuses ?? state.nodeStatuses;
+      const cur = ns[event.node_id];
       if (!cur || cur === "idle") {
-        newNodeStatuses[event.node_id] = "running";
-        mutatedStatuses = true;
+        statuses()[event.node_id] = "running";
       }
     }
   }
@@ -148,11 +172,16 @@ function _applyEvents(events: StreamEvent[]) {
     (e): e is DirectorDecisionEvent => e.type === "director_decision",
   );
 
+  // Sync workflow lifecycle phase once after processing the batch
+  if (newStatus === "completed" || newStatus === "failed") {
+    _syncWorkflowPhase("review");
+  }
+
   useRunStore.setState({
     events: [...state.events, ...events],
     status: newStatus,
-    nodeStatuses: mutatedStatuses ? newNodeStatuses : state.nodeStatuses,
-    parentChildMap: mutatedParentChild ? newParentChildMap : state.parentChildMap,
+    nodeStatuses: newNodeStatuses ?? state.nodeStatuses,
+    parentChildMap: newParentChildMap ?? state.parentChildMap,
     progressSummary: newProgressSummary,
     directorDecisions: directorDecisions.length > 0
       ? [...state.directorDecisions, ...directorDecisions]
@@ -204,18 +233,18 @@ export const useRunStore = create<RunState>((set, get) => ({
   setStatus: (status) => set({ status }),
 
   addEvent: (event: StreamEvent) => {
-    // O(1) dedup via Set
     if (event.event_id) {
       if (_eventIds.has(event.event_id)) return;
       _eventIds.add(event.event_id);
+      _trimEventIds();
     }
     _pendingEvents.push(event);
     _scheduleFlush();
   },
 
   hydrateEvents: (events: StreamEvent[]) => {
-    // Reset batch state
     _eventIds.clear();
+    _lastSyncedPhase = null;
     _pendingEvents = [];
     if (_flushRaf !== null) {
       cancelAnimationFrame(_flushRaf);
@@ -243,6 +272,7 @@ export const useRunStore = create<RunState>((set, get) => ({
 
   clearEvents: () => {
     _eventIds.clear();
+    _lastSyncedPhase = null;
     _pendingEvents = [];
     if (_flushRaf !== null) {
       cancelAnimationFrame(_flushRaf);
