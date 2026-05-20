@@ -25,7 +25,7 @@ EventEmitter = Callable[..., Awaitable[None]]
 
 # Default limits
 DEFAULT_MAX_TURNS = 80
-DEFAULT_TIMEOUT_SECONDS = 900  # 15 minutes
+DEFAULT_TIMEOUT_SECONDS = 900  # 15 minutes of inactivity
 
 
 @dataclass
@@ -36,6 +36,10 @@ class AgentResult:
     error: str = ""
     turns_used: int = 0
     files_changed: list[str] = field(default_factory=list)
+
+
+class _InactivityTimeout(Exception):
+    """Raised when agent produces no output for the configured timeout."""
 
 
 class AgentRunner:
@@ -77,7 +81,7 @@ class AgentRunner:
             node_id: Node identifier for event routing.
             system_prompt: Optional custom system prompt override.
             max_turns: Maximum LLM call rounds.
-            timeout_seconds: Total time limit.
+            timeout_seconds: Max seconds of inactivity before timeout.
             cancel_event: Optional event to signal cancellation.
 
         Returns:
@@ -88,30 +92,36 @@ class AgentRunner:
 
         result = AgentResult()
         start_time = time.monotonic()
+        last_activity = time.monotonic()
+
+        async def _emit_with_activity(event_type: str, **kwargs: Any) -> None:
+            nonlocal last_activity
+            last_activity = time.monotonic()
+            await emit(event_type, **kwargs)
 
         try:
-            result = await asyncio.wait_for(
-                self._run_loop(
-                    prompt=prompt,
-                    model_config=model_config,
-                    agent_type=agent_type,
-                    workspace=workspace,
-                    emit=emit,
-                    run_id=run_id,
-                    node_id=node_id,
-                    system_prompt=system_prompt,
-                    max_turns=max_turns,
-                    cancel_event=cancel_event,
-                    result=result,
-                    start_time=start_time,
-                    timeout_seconds=timeout_seconds,
-                ),
-                timeout=timeout_seconds,
+            result = await self._run_loop(
+                prompt=prompt,
+                model_config=model_config,
+                agent_type=agent_type,
+                workspace=workspace,
+                emit=_emit_with_activity,
+                run_id=run_id,
+                node_id=node_id,
+                system_prompt=system_prompt,
+                max_turns=max_turns,
+                cancel_event=cancel_event,
+                result=result,
+                start_time=start_time,
+                timeout_seconds=timeout_seconds,
+                last_activity_time=lambda: last_activity,
             )
-        except asyncio.TimeoutError:
+        except _InactivityTimeout:
             result.success = False
-            result.error = f"Agent timed out after {timeout_seconds}s"
-            logger.warning("Agent %s/%s timed out after %ds", run_id, node_id[:12], timeout_seconds)
+            elapsed = time.monotonic() - start_time
+            result.error = f"Agent timed out: no activity for {timeout_seconds}s (total elapsed: {elapsed:.0f}s)"
+            logger.warning("Agent %s/%s timed out (inactivity %ds, elapsed %.0fs)",
+                           run_id, node_id[:12], timeout_seconds, elapsed)
         except Exception as exc:
             result.success = False
             result.error = f"Agent error: {exc}"
@@ -149,6 +159,7 @@ class AgentRunner:
         result: AgentResult,
         start_time: float,
         timeout_seconds: int,
+        last_activity_time: Callable[[], float] | None = None,
     ) -> AgentResult:
         """Inner loop: call LLM -> execute tools -> repeat."""
         # Build system prompt
@@ -171,6 +182,10 @@ class AgentRunner:
                 result.success = False
                 result.error = "Cancelled"
                 return result
+
+            # Check inactivity timeout
+            if last_activity_time and (time.monotonic() - last_activity_time()) > timeout_seconds:
+                raise _InactivityTimeout()
 
             # Emit turn status
             await emit("agent_status", run_id=run_id, node_id=node_id,

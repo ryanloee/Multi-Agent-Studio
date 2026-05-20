@@ -129,3 +129,44 @@ class TestExtractLlmText:
 
     def test_empty_input(self):
         assert _extract_llm_text("") == ""
+
+
+class TestCheckpointRoundtrip:
+    def test_world_model_json_roundtrip(self):
+        model = WorldModel(goal="Build app", project_structure="src/")
+        model.record_success("s1", "scout", "Found files", ["a.py", "b.py"])
+        model.record_failure("w1", "worker", "Build error", prompt_hint="fix main.py")
+        model.iteration = 5
+        model.max_iterations = 30
+        model.current_file_snapshot = "M src/main.py"
+
+        json_str = model.to_json()
+        restored = WorldModel.from_json(json_str)
+
+        assert restored.goal == "Build app"
+        assert restored.project_structure == "src/"
+        assert restored.iteration == 5
+        assert restored.max_iterations == 30
+        assert restored.current_file_snapshot == "M src/main.py"
+        assert len(restored.completed_tasks) == 1
+        assert restored.completed_tasks[0].files_changed == ["a.py", "b.py"]
+        assert len(restored.failed_attempts) == 1
+        assert restored.failed_attempts[0].prompt_hint == "fix main.py"
+
+    def test_checkpoint_data_structure(self):
+        model = WorldModel(goal="test")
+        model.iteration = 3
+        json_str = model.to_json()
+
+        checkpoint = {
+            "world_model_json": json_str,
+            "sandbox_id": "ws-director-abc12345",
+            "global_config": {"_goal": "test"},
+            "workspace_directory": "/tmp/workspace",
+            "dag_json": {"nodes": [], "edges": []},
+            "checkpoint_iteration": 3,
+        }
+
+        assert checkpoint["sandbox_id"] == "ws-director-abc12345"
+        restored = WorldModel.from_json(checkpoint["world_model_json"])
+        assert restored.iteration == 3

@@ -73,6 +73,7 @@ class Run(Base):
     engine_workflow_id: Mapped[Optional[str]] = mapped_column(
         String(512), nullable=True,
     )
+    checkpoint_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
         server_default=func.now(),

@@ -124,6 +124,7 @@ class RunResponse(BaseModel):
     workflow_id: UUID
     status: str
     engine_workflow_id: Optional[str] = None
+    checkpoint_json: Optional[dict[str, Any]] = None
     created_at: datetime
     completed_at: Optional[datetime] = None
 

@@ -146,6 +146,14 @@ async def lifespan(app: FastAPI):
             run_event_table = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' AND name='run_events'"))
             if not run_event_table.fetchone():
                 logger.info("Schema migration: run_events table not found, will be created by create_all")
+            # Check for checkpoint_json on runs table
+            runs_table = await conn.execute(sa_text("SELECT name FROM sqlite_master WHERE type='table' AND name='runs'"))
+            if runs_table.fetchone():
+                runs_cols = await conn.execute(sa_text("PRAGMA table_info(runs)"))
+                runs_columns = {row[1] for row in runs_cols.fetchall()}
+                if "checkpoint_json" not in runs_columns:
+                    logger.info("Schema migration: adding checkpoint_json to runs table")
+                    await conn.execute(sa_text("ALTER TABLE runs ADD COLUMN checkpoint_json TEXT"))
         if needs_reset:
             await db_engine.dispose()
             db_path.unlink(missing_ok=True)

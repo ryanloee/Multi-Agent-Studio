@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.config import settings
 from app.core.director_prompts import (
     DIRECTOR_SYSTEM,
     SCOUT_SYSTEM,
@@ -190,6 +191,7 @@ class DirectorLoop:
         dag_json: dict,
         global_config: dict | None = None,
         workspace_directory: str | None = None,
+        resume_from: dict | None = None,
     ) -> str:
         cancel_event = asyncio.Event()
         self._runs[run_id] = {
@@ -205,6 +207,7 @@ class DirectorLoop:
             self._dispatch_loop(
                 run_id, dag_json, global_config or {}, cancel_event,
                 workspace_directory=workspace_directory,
+                resume_from=resume_from,
             ),
             name=f"director-loop-{run_id}",
         )
@@ -222,9 +225,10 @@ class DirectorLoop:
         return run_id
 
     async def recover_interrupted_runs(self) -> None:
-        """Mark stale running runs as failed — we cannot resume a Director loop."""
+        """Detect interrupted runs and resume from checkpoint if possible."""
         try:
             from sqlalchemy import select
+
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel
 
@@ -234,8 +238,37 @@ class DirectorLoop:
                         RunModel.status.in_(("running", "pending", "cancelling"))
                     )
                 )
-                for run in result.scalars().all():
-                    run.status = "failed"
+                runs = result.scalars().all()
+                if not runs:
+                    return
+
+                for run in runs:
+                    checkpoint = run.checkpoint_json
+                    if not checkpoint or not checkpoint.get("sandbox_id"):
+                        run.status = "failed"
+                        logger.info("Marking interrupted run %s as failed (no checkpoint)", run.id)
+                        continue
+
+                    sandbox_dir = Path(settings.sandbox_root) / checkpoint["sandbox_id"]
+                    if not sandbox_dir.exists():
+                        run.status = "failed"
+                        logger.info("Marking interrupted run %s as failed (sandbox missing)", run.id)
+                        continue
+
+                    run.status = "running"
+                    await session.commit()
+                    logger.info(
+                        "Resuming interrupted run %s from iteration %d",
+                        run.id, checkpoint.get("checkpoint_iteration", 0),
+                    )
+                    await self.start_run(
+                        run_id=str(run.id),
+                        dag_json=checkpoint.get("dag_json", {}),
+                        global_config=checkpoint.get("global_config", {}),
+                        workspace_directory=checkpoint.get("workspace_directory"),
+                        resume_from=checkpoint,
+                    )
+
                 await session.commit()
         except Exception:
             logger.warning("Failed to recover interrupted runs", exc_info=True)
@@ -263,6 +296,7 @@ class DirectorLoop:
         global_config: dict,
         cancel_event: asyncio.Event,
         workspace_directory: str | None = None,
+        resume_from: dict | None = None,
     ) -> None:
         """Main Director loop: call LLM → dispatch sub-agent → update world model → repeat."""
         goal = global_config.get("_goal", "") or dag_json.get("metadata", {}).get("goal", "")
@@ -289,70 +323,105 @@ class DirectorLoop:
 
         # Create shared sandbox for trunk-based development
         sandbox_id: str | None = None
-        try:
-            sandbox_id = await self._sandbox.create(
-                f"ws-director-{run_id[:8]}",
-                template_dir=workspace_directory,
-                user_workspace=workspace_directory,
+        world: WorldModel | None = None
+
+        if resume_from:
+            world = WorldModel.from_json(resume_from["world_model_json"])
+            sandbox_id = resume_from["sandbox_id"]
+            dag_json = resume_from.get("dag_json", dag_json)
+            global_config = resume_from.get("global_config", global_config)
+            workspace_directory = resume_from.get("workspace_directory", workspace_directory)
+            try:
+                await self._sandbox.re_register(sandbox_id, workspace_directory)
+                logger.info(
+                    "Re-registered sandbox %s for resumed run %s at iteration %d",
+                    sandbox_id[:12], run_id, world.iteration,
+                )
+            except Exception:
+                logger.exception("Failed to re-register sandbox for resumed run %s", run_id)
+                await self._finish_run(run_id, "failed", "Sandbox directory not found for resume")
+                return
+
+            await self._emit(
+                "run_resumed", run_id, "director",
+                iteration=world.iteration,
+                checkpoint_iteration=resume_from.get("checkpoint_iteration", 0),
             )
-            logger.info("Created shared sandbox %s for director run %s", sandbox_id[:12], run_id)
-        except Exception:
-            logger.exception("Failed to create sandbox for director run %s", run_id)
-            await self._finish_run(run_id, "failed", "Failed to create sandbox")
+            logger.info("Resumed run %s from iteration %d", run_id, world.iteration)
+        else:
+            try:
+                sandbox_id = await self._sandbox.create(
+                    f"ws-director-{run_id[:8]}",
+                    template_dir=workspace_directory,
+                    user_workspace=workspace_directory,
+                )
+                logger.info("Created shared sandbox %s for director run %s", sandbox_id[:12], run_id)
+            except Exception:
+                logger.exception("Failed to create sandbox for director run %s", run_id)
+                await self._finish_run(run_id, "failed", "Failed to create sandbox")
+                return
+
+            world = WorldModel(goal=goal)
+            world.iteration = 0
+            world.max_iterations = global_config.get("max_iterations", 30)
+
+        if world is None or sandbox_id is None:
+            logger.error("Failed to initialize world/sandbox for run %s", run_id)
+            await self._finish_run(run_id, "failed", "Internal error: state initialization failed")
             return
 
-        world = WorldModel(goal=goal)
-
-        # Initial scout to understand project structure
-        world.iteration = 0
-        world.max_iterations = global_config.get("max_iterations", 30)
+        clean_finish = False
 
         try:
-            # Step 1: Initial scout
-            await self._emit("director_decision", run_id, "director",
-                             action="scout", reasoning="Initial project reconnaissance",
-                             task_id="init-scout", iteration=0)
+            if not resume_from:
+                await self._emit("director_decision", run_id, "director",
+                                 action="scout", reasoning="Initial project reconnaissance",
+                                 task_id="init-scout", iteration=0)
 
-            scout_result = await self._run_sub_agent(
-                run_id=run_id,
-                agent_type="explore",
-                system_prompt=SCOUT_SYSTEM,
-                prompt=f"Investigate the project structure and report findings.\n\nGoal: {goal}",
-                sandbox_id=sandbox_id,
-                cancel_event=cancel_event,
-                model_provider=global_config.get("director_model_provider", ""),
-                model_id=global_config.get("director_model_id", ""),
-                dag_node_map=dag_node_map,
-                workspace_directory=workspace_directory,
-                world=world,
-            )
+                scout_result = await self._run_sub_agent(
+                    run_id=run_id,
+                    agent_type="explore",
+                    system_prompt=SCOUT_SYSTEM,
+                    prompt=f"Investigate the project structure and report findings.\n\nGoal: {goal}",
+                    sandbox_id=sandbox_id,
+                    cancel_event=cancel_event,
+                    model_provider=global_config.get("director_model_provider", ""),
+                    model_id=global_config.get("director_model_id", ""),
+                    dag_node_map=dag_node_map,
+                    workspace_directory=workspace_directory,
+                    world=world,
+                )
 
-            logger.info(
-                "Scout result for run %s: state=%s error=%s raw_output_len=%d",
-                run_id, scout_result.state, (scout_result.error or "")[:100],
-                len(scout_result.raw_output or ""),
-            )
-            _dbg.log_node_lifecycle(
-                __name__, node_id="init-scout", agent_type="explore",
-                event="completed" if scout_result.state == "completed" else "failed",
-                error=(scout_result.error or "")[:500],
-                raw_output_len=len(scout_result.raw_output or ""),
-            )
-            if scout_result.state == "completed" and scout_result.raw_output:
-                llm_text = _extract_llm_text(scout_result.raw_output)
-                findings = _extract_structured_block(llm_text, "SCOUT_FINDINGS")
-                if findings:
-                    world.project_structure = findings.get("summary", llm_text[:2000])
+                logger.info(
+                    "Scout result for run %s: state=%s error=%s raw_output_len=%d",
+                    run_id, scout_result.state, (scout_result.error or "")[:100],
+                    len(scout_result.raw_output or ""),
+                )
+                _dbg.log_node_lifecycle(
+                    __name__, node_id="init-scout", agent_type="explore",
+                    event="completed" if scout_result.state == "completed" else "failed",
+                    error=(scout_result.error or "")[:500],
+                    raw_output_len=len(scout_result.raw_output or ""),
+                )
+                if scout_result.state == "completed" and scout_result.raw_output:
+                    llm_text = _extract_llm_text(scout_result.raw_output)
+                    findings = _extract_structured_block(llm_text, "SCOUT_FINDINGS")
+                    if findings:
+                        world.project_structure = findings.get("summary", llm_text[:2000])
+                    else:
+                        world.project_structure = llm_text[:2000]
+                    world.record_success("init-scout", "scout", "Initial project reconnaissance completed")
                 else:
-                    world.project_structure = llm_text[:2000]
-                world.record_success("init-scout", "scout", "Initial project reconnaissance completed")
-            else:
-                world.record_failure("init-scout", "scout", scout_result.error or "Scout failed")
-                world.project_structure = "(scout failed — project structure unknown)"
+                    world.record_failure("init-scout", "scout", scout_result.error or "Scout failed")
+                    world.project_structure = "(scout failed — project structure unknown)"
 
-            # Update file snapshot
-            world.current_file_snapshot = await self._git_diff_stat(sandbox_id)
-            world.iteration = 1
+                # Update file snapshot
+                world.current_file_snapshot = await self._git_diff_stat(sandbox_id)
+                world.iteration = 1
+
+                # Save checkpoint after initial scout
+                await self._save_checkpoint(run_id, world, sandbox_id,
+                                            global_config, workspace_directory, dag_json)
 
             # Step 2: Main dispatch loop
             consecutive_no_decision = 0
@@ -399,11 +468,13 @@ class DirectorLoop:
 
                 if action == "done":
                     world.record_success(task_id, "done", reasoning)
+                    clean_finish = True
                     await self._finish_run(run_id, "completed", reasoning)
                     return
 
                 if action == "failed":
                     world.record_failure(task_id, "failed", reasoning)
+                    clean_finish = True
                     await self._finish_run(run_id, "failed", reasoning)
                     return
 
@@ -453,13 +524,19 @@ class DirectorLoop:
                 world.current_file_snapshot = await self._git_diff_stat(sandbox_id)
                 world.iteration += 1
 
+                # Save checkpoint after each iteration
+                await self._save_checkpoint(run_id, world, sandbox_id,
+                                            global_config, workspace_directory, dag_json)
+
             # Loop ended without done/failed
+            clean_finish = True
             if cancel_event.is_set():
                 await self._finish_run(run_id, "cancelled", "Cancelled by user")
             else:
                 await self._finish_run(run_id, "failed", f"Max iterations ({world.max_iterations}) reached")
 
         except asyncio.CancelledError:
+            clean_finish = True
             await self._finish_run(run_id, "cancelled", "Cancelled")
         except Exception as exc:
             tb = traceback.format_exc()
@@ -472,10 +549,13 @@ class DirectorLoop:
                         await self._sandbox.sync_back(sandbox_id, workspace_directory)
                     except Exception:
                         logger.warning("Final sync_back failed for director run %s", run_id, exc_info=True)
-                try:
-                    await self._sandbox.destroy(sandbox_id)
-                except Exception:
-                    pass
+                if clean_finish:
+                    try:
+                        await self._sandbox.destroy(sandbox_id)
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Preserving sandbox %s for potential resume", sandbox_id[:12])
 
     # ------------------------------------------------------------------
     # Sub-agent execution
@@ -803,6 +883,40 @@ class DirectorLoop:
         except Exception:
             return ""
 
+    async def _save_checkpoint(
+        self,
+        run_id: str,
+        world: WorldModel,
+        sandbox_id: str,
+        global_config: dict,
+        workspace_directory: str | None,
+        dag_json: dict,
+    ) -> None:
+        """Persist current world model state to the runs table for crash recovery."""
+        try:
+            from sqlalchemy import update
+
+            from app.core.database import async_session_factory
+            from app.models.db import Run as RunModel
+
+            checkpoint_data = {
+                "world_model_json": world.to_json(),
+                "sandbox_id": sandbox_id,
+                "global_config": global_config,
+                "workspace_directory": workspace_directory or "",
+                "dag_json": dag_json,
+                "checkpoint_iteration": world.iteration,
+            }
+            async with async_session_factory() as session:
+                await session.execute(
+                    update(RunModel)
+                    .where(RunModel.id == uuid.UUID(run_id))
+                    .values(checkpoint_json=checkpoint_data)
+                )
+                await session.commit()
+        except Exception:
+            logger.warning("Failed to save checkpoint for run %s", run_id, exc_info=True)
+
     async def _finish_run(self, run_id: str, status: str, message: str = "") -> None:
         """Update run status in memory and DB."""
         run_state = self._runs.get(run_id)
@@ -818,6 +932,7 @@ class DirectorLoop:
     async def _update_run_status_db(self, run_id: str, status: str) -> None:
         try:
             from sqlalchemy import select
+
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel, Workflow as WorkflowModel
 

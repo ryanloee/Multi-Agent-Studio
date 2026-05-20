@@ -127,6 +127,7 @@ function _applyEvents(events: StreamEvent[]) {
 
     // -- run lifecycle --
     if (event.type === "run_started") newStatus = "running";
+    if (event.type === "run_resumed") newStatus = "running";
     if (event.type === "run_completed") newStatus = "completed";
     if (event.type === "run_failed") newStatus = "failed";
 

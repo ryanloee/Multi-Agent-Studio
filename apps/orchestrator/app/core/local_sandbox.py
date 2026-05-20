@@ -433,6 +433,20 @@ class LocalSandbox:
             logger.error("sync_back failed for %s -> %s: %s", sandbox_id[:12], target_dir, exc)
             return False
 
+    async def re_register(self, sandbox_id: str, user_workspace: str | None = None) -> None:
+        """Re-register an existing sandbox directory after server restart.
+
+        Unlike create(), this does NOT copy files or initialize git.
+        It simply registers the directory in the _sandboxes dict.
+        """
+        root = self.root / sandbox_id
+        if not root.exists():
+            raise KeyError(f"Sandbox directory not found: {root}")
+        resolved_user_ws = Path(user_workspace).resolve() if user_workspace else None
+        state = _SandboxState(root, sandbox_id, user_workspace=resolved_user_ws)
+        self._sandboxes[sandbox_id] = state
+        logger.info("Re-registered existing sandbox %s at %s", sandbox_id, root)
+
     async def destroy(self, sandbox_id: str) -> None:
         """Remove sandbox directories and kill any remaining processes."""
         _last_sync_back.pop(sandbox_id, None)
