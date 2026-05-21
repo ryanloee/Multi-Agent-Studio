@@ -15,7 +15,8 @@ import type { WorkflowDetail } from "@/types/api";
 import Toolbar from "@/components/toolbar/Toolbar";
 import LeftPanel from "@/components/sidebar/LeftPanel";
 import FlowCanvas from "@/components/canvas/FlowCanvas";
-import ConfigPanel from "@/components/panels/ConfigPanel";
+import FileBrowserPanel from "@/components/panels/FileBrowserPanel";
+import ConfigModal from "@/components/panels/ConfigModal";
 import OutputPanel from "@/components/panels/OutputPanel";
 import ApprovalModal from "@/components/panels/ApprovalModal";
 import DirectoryPicker from "@/components/common/DirectoryPicker";
@@ -31,6 +32,16 @@ export default function WorkflowEditor() {
   // ---- Panel collapse state ----
   const [leftOpen, setLeftOpen] = useState(true);
   const [rightOpen, setRightOpen] = useState(true);
+  const [configModalOpen, setConfigModalOpen] = useState(false);
+
+  const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);
+  const selectedEdgeId = useWorkflowStore((s) => s.selectedEdgeId);
+
+  useEffect(() => {
+    if (selectedNodeId || selectedEdgeId) {
+      setConfigModalOpen(true);
+    }
+  }, [selectedNodeId, selectedEdgeId]);
 
   // ---- Local state ----
   const [workflowName, setWorkflowName] = useState(t("wfEditor.untitled"));
@@ -225,6 +236,7 @@ export default function WorkflowEditor() {
         workflowName={workflowName}
         onNameChange={handleNameChange}
         onSave={handleSave}
+        onOpenConfig={() => setConfigModalOpen(true)}
       />
 
       {/* Body: LeftPanel + Canvas area + ConfigPanel */}
@@ -280,7 +292,7 @@ export default function WorkflowEditor() {
 
         {/* Right rail + panel */}
         {rightOpen ? (
-          <ConfigPanel />
+          <FileBrowserPanel />
         ) : (
           <div
             className="flex flex-col items-center pt-2 border-l border-gray-200 bg-white"
@@ -301,6 +313,12 @@ export default function WorkflowEditor() {
       {runStatus === "paused" && runId && (
         <ApprovalModal runId={runId} />
       )}
+
+      {/* Config Modal (gear button in toolbar) */}
+      <ConfigModal
+        open={configModalOpen}
+        onClose={() => setConfigModalOpen(false)}
+      />
 
       {!workspaceDirectory.trim() && (
         <div className="absolute inset-0 z-40 flex items-center justify-center bg-gray-950/45 backdrop-blur-[2px] p-6">

@@ -21,6 +21,8 @@ export const translations: Record<Locale, Record<string, string>> = {
     "toolbar.runFailed": "启动工作流失败",
     "toolbar.saved": "已保存",
     "toolbar.setDirFirst": "请先设置工作目录",
+    "toolbar.resume": "继续",
+    "toolbar.resumeTooltip": "从上次中断处继续运行（跳过已完成的步骤）",
 
     // ─── Sidebar ───
     "sidebar.title": "节点库",
@@ -401,6 +403,22 @@ export const translations: Record<Locale, Record<string, string>> = {
     "dirPicker.refresh": "刷新",
     "dirPicker.cancel": "取消",
     "dirPicker.selectDir": "选择此目录",
+
+    // ─── Workspace File Browser ───
+    "fileBrowser.title": "文件浏览器",
+    "fileBrowser.loading": "加载中...",
+    "fileBrowser.empty": "工作区为空",
+    "fileBrowser.noWorkspace": "请先设置工作区目录",
+    "fileBrowser.refresh": "刷新",
+    "fileBrowser.preview": "预览",
+    "fileBrowser.fileTooLarge": "文件过大，内容已截断",
+    "fileBrowser.readFileError": "读取文件失败",
+    "fileBrowser.size": "大小",
+    "fileBrowser.lines": "行",
+
+    // ─── Config Modal ───
+    "configModal.title": "配置",
+    "configModal.openTooltip": "打开配置",
   },
 
   en: {
@@ -423,6 +441,8 @@ export const translations: Record<Locale, Record<string, string>> = {
     "toolbar.runFailed": "Failed to start workflow",
     "toolbar.saved": "Saved",
     "toolbar.setDirFirst": "Please set workspace directory first",
+    "toolbar.resume": "Resume",
+    "toolbar.resumeTooltip": "Resume from last checkpoint (skips completed steps)",
 
     // ─── Sidebar ───
     "sidebar.title": "Nodes",
@@ -803,5 +823,21 @@ export const translations: Record<Locale, Record<string, string>> = {
     "dirPicker.refresh": "Refresh",
     "dirPicker.cancel": "Cancel",
     "dirPicker.selectDir": "Select This Directory",
+
+    // ─── Workspace File Browser ───
+    "fileBrowser.title": "Files",
+    "fileBrowser.loading": "Loading...",
+    "fileBrowser.empty": "Workspace is empty",
+    "fileBrowser.noWorkspace": "Set workspace directory first",
+    "fileBrowser.refresh": "Refresh",
+    "fileBrowser.preview": "Preview",
+    "fileBrowser.fileTooLarge": "File is too large, content truncated",
+    "fileBrowser.readFileError": "Failed to read file",
+    "fileBrowser.size": "Size",
+    "fileBrowser.lines": "lines",
+
+    // ─── Config Modal ───
+    "configModal.title": "Config",
+    "configModal.openTooltip": "Open Settings",
   },
 };

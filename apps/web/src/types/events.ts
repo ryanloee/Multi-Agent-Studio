@@ -15,6 +15,7 @@ export type StreamEventType =
   | "run_started"
   | "run_completed"
   | "run_failed"
+  | "run_resumed"
   | "node_started"
   | "node_completed"
   | "node_failed"

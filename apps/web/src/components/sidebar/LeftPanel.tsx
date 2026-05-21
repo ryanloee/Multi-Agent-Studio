@@ -1,14 +1,14 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { ListTodo, ClipboardList } from "lucide-react";
+import { ListTodo, ClipboardList, Target } from "lucide-react";
 import { useRunStore } from "@/stores/runStore";
 import { useTaskStore } from "@/stores/taskStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import TaskBoard from "@/components/panels/TaskBoard";
 
-type LeftTab = "overview" | "tasks";
+type LeftTab = "overview" | "tasks" | "goal";
 
 export default function LeftPanel({ workflowId }: { workflowId?: string }) {
   const [activeTab, setActiveTab] = useState<LeftTab>("overview");
@@ -74,6 +74,7 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
       {/* Tab header */}
       <div className="flex items-center border-b border-gray-100 shrink-0">
         {tabBtn("overview", <ClipboardList size={14} />, t("leftPanel.overview"))}
+        {tabBtn("goal", <Target size={14} />, t("leftPanel.goal"))}
         {tabBtn("tasks", <ListTodo size={14} />, t("leftPanel.tasks"), taskCount)}
       </div>
 
@@ -116,6 +117,8 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
               </div>
             )}
           </div>
+        ) : activeTab === "goal" ? (
+          <GoalTab />
         ) : (
           <div className="h-full overflow-y-auto">
             {plannedTaskItems.length > 0 && (
@@ -148,6 +151,29 @@ export default function LeftPanel({ workflowId }: { workflowId?: string }) {
         )}
       </div>
     </aside>
+  );
+}
+
+function GoalTab() {
+  const t = useLocaleStore((s) => s.t);
+  const goal = useWorkflowStore((s) => s.goal);
+  const updateGoal = useWorkflowStore((s) => s.updateGoal);
+
+  return (
+    <div className="h-full overflow-y-auto p-3 space-y-3">
+      <div className="space-y-1.5">
+        <label className="block text-[11px] font-semibold text-gray-500 uppercase tracking-wider">
+          {t("workflow.goalLabel")}
+        </label>
+        <textarea
+          value={goal}
+          onChange={(e) => updateGoal(e.target.value)}
+          placeholder={t("workflow.goalPlaceholder")}
+          rows={12}
+          className="w-full rounded-lg border border-gray-200 bg-white px-3 py-2 text-xs text-gray-800 placeholder-gray-300 resize-y focus:border-blue-400 focus:ring-2 focus:ring-blue-100 focus:outline-none transition-all leading-relaxed"
+        />
+      </div>
+    </div>
   );
 }
 

@@ -1,14 +1,7 @@
 "use client";
 
-import { useState, useCallback, useRef, useEffect, type ComponentType } from "react";
+import { useState, useCallback, useRef, useEffect } from "react";
 import {
-  Code,
-  Map,
-  Search,
-  Terminal,
-  FileCheck,
-  GitMerge,
-  User,
   X,
   Settings,
   FolderOpen,
@@ -16,7 +9,6 @@ import {
   Target,
   AlertTriangle,
   CheckCircle2,
-  type LucideProps,
 } from "lucide-react";
 import type { AgentNodeType, EdgeData, WorkflowNode, WorkflowEdge, WorkerAgentType } from "@/types/workflow";
 import { useWorkflowStore } from "@/stores/workflowStore";
@@ -24,47 +16,12 @@ import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { NODE_META } from "@/lib/constants";
+import { ICON_MAP, COLOR_MAP, FEATURES, CHILD_MODEL_TYPES } from "@/lib/nodeConfig";
 import ModelSelector from "./ModelSelector";
 import PromptEditor from "./PromptEditor";
 import PermissionsEditor from "./PermissionsEditor";
 import CommandEditor from "./CommandEditor";
 import DirectoryPicker from "@/components/common/DirectoryPicker";
-
-const ICON_MAP: Record<string, ComponentType<LucideProps>> = {
-  Code, Map, Search, Terminal, FileCheck, GitMerge, User,
-};
-
-const COLOR_MAP: Record<string, { bg: string; text: string }> = {
-  blue: { bg: "bg-blue-50", text: "text-blue-500" },
-  green: { bg: "bg-emerald-50", text: "text-emerald-500" },
-  yellow: { bg: "bg-amber-50", text: "text-amber-500" },
-  gray: { bg: "bg-gray-100", text: "text-gray-500" },
-  purple: { bg: "bg-purple-50", text: "text-purple-500" },
-  orange: { bg: "bg-orange-50", text: "text-orange-500" },
-  teal: { bg: "bg-teal-50", text: "text-teal-500" },
-};
-
-interface FeatureFlags {
-  agentType: boolean;
-  model: boolean;
-  prompt: boolean;
-  permissions: boolean;
-  command: boolean;
-  description: boolean;
-}
-
-const FEATURES: Record<AgentNodeType, FeatureFlags> = {
-  coder:   { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
-  plan:    { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
-  design:  { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
-  explore: { agentType: true,  model: true,  prompt: true,  permissions: false, command: false, description: false },
-  merge:   { agentType: true,  model: true,  prompt: true,  permissions: true,  command: false, description: false },
-  shell:   { agentType: false, model: false, prompt: false, permissions: false, command: true,  description: false },
-  review:  { agentType: true,  model: true,  prompt: true,  permissions: false, command: false, description: false },
-  human:   { agentType: false, model: false, prompt: false, permissions: false, command: false, description: true  },
-};
-
-const CHILD_MODEL_TYPES: WorkerAgentType[] = ["design", "explore", "coder", "merge", "review", "shell"];
 
 export default function ConfigPanel() {
   const selectedNodeId = useWorkflowStore((s) => s.selectedNodeId);

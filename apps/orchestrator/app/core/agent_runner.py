@@ -28,8 +28,8 @@ DEFAULT_MAX_TURNS = 80
 DEFAULT_TIMEOUT_SECONDS = 900  # 15 minutes of inactivity
 
 # LLM retry settings
-LLM_MAX_RETRIES = 3
-LLM_RETRY_BASE_DELAY = 2.0  # seconds, exponential backoff: 2s, 4s, 8s
+LLM_MAX_RETRIES = 10
+LLM_RETRY_BASE_DELAY = 2.0  # seconds, exponential backoff: 2s, 4s, 8s, 16s ...
 
 
 @dataclass
@@ -211,7 +211,7 @@ class AgentRunner:
                 except (LLMConnectionError, LLMTimeoutError) as exc:
                     last_llm_error = exc
                     if attempt < LLM_MAX_RETRIES:
-                        delay = LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        delay = min(LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1)), 30.0)
                         logger.warning(
                             "LLM transient error (attempt %d/%d), retrying in %.1fs: %s",
                             attempt, LLM_MAX_RETRIES, delay, exc,

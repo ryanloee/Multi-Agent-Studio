@@ -37,6 +37,7 @@ from app.api.settings import router as settings_router
 from app.api.shared_doc import router as shared_doc_router  # noqa: E402
 from app.api.tasks import router as tasks_router, init_task_deps as init_tasks_deps
 from app.api.workflows import router as workflows_router
+from app.api.workspace import router as workspace_router
 from app.config import settings
 from app.core.database import engine as db_engine
 from app.core.local_bus import InProcessEventBus
@@ -282,6 +283,7 @@ app.include_router(planner_chat_router, prefix="/api/planner", tags=["planner"])
 app.include_router(settings_router, prefix="/api/settings", tags=["settings"])
 app.include_router(tasks_router, prefix="/api/runs", tags=["tasks"])
 app.include_router(models_router, prefix="/api/models", tags=["models"])
+app.include_router(workspace_router, prefix="/api/workspace", tags=["workspace"])
 
 
 @app.websocket("/ws/runs/{run_id}/stream")

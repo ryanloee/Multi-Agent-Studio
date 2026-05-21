@@ -268,6 +268,12 @@ export const api = {
   cancelRun: (id: string): Promise<void> =>
     request<void>(`/runs/${id}/cancel`, { method: "POST" }),
 
+  /** Resume a failed/completed/cancelled run from its last checkpoint */
+  resumeRun: (id: string): Promise<{ status: string; run_id: string; resumed_from_iteration: number }> =>
+    request<{ status: string; run_id: string; resumed_from_iteration: number }>(`/runs/${id}/resume`, {
+      method: "POST",
+    }),
+
   /** Approve a paused run (Human-in-the-Loop) */
   approveRun: (id: string): Promise<void> =>
     request<void>(`/runs/${id}/approve`, { method: "POST" }),
@@ -448,5 +454,48 @@ export const api = {
   clearDebugLogs: (): Promise<{ success: boolean }> =>
     request<{ success: boolean }>("/settings/debug-logs/clear", {
       method: "POST",
+    }),
+
+  // ---- Workspace File Browser ----
+
+  listWorkspaceTree: (params: {
+    workspace: string;
+    subpath?: string;
+    depth?: number;
+  }): Promise<{
+    root: string;
+    subpath: string;
+    entries: Array<{
+      name: string;
+      path: string;
+      is_dir: boolean;
+      size: number;
+      children: Array<unknown>;
+    }>;
+    error: string;
+  }> =>
+    request("/workspace/tree", {
+      method: "POST",
+      body: JSON.stringify({
+        workspace: params.workspace,
+        subpath: params.subpath ?? "",
+        depth: params.depth ?? 2,
+      }),
+    }),
+
+  readWorkspaceFile: (params: {
+    workspace: string;
+    path: string;
+  }): Promise<{
+    path: string;
+    content: string;
+    size: number;
+    mime_type: string;
+    truncated: boolean;
+    error: string;
+  }> =>
+    request("/workspace/read", {
+      method: "POST",
+      body: JSON.stringify(params),
     }),
 };

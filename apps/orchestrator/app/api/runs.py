@@ -424,3 +424,75 @@ async def rollback_run(
         "commit_hash": commit_hash,
         "reason": body.reason,
     }
+
+
+@router.post("/{run_id}/resume")
+async def resume_run(
+    run_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Resume a failed/interrupted run from its last checkpoint.
+
+    The Director will pick up from the saved WorldModel state, skipping
+    already-completed iterations and the initial scout phase.
+    """
+    engine = _require_engine()
+
+    result = await db.execute(
+        select(Run).where(Run.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    if run.status not in ("failed", "completed", "cancelled"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cannot resume run in status '{run.status}'. "
+                "Only failed/completed/cancelled runs can be resumed."
+            ),
+        )
+
+    checkpoint = run.checkpoint_json
+    if not checkpoint or not checkpoint.get("world_model_json"):
+        raise HTTPException(
+            status_code=400,
+            detail="No checkpoint found for this run. Cannot resume.",
+        )
+
+    sandbox_id = checkpoint.get("sandbox_id")
+    if sandbox_id:
+        sandbox_dir = Path(engine._sandbox.root) / sandbox_id
+        if not sandbox_dir.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="Sandbox directory no longer exists. Cannot resume from checkpoint.",
+            )
+
+    global_config = checkpoint.get("global_config", {})
+    dag_json = checkpoint.get("dag_json", {})
+    workspace_directory = checkpoint.get("workspace_directory", "")
+
+    run.status = "running"
+    run.completed_at = None
+    await db.flush()
+
+    await engine.start_run(
+        run_id=str(run_id),
+        dag_json=dag_json,
+        global_config=global_config,
+        workspace_directory=workspace_directory,
+        resume_from=checkpoint,
+    )
+
+    logger.info(
+        "Resumed run %s from checkpoint iteration %d",
+        run_id, checkpoint.get("checkpoint_iteration", 0),
+    )
+
+    return {
+        "status": "running",
+        "run_id": str(run_id),
+        "resumed_from_iteration": checkpoint.get("checkpoint_iteration", 0),
+    }

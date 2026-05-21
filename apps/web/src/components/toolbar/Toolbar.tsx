@@ -10,6 +10,8 @@ import {
   Check,
   Target,
   AlertTriangle,
+  Settings,
+  RotateCcw,
 } from "lucide-react";
 import { useWorkflowStore } from "@/stores/workflowStore";
 import { useRunStore } from "@/stores/runStore";
@@ -23,6 +25,7 @@ interface ToolbarProps {
   workflowName: string;
   onNameChange: (name: string) => void;
   onSave?: () => void;
+  onOpenConfig?: () => void;
 }
 
 export default function Toolbar({
@@ -30,6 +33,7 @@ export default function Toolbar({
   workflowName,
   onNameChange,
   onSave,
+  onOpenConfig,
 }: ToolbarProps) {
   const nodes = useWorkflowStore((s) => s.nodes) ?? [];
   const edges = useWorkflowStore((s) => s.edges) ?? [];
@@ -54,6 +58,7 @@ export default function Toolbar({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [triggering, setTriggering] = useState(false);
+  const [resuming, setResuming] = useState(false);
 
   const isRunning = status === "running";
   const isPaused = status === "paused";
@@ -167,6 +172,22 @@ export default function Toolbar({
       console.error("Cancel failed:", err);
     }
   }, [runId, setRunId, setStatus]);
+
+  const handleResume = useCallback(async () => {
+    if (!runId) return;
+    setResuming(true);
+    try {
+      await api.resumeRun(runId);
+      setStatus("running");
+      setLifecyclePhase("running");
+      setBlockers([]);
+    } catch (err) {
+      console.error("Resume failed:", err);
+      window.alert(err instanceof Error ? err.message : t("toolbar.runFailed"));
+    } finally {
+      setResuming(false);
+    }
+  }, [runId, setStatus, setLifecyclePhase, setBlockers, t]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -302,6 +323,23 @@ export default function Toolbar({
           </button>
         )}
 
+        {/* Resume from checkpoint */}
+        {runId && (status === "failed" || status === "completed" || status === "cancelled") && (
+          <button
+            onClick={handleResume}
+            disabled={resuming}
+            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:from-amber-600 hover:to-orange-600 transition-all shadow-sm disabled:opacity-50"
+            title={t("toolbar.resumeTooltip")}
+          >
+            {resuming ? (
+              <Loader2 size={14} className="animate-spin" />
+            ) : (
+              <RotateCcw size={14} />
+            )}
+            {t("toolbar.resume")}
+          </button>
+        )}
+
         {/* Status badge */}
         <span
           className={`inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium ${STATUS_COLORS[status]}`}
@@ -318,6 +356,15 @@ export default function Toolbar({
             <span className="truncate">{blockers[0].message}</span>
           </div>
         )}
+
+        {/* Config button */}
+        <button
+          onClick={onOpenConfig}
+          className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium rounded-lg border border-gray-200 text-gray-500 hover:bg-gray-50 hover:text-gray-700 transition-colors"
+          title={t("configModal.openTooltip")}
+        >
+          <Settings size={14} />
+        </button>
 
         {/* Language toggle */}
         <button
