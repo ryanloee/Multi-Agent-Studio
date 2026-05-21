@@ -33,6 +33,10 @@ export type StreamEventType =
   | "idle_warning"
   | "permission_request"
   | "director_decision"
+  | "worker_summary"
+  | "review_started"
+  | "review_result"
+  | "review_retry"
   | "node_paused"
   | "node_approved"
   | "node_rejected"
@@ -242,6 +246,37 @@ export interface DirectorDecisionEvent extends StreamEvent {
   iteration?: number;
 }
 
+export interface WorkerSummaryEvent extends StreamEvent {
+  type: "worker_summary";
+  node_id: "director";
+  task_id: string;
+  content: string;
+}
+
+export interface ReviewStartedEvent extends StreamEvent {
+  type: "review_started";
+  node_id: "director";
+  task_id: string;
+  attempt: number;
+}
+
+export interface ReviewResultEvent extends StreamEvent {
+  type: "review_result";
+  node_id: "director";
+  task_id: string;
+  result: "pass" | "reject";
+  reason: string;
+  attempt: number;
+}
+
+export interface ReviewRetryEvent extends StreamEvent {
+  type: "review_retry";
+  node_id: "director";
+  task_id: string;
+  attempt: number;
+  max_attempts: number;
+}
+
 // ---------------------------------------------------------------------------
 // Event map — maps type discriminator to the concrete event interface
 // ---------------------------------------------------------------------------
@@ -273,4 +308,8 @@ export interface StreamEventMap {
   idle_warning: IdleWarningEvent;
   permission_request: PermissionRequestEvent;
   director_decision: DirectorDecisionEvent;
+  worker_summary: WorkerSummaryEvent;
+  review_started: ReviewStartedEvent;
+  review_result: ReviewResultEvent;
+  review_retry: ReviewRetryEvent;
 }

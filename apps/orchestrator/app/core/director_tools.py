@@ -3,7 +3,40 @@
 The Director agent uses tool-use to output structured decisions.
 Each turn it calls the `decide` tool with an action, reasoning, and
 a prompt for the sub-agent it wants to dispatch.
+
+When reviewing a worker's output, it calls the `review` tool instead.
 """
+
+_REVIEW_TOOL = {
+    "name": "review",
+    "description": (
+        "Review a sub-agent's output and give a pass or reject assessment. "
+        "You MUST call this tool when reviewing worker output."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "result": {
+                "type": "string",
+                "enum": ["pass", "reject"],
+                "description": "pass: output meets requirements. reject: output needs revision.",
+            },
+            "reason": {
+                "type": "string",
+                "description": (
+                    "Explanation of the review result. Required for both pass and reject."
+                ),
+            },
+            "next_prompt": {
+                "type": "string",
+                "description": (
+                    "When rejecting, specific guidance for the worker to fix the issues."
+                ),
+            },
+        },
+        "required": ["result", "reason"],
+    },
+}
 
 DIRECTOR_TOOLS = [{
     "name": "decide",
@@ -45,8 +78,8 @@ DIRECTOR_TOOLS = [{
         },
         "required": ["action", "reasoning", "prompt", "task_id"],
     },
-}]
+}, _REVIEW_TOOL]
 
 
-# Tool choice constraint — forces the model to call `decide` every turn.
 DIRECTOR_TOOL_CHOICE = {"type": "function", "function": {"name": "decide"}}
+REVIEW_TOOL_CHOICE = {"type": "function", "function": {"name": "review"}}

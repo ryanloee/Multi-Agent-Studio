@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import {
   Play,
   Square,
@@ -20,6 +20,8 @@ import { api } from "@/lib/api";
 import { STATUS_COLORS } from "@/lib/constants";
 import type { RunStatus, WorkflowLifecyclePhase } from "@/types/workflow";
 
+const EMPTY_ARRAY: never[] = [];
+
 interface ToolbarProps {
   workflowId: string;
   workflowName: string;
@@ -35,8 +37,8 @@ export default function Toolbar({
   onSave,
   onOpenConfig,
 }: ToolbarProps) {
-  const nodes = useWorkflowStore((s) => s.nodes) ?? [];
-  const edges = useWorkflowStore((s) => s.edges) ?? [];
+  const nodes = useWorkflowStore((s) => s.nodes) ?? EMPTY_ARRAY;
+  const edges = useWorkflowStore((s) => s.edges) ?? EMPTY_ARRAY;
   const autoChildModelMap = useWorkflowStore((s) => s.autoChildModelMap);
   const plannerUiState = useWorkflowStore((s) => s.plannerUiState);
   const workspaceDirectory = useWorkflowStore((s) => s.workspaceDirectory);
@@ -108,7 +110,29 @@ export default function Toolbar({
 
   const loadWorkflow = useWorkflowStore((s) => s.loadWorkflow);
 
+  const canResume = useMemo(() => {
+    if (!runId) return false;
+    return status === "failed" || status === "completed" || status === "cancelled";
+  }, [runId, status]);
+
   const handleRun = useCallback(async () => {
+    if (canResume) {
+      if (!runId) return;
+      setResuming(true);
+      try {
+        await api.resumeRun(runId);
+        setStatus("running");
+        setLifecyclePhase("running");
+        setBlockers([]);
+      } catch (err) {
+        console.error("Resume failed:", err);
+        window.alert(err instanceof Error ? err.message : t("toolbar.runFailed"));
+      } finally {
+        setResuming(false);
+      }
+      return;
+    }
+
     setTriggering(true);
     try {
       console.groupCollapsed("[MAS Run] trigger");
@@ -131,7 +155,6 @@ export default function Toolbar({
       setStatus("running");
       setLifecyclePhase("running");
       setBlockers([]);
-      // Reload workflow so runtime status uses the persisted executable DAG.
       const updated = await api.getWorkflow(workflowId);
       loadWorkflow(updated);
     } catch (err) {
@@ -148,6 +171,8 @@ export default function Toolbar({
       setTriggering(false);
     }
   }, [
+    canResume,
+    runId,
     workflowId,
     lifecyclePhase,
     workspaceDirectory,
@@ -160,6 +185,7 @@ export default function Toolbar({
     loadWorkflow,
     setLifecyclePhase,
     setBlockers,
+    t,
   ]);
 
   const handleCancel = useCallback(async () => {
@@ -172,22 +198,6 @@ export default function Toolbar({
       console.error("Cancel failed:", err);
     }
   }, [runId, setRunId, setStatus]);
-
-  const handleResume = useCallback(async () => {
-    if (!runId) return;
-    setResuming(true);
-    try {
-      await api.resumeRun(runId);
-      setStatus("running");
-      setLifecyclePhase("running");
-      setBlockers([]);
-    } catch (err) {
-      console.error("Resume failed:", err);
-      window.alert(err instanceof Error ? err.message : t("toolbar.runFailed"));
-    } finally {
-      setResuming(false);
-    }
-  }, [runId, setStatus, setLifecyclePhase, setBlockers, t]);
 
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
@@ -207,7 +217,9 @@ export default function Toolbar({
   const [editingName, setEditingName] = useState(false);
   const [tempName, setTempName] = useState(workflowName);
 
-  useEffect(() => { setTempName(workflowName); }, [workflowName]);
+  useEffect(() => {
+    setTempName(workflowName);
+  }, [workflowName]);
 
   const commitName = useCallback(() => {
     setEditingName(false);
@@ -216,7 +228,26 @@ export default function Toolbar({
     else setTempName(workflowName);
   }, [tempName, workflowName, onNameChange]);
 
-  const toggleLocale = useCallback(() => setLocale(locale === "zh" ? "en" : "zh"), [locale, setLocale]);
+  const toggleLocale = useCallback(() => {
+    setLocale(locale === "zh" ? "en" : "zh");
+  }, [locale, setLocale]);
+
+  const runButtonTitle = useMemo(() => {
+    if (canResume) return t("toolbar.resumeTooltip");
+    if (hasWorkspaceDirectory) return t("toolbar.runShortcut");
+    return t("toolbar.setDirFirst");
+  }, [canResume, hasWorkspaceDirectory, t]);
+
+  const runButtonLabel = canResume ? t("toolbar.resume") : t("toolbar.run");
+  const runButtonGradient = canResume
+    ? "bg-gradient-to-r from-amber-500 to-orange-500 hover:from-amber-600 hover:to-orange-600"
+    : "bg-gradient-to-r from-green-500 to-emerald-600 hover:from-green-600 hover:to-emerald-700";
+
+  const phaseBadgeClassName = useMemo(() => {
+    if (lifecyclePhase === "ready") return "bg-emerald-100 text-emerald-700";
+    if (lifecyclePhase === "running") return "bg-blue-100 text-blue-700";
+    return "bg-gray-100 text-gray-700";
+  }, [lifecyclePhase]);
 
   return (
     <header className="h-13 bg-white/95 backdrop-blur-sm border-b border-gray-200 flex items-center px-4 shrink-0 select-none">
@@ -262,13 +293,7 @@ export default function Toolbar({
           {t("workflow.modeAuto")}
         </div>
         <div
-          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none ${
-            lifecyclePhase === "ready"
-              ? "bg-emerald-100 text-emerald-700"
-              : lifecyclePhase === "running"
-                  ? "bg-blue-100 text-blue-700"
-                  : "bg-gray-100 text-gray-700"
-          }`}
+          className={`flex items-center gap-1.5 px-3 py-1 rounded-lg text-xs font-medium select-none ${phaseBadgeClassName}`}
         >
           <Target size={12} />
           {phaseLabels[lifecyclePhase]}
@@ -298,7 +323,7 @@ export default function Toolbar({
           {saved ? t("toolbar.saved") : t("toolbar.save")}
         </button>
 
-        {/* Run / Cancel */}
+        {/* Run / Resume / Cancel */}
         {isRunning || isPaused ? (
           <button
             onClick={handleCancel}
@@ -308,35 +333,20 @@ export default function Toolbar({
             {t("toolbar.cancel")}
           </button>
         ) : (
-          <button
-            onClick={handleRun}
-            disabled={triggering || nodes.length === 0}
-            className="flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-green-500 to-emerald-600 text-white hover:from-green-600 hover:to-emerald-700 transition-all shadow-sm disabled:opacity-50"
-            title={hasWorkspaceDirectory ? t("toolbar.runShortcut") : t("toolbar.setDirFirst")}
+           <button
+             onClick={handleRun}
+             disabled={triggering || resuming || nodes.length === 0}
+            className={`flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg text-white transition-all shadow-sm disabled:opacity-50 ${runButtonGradient}`}
+            title={runButtonTitle}
           >
-            {triggering ? (
+            {triggering || resuming ? (
               <Loader2 size={14} className="animate-spin" />
+            ) : canResume ? (
+              <RotateCcw size={14} />
             ) : (
               <Play size={14} />
             )}
-            {t("toolbar.run")}
-          </button>
-        )}
-
-        {/* Resume from checkpoint */}
-        {runId && (status === "failed" || status === "completed" || status === "cancelled") && (
-          <button
-            onClick={handleResume}
-            disabled={resuming}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-gradient-to-r from-amber-500 to-orange-500 text-white hover:from-amber-600 hover:to-orange-600 transition-all shadow-sm disabled:opacity-50"
-            title={t("toolbar.resumeTooltip")}
-          >
-            {resuming ? (
-              <Loader2 size={14} className="animate-spin" />
-            ) : (
-              <RotateCcw size={14} />
-            )}
-            {t("toolbar.resume")}
+            {runButtonLabel}
           </button>
         )}
 

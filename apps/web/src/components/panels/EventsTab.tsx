@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRunStore } from "@/stores/runStore";
 import { useLocaleStore } from "@/stores/localeStore";
-import type { StreamEvent, DirectorDecisionEvent } from "@/types/events";
+import type { StreamEvent, DirectorDecisionEvent, ReviewResultEvent, ReviewRetryEvent, WorkerSummaryEvent } from "@/types/events";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -30,6 +30,10 @@ const TYPE_ICONS: Record<string, string> = {
   node_completed: "✅",
   node_failed: "❌",
   director_decision: "\u{1F4CB}",
+  worker_summary: "\u{1F4DD}",
+  review_started: "\u{1F50D}",
+  review_result: "\u{1F4CA}",
+  review_retry: "\u{1F504}",
   llm_token: "\u{1F4AC}",
   llm_chunk: "\u{1F4AC}",
   tool_call: "\u{1F527}",
@@ -52,6 +56,10 @@ const TYPE_LABELS: Record<string, string> = {
   node_completed: "完成",
   node_failed: "失败",
   director_decision: "调度",
+  worker_summary: "摘要",
+  review_started: "审核中",
+  review_result: "审核结果",
+  review_retry: "重试",
   llm_token: "LLM",
   llm_chunk: "LLM",
   tool_call: "工具",
@@ -73,6 +81,7 @@ const TYPE_LABELS: Record<string, string> = {
 const DEFAULT_VISIBLE_TYPES = new Set([
   "node_started", "node_completed", "node_failed",
   "director_decision",
+  "worker_summary", "review_started", "review_result", "review_retry",
   "tool_call", "tool_result",
   "error",
   "run_started", "run_completed", "run_failed",
@@ -237,7 +246,7 @@ export default function EventsTab() {
 
             if (event.type === "director_decision") {
               const de = event as DirectorDecisionEvent;
-              const icon = ACTION_ICONS[de.action] || "\u{1F4CB}";
+              const icon = ACTION_ICONS[de.action] || "";
               return (
                 <div key={`ev-${idx}`} className="relative flex items-start gap-2.5 py-1.5 group">
                   <div className="relative z-10 w-8 h-8 rounded-full bg-purple-50 border border-purple-200 flex items-center justify-center text-sm shrink-0">
@@ -263,6 +272,93 @@ export default function EventsTab() {
                         ))}
                       </div>
                     )}
+                  </div>
+                </div>
+              );
+            }
+
+            if (event.type === "worker_summary") {
+              const we = event as WorkerSummaryEvent;
+              return (
+                <div key={`ev-${idx}`} className="relative flex items-start gap-2.5 py-1.5 group">
+                  <div className="relative z-10 w-8 h-8 rounded-full bg-blue-50 border border-blue-200 flex items-center justify-center text-sm shrink-0">
+                    {"\u{1F4DD}"}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-mono text-gray-400">{formatTimestamp(event.timestamp)}</span>
+                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">
+                        Worker 完成
+                      </span>
+                      <span className="text-[10px] text-gray-400 truncate max-w-[120px]">{we.task_id}</span>
+                    </div>
+                    <p className="text-xs text-gray-700 mt-0.5 line-clamp-3 font-mono whitespace-pre-wrap">
+                      {truncate(we.content, 300)}
+                    </p>
+                  </div>
+                </div>
+              );
+            }
+
+            if (event.type === "review_started") {
+              return (
+                <div key={`ev-${idx}`} className="relative flex items-start gap-2.5 py-1.5 group">
+                  <div className="relative z-10 w-8 h-8 rounded-full bg-amber-50 border border-amber-200 flex items-center justify-center text-sm shrink-0">
+                    {"\u{1F50D}"}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-mono text-gray-400">{formatTimestamp(event.timestamp)}</span>
+                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-700">
+                        审核中
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            }
+
+            if (event.type === "review_result") {
+              const re = event as ReviewResultEvent;
+              const isPass = re.result === "pass";
+              return (
+                <div key={`ev-${idx}`} className="relative flex items-start gap-2.5 py-1.5 group">
+                  <div className={`relative z-10 w-8 h-8 rounded-full border flex items-center justify-center text-sm shrink-0 ${
+                    isPass ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"
+                  }`}>
+                    {isPass ? "\u{2705}" : "\u{274C}"}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-mono text-gray-400">{formatTimestamp(event.timestamp)}</span>
+                      <span className={`text-[10px] font-medium px-1.5 py-0.5 rounded ${
+                        isPass ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"
+                      }`}>
+                        {isPass ? "审核通过" : "审核不通过"} (第 {re.attempt} 次)
+                      </span>
+                      <span className="text-[10px] text-gray-400 truncate max-w-[120px]">{re.task_id}</span>
+                    </div>
+                    <p className="text-xs text-gray-700 mt-0.5 line-clamp-2">{re.reason}</p>
+                  </div>
+                </div>
+              );
+            }
+
+            if (event.type === "review_retry") {
+              const rre = event as ReviewRetryEvent;
+              return (
+                <div key={`ev-${idx}`} className="relative flex items-start gap-2.5 py-1.5 group">
+                  <div className="relative z-10 w-8 h-8 rounded-full bg-orange-50 border border-orange-200 flex items-center justify-center text-sm shrink-0">
+                    {"\u{1F504}"}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[10px] font-mono text-gray-400">{formatTimestamp(event.timestamp)}</span>
+                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-orange-100 text-orange-700">
+                        重新派发 Worker (第 {rre.attempt + 1}/{rre.max_attempts} 次)
+                      </span>
+                      <span className="text-[10px] text-gray-400 truncate max-w-[120px]">{rre.task_id}</span>
+                    </div>
                   </div>
                 </div>
               );

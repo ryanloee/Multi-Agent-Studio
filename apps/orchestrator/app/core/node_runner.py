@@ -19,19 +19,17 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from app.core import debug_logger as _dbg
 from app.core.local_bus import InProcessEventBus
 from app.core.local_sandbox import LocalSandbox
 from app.sandbox.checkpoint import GitCheckpointManager
 from app.sandbox.provision import SandboxProvisioner
 
 logger = logging.getLogger(__name__)
-
-import app.core.debug_logger as _dbg
 
 _db_semaphore: asyncio.Semaphore | None = None
 
@@ -181,17 +179,25 @@ class NodeRunner:
         model_provider: str = "",
         model_id: str = "",
         destroy_sandbox: bool = True,
+        enable_self_review: bool = False,
     ) -> NodeResult:
         """Execute one agent, return structured result.
 
         If *sandbox_id* is provided the sandbox is reused (trunk-based);
         otherwise a fresh one is created from *workspace_directory*.
-        
+
         Each node gets an isolated container under .mas/containers/{node_id}/.
         After completion, changes are committed and merged to the main workspace.
         """
-        _dbg.info(__name__, "execute_node starting", node_id=node_id, agent_type=agent_type,
-                  model_provider=model_provider, model_id=model_id, sandbox_id=(sandbox_id or "")[:12])
+        _dbg.info(
+            __name__,
+            "execute_node starting",
+            node_id=node_id,
+            agent_type=agent_type,
+            model_provider=model_provider,
+            model_id=model_id,
+            sandbox_id=(sandbox_id or "")[:12],
+        )
         if cancel_event is None:
             cancel_event = asyncio.Event()
         global_config = global_config or {}
@@ -305,6 +311,7 @@ class NodeRunner:
                     run_id=run_id,
                     node_id=node_id,
                     cancel_event=cancel_event,
+                    enable_self_review=enable_self_review,
                 )
             finally:
                 await runner.close()
@@ -325,18 +332,20 @@ class NodeRunner:
             result.raw_output = agent_result.output
             result.error = agent_result.error
             result.files_changed = agent_result.files_changed
-            result.result_summary = _summarize(agent_result.output) if agent_result.output else agent_result.error
-            
+            result.result_summary = (
+                _summarize(agent_result.output) if agent_result.output else agent_result.error
+            )
+
             # Commit node changes and merge to main workspace if successful
             if state == "completed":
                 try:
                     # Commit changes in the node container
                     commit_hash = await self._checkpoint.commit_node_changes(
-                        sandbox_id, node_id, 
+                        sandbox_id, node_id,
                         message=f"node {node_id} completed"
                     )
                     logger.info("Committed node %s changes: %s", node_id, commit_hash[:12])
-                    
+
                     # Merge node changes to main workspace
                     merged = await self._checkpoint.merge_node_to_main(sandbox_id, node_id)
                     if merged:
@@ -345,7 +354,7 @@ class NodeRunner:
                         logger.warning("Failed to merge node %s changes", node_id)
                 except Exception as exc:
                     logger.warning("Git sync failed for node %s: %s", node_id, exc)
-            
+
             return result
 
         finally:
@@ -356,7 +365,11 @@ class NodeRunner:
                 try:
                     await self._sandbox.sync_back(sandbox_id, workspace_directory)
                 except Exception:
-                    logger.warning("sync_back failed for sandbox %s", sandbox_id[:12], exc_info=True)
+                    logger.warning(
+                        "sync_back failed for sandbox %s",
+                        sandbox_id[:12],
+                        exc_info=True,
+                    )
 
             if _owns_sandbox and destroy_sandbox:
                 try:
@@ -416,4 +429,3 @@ class NodeRunner:
                     await session.commit()
             except Exception:
                 logger.warning("Failed to persist run event %s", event.get("type"), exc_info=True)
-

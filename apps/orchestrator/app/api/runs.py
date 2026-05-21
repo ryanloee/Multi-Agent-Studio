@@ -462,12 +462,15 @@ async def resume_run(
         )
 
     sandbox_id = checkpoint.get("sandbox_id")
+    sandbox_existed = True
     if sandbox_id:
         sandbox_dir = Path(engine._sandbox.root) / sandbox_id
         if not sandbox_dir.exists():
-            raise HTTPException(
-                status_code=400,
-                detail="Sandbox directory no longer exists. Cannot resume from checkpoint.",
+            # Sandbox was destroyed (e.g. by old bug), will recreate from workspace
+            sandbox_existed = False
+            logger.info(
+                "Sandbox %s no longer exists for run %s, will recreate from workspace",
+                sandbox_id[:12] if sandbox_id else "unknown", run_id,
             )
 
     global_config = checkpoint.get("global_config", {})
@@ -484,6 +487,7 @@ async def resume_run(
         global_config=global_config,
         workspace_directory=workspace_directory,
         resume_from=checkpoint,
+        sandbox_existed=sandbox_existed,
     )
 
     logger.info(

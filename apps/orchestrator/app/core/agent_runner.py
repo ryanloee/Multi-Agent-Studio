@@ -8,14 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import platform
 import time
-import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from typing import Any, Awaitable, Callable
 
-from app.core.agent_llm import LLMClient, LLMError, LLMConnectionError, LLMTimeoutError
+from app.core.agent_llm import LLMClient, LLMConnectionError, LLMError, LLMTimeoutError
 from app.core.agent_tools import TOOLS, execute_tool, get_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -26,6 +24,7 @@ EventEmitter = Callable[..., Awaitable[None]]
 # Default limits
 DEFAULT_MAX_TURNS = 80
 DEFAULT_TIMEOUT_SECONDS = 900  # 15 minutes of inactivity
+SELF_REVIEW_MAX_TURNS = 10
 
 # LLM retry settings
 LLM_MAX_RETRIES = 10
@@ -42,7 +41,7 @@ class AgentResult:
     files_changed: list[str] = field(default_factory=list)
 
 
-class _InactivityTimeout(Exception):
+class _InactivityTimeoutError(Exception):
     """Raised when agent produces no output for the configured timeout."""
 
 
@@ -72,6 +71,7 @@ class AgentRunner:
         max_turns: int = DEFAULT_MAX_TURNS,
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
         cancel_event: asyncio.Event | None = None,
+        enable_self_review: bool = False,
     ) -> AgentResult:
         """Run the agent loop until completion or limits hit.
 
@@ -120,10 +120,25 @@ class AgentRunner:
                 timeout_seconds=timeout_seconds,
                 last_activity_time=lambda: last_activity,
             )
-        except _InactivityTimeout:
+
+            if result.success and enable_self_review and result.files_changed:
+                result = await self._run_self_review(
+                    result=result,
+                    model_config=model_config,
+                    workspace=workspace,
+                    emit=_emit_with_activity,
+                    run_id=run_id,
+                    node_id=node_id,
+                    cancel_event=cancel_event,
+                    original_prompt=prompt,
+                )
+        except _InactivityTimeoutError:
             result.success = False
             elapsed = time.monotonic() - start_time
-            result.error = f"Agent timed out: no activity for {timeout_seconds}s (total elapsed: {elapsed:.0f}s)"
+            result.error = (
+                f"Agent timed out: no activity for {timeout_seconds}s "
+                f"(total elapsed: {elapsed:.0f}s)"
+            )
             logger.warning("Agent %s/%s timed out (inactivity %ds, elapsed %.0fs)",
                            run_id, node_id[:12], timeout_seconds, elapsed)
         except Exception as exc:
@@ -146,6 +161,117 @@ class AgentRunner:
         logger.info("Agent %s/%s finished: success=%s turns=%d elapsed=%.1fs",
                      run_id, node_id[:12], result.success, result.turns_used, elapsed)
 
+        return result
+
+    async def _run_self_review(
+        self,
+        result: AgentResult,
+        model_config: dict[str, Any],
+        workspace: str,
+        emit: EventEmitter,
+        run_id: str,
+        node_id: str,
+        cancel_event: asyncio.Event | None,
+        original_prompt: str,
+    ) -> AgentResult:
+        """Run a self-review pass after worker completes, optimizing code quality."""
+        from app.core.director_prompts import SELF_REVIEW_SYSTEM
+
+        await emit("agent_status", run_id=run_id, node_id=node_id,
+                    content="Self-review: optimizing code quality...")
+
+        files_list = "\n".join(f"- {f}" for f in result.files_changed)
+        review_prompt = (
+            f"{SELF_REVIEW_SYSTEM}\n\n"
+            f"## Files you just modified:\n{files_list}\n\n"
+            f"## Original task:\n{original_prompt[:1000]}\n\n"
+            f"Please review and optimize your recent changes. "
+            f"Only modify the files listed above."
+        )
+
+        messages: list[dict[str, Any]] = [
+            {"role": "user", "content": review_prompt},
+        ]
+
+        for turn in range(SELF_REVIEW_MAX_TURNS):
+            if cancel_event and cancel_event.is_set():
+                break
+
+            response = None
+            last_llm_error: LLMError | None = None
+            for attempt in range(1, LLM_MAX_RETRIES + 1):
+                try:
+                    response = await self._llm.chat(
+                        messages=messages,
+                        tools=TOOLS,
+                        system=SELF_REVIEW_SYSTEM,
+                        model_config=model_config,
+                    )
+                    last_llm_error = None
+                    break
+                except (LLMConnectionError, LLMTimeoutError) as exc:
+                    last_llm_error = exc
+                    if attempt < LLM_MAX_RETRIES:
+                        delay = min(LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1)), 30.0)
+                        await asyncio.sleep(delay)
+                except LLMError as exc:
+                    last_llm_error = exc
+                    break
+
+            if response is None:
+                logger.warning("Self-review LLM call failed: %s", last_llm_error)
+                break
+
+            if response.text:
+                await emit("llm_token", run_id=run_id, node_id=node_id,
+                            content=f"\n[Self-Review] {response.text}")
+
+            if not response.tool_calls:
+                break
+
+            assistant_content: list[dict[str, Any]] = []
+            if response.text:
+                assistant_content.append({"type": "text", "text": response.text})
+            for tc in response.tool_calls:
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["name"],
+                    "input": tc["input"],
+                })
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_results: list[dict[str, Any]] = []
+            for tc in response.tool_calls:
+                if cancel_event and cancel_event.is_set():
+                    break
+                tool_name = tc["name"]
+                tool_input = tc["input"]
+                tool_id = tc["id"]
+
+                await emit("tool_call", run_id=run_id, node_id=node_id,
+                            tool_name=tool_name,
+                            content=f"[Self-Review] {_summarize_tool_call(tool_name, tool_input)}")
+
+                tool_output = await execute_tool(tool_name, tool_input, workspace)
+
+                if tool_name in ("write", "edit"):
+                    file_path = tool_input.get("path", "")
+                    if file_path and file_path not in result.files_changed:
+                        result.files_changed.append(file_path)
+
+                await emit("tool_result", run_id=run_id, node_id=node_id,
+                            tool_name=tool_name,
+                            content=f"[Self-Review] {tool_output[:3000]}")
+
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tool_id,
+                    "content": tool_output,
+                })
+            messages.append({"role": "user", "content": tool_results})
+
+        result.output += "\n\n[Self-Review completed]"
         return result
 
     async def _run_loop(
@@ -189,7 +315,7 @@ class AgentRunner:
 
             # Check inactivity timeout
             if last_activity_time and (time.monotonic() - last_activity_time()) > timeout_seconds:
-                raise _InactivityTimeout()
+                raise _InactivityTimeoutError()
 
             # Emit turn status
             await emit("agent_status", run_id=run_id, node_id=node_id,
@@ -218,7 +344,9 @@ class AgentRunner:
                         )
                         await emit(
                             "agent_status", run_id=run_id, node_id=node_id,
-                            content=f"LLM connection error, retrying ({attempt}/{LLM_MAX_RETRIES})...",
+                            content=(
+                                f"LLM connection error, retrying ({attempt}/{LLM_MAX_RETRIES})..."
+                            ),
                         )
                         await asyncio.sleep(delay)
                     else:
@@ -294,8 +422,13 @@ class AgentRunner:
                 tool_input = tc["input"]
                 tool_id = tc["id"]
 
-                await emit("tool_call", run_id=run_id, node_id=node_id,
-                            tool_name=tool_name, content=_summarize_tool_call(tool_name, tool_input))
+                await emit(
+                    "tool_call",
+                    run_id=run_id,
+                    node_id=node_id,
+                    tool_name=tool_name,
+                    content=_summarize_tool_call(tool_name, tool_input),
+                )
 
                 # Execute
                 tool_output = await execute_tool(tool_name, tool_input, workspace)
