@@ -1,39 +1,44 @@
-"""Tests for the new Director dispatch loop architecture."""
+"""Tests for the DirectorLoop serial DAG executor.
 
-import json
+The Director is rule-based (no LLM). Planner review uses tool-use.
+"""
 
-import pytest
-
-from app.core.director_tools import DIRECTOR_TOOLS, DIRECTOR_TOOL_CHOICE
-from app.core.director_prompts import DIRECTOR_SYSTEM, SCOUT_SYSTEM, WORKER_SYSTEM
-from app.core.world_model import WorldModel, TaskSummary, FailureRecord
-from app.core.director_loop import _extract_structured_block, _extract_llm_text
-
-
-class TestDirectorTools:
-    def test_tool_schema_valid(self):
-        assert len(DIRECTOR_TOOLS) == 1
-        tool = DIRECTOR_TOOLS[0]
-        assert tool["name"] == "decide"
-        schema = tool["input_schema"]
-        assert "action" in schema["properties"]
-        assert set(schema["properties"]["action"]["enum"]) == {"scout", "worker", "test", "done", "failed"}
-        assert "prompt" in schema["properties"]
-
-    def test_tool_choice(self):
-        assert DIRECTOR_TOOL_CHOICE["type"] == "function"
-        assert DIRECTOR_TOOL_CHOICE["function"]["name"] == "decide"
+from app.core.director_loop import _extract_llm_text, _extract_structured_block
+from app.core.director_prompts import (
+    MERGER_SYSTEM,
+    PLANNER_REVIEW_SYSTEM,
+    SCOUT_SYSTEM,
+    TESTER_SYSTEM,
+    WORKER_SYSTEM,
+)
+from app.core.director_tools import (
+    MAX_REVIEW_RETRIES,
+    REVIEW_TOOL,
+    REVIEW_TOOL_CHOICE_OPENAI,
+    REVIEW_TOOL_OPENAI,
+)
+from app.core.world_model import WorldModel
 
 
-class TestDirectorPrompts:
-    def test_system_prompt_has_placeholders(self):
-        formatted = DIRECTOR_SYSTEM.format(
-            max_iterations=30,
-            world_model="test world model",
-        )
-        assert "30" in formatted
-        assert "test world model" in formatted
+class TestPlannerReviewTools:
+    def test_review_tool_schema_valid(self):
+        assert REVIEW_TOOL["name"] == "review"
+        schema = REVIEW_TOOL["input_schema"]
+        assert schema["type"] == "object"
+        assert set(schema["properties"]["result"]["enum"]) == {"pass", "reject"}
+        assert set(schema["required"]) == {"result", "reason"}
 
+    def test_openai_tool_wrapper(self):
+        assert REVIEW_TOOL_OPENAI["type"] == "function"
+        assert REVIEW_TOOL_OPENAI["function"]["name"] == "review"
+        assert REVIEW_TOOL_CHOICE_OPENAI["type"] == "function"
+        assert REVIEW_TOOL_CHOICE_OPENAI["function"]["name"] == "review"
+
+    def test_review_retry_limit(self):
+        assert MAX_REVIEW_RETRIES >= 1
+
+
+class TestPrompts:
     def test_scout_system_has_markers(self):
         assert "===SCOUT_FINDINGS===" in SCOUT_SYSTEM
         assert "===END_SCOUT_FINDINGS===" in SCOUT_SYSTEM
@@ -42,36 +47,52 @@ class TestDirectorPrompts:
         assert "===WORKER_RESULT===" in WORKER_SYSTEM
         assert "===END_WORKER_RESULT===" in WORKER_SYSTEM
 
+    def test_tester_system_has_markers(self):
+        assert "===WORKER_RESULT===" in TESTER_SYSTEM
+        assert "===END_WORKER_RESULT===" in TESTER_SYSTEM
+
+    def test_merger_system_has_markers(self):
+        assert "===WORKER_RESULT===" in MERGER_SYSTEM
+        assert "===END_WORKER_RESULT===" in MERGER_SYSTEM
+
+    def test_planner_review_prompt_mentions_review_tool(self):
+        assert "review" in PLANNER_REVIEW_SYSTEM
+
 
 class TestWorldModel:
     def test_to_prompt_context_basic(self):
         model = WorldModel(goal="Build a TODO app")
         ctx = model.to_prompt_context()
         assert "Build a TODO app" in ctx
-        assert "0/30" in ctx
 
     def test_record_success(self):
         model = WorldModel(goal="test")
         model.record_success("s1", "scout", "Found 3 files", ["a.py", "b.py"])
         assert len(model.completed_tasks) == 1
         assert model.completed_tasks[0].files_changed == ["a.py", "b.py"]
+        assert model.node_statuses["s1"] == "completed"
 
     def test_record_failure(self):
         model = WorldModel(goal="test")
         model.record_failure("w1", "worker", "Build error", prompt_hint="fix main.py")
         assert len(model.failed_attempts) == 1
         assert model.failed_attempts[0].prompt_hint == "fix main.py"
+        assert model.node_statuses["w1"] == "failed"
 
     def test_json_roundtrip(self):
         model = WorldModel(goal="test", project_structure="src/")
         model.record_success("s1", "scout", "ok")
         model.record_failure("w1", "worker", "err")
+        model.current_node_index = 2
+        model.node_queue = [{"id": "A"}, {"id": "B"}]
         json_str = model.to_json()
         restored = WorldModel.from_json(json_str)
         assert restored.goal == "test"
         assert restored.project_structure == "src/"
         assert len(restored.completed_tasks) == 1
         assert len(restored.failed_attempts) == 1
+        assert restored.current_node_index == 2
+        assert restored.node_queue == [{"id": "A"}, {"id": "B"}]
 
     def test_prompt_context_keeps_limits(self):
         model = WorldModel(goal="test")
@@ -79,7 +100,7 @@ class TestWorldModel:
             model.record_success(f"t{i}", "worker", f"task {i}")
         ctx = model.to_prompt_context()
         # Should only include last 15 tasks
-        lines = [l for l in ctx.split("\n") if l.strip().startswith("[+]")]
+        lines = [line for line in ctx.split("\n") if line.strip().startswith("[+]")]
         assert len(lines) <= 15
 
 
@@ -136,8 +157,7 @@ class TestCheckpointRoundtrip:
         model = WorldModel(goal="Build app", project_structure="src/")
         model.record_success("s1", "scout", "Found files", ["a.py", "b.py"])
         model.record_failure("w1", "worker", "Build error", prompt_hint="fix main.py")
-        model.iteration = 5
-        model.max_iterations = 30
+        model.current_node_index = 5
         model.current_file_snapshot = "M src/main.py"
 
         json_str = model.to_json()
@@ -145,8 +165,7 @@ class TestCheckpointRoundtrip:
 
         assert restored.goal == "Build app"
         assert restored.project_structure == "src/"
-        assert restored.iteration == 5
-        assert restored.max_iterations == 30
+        assert restored.current_node_index == 5
         assert restored.current_file_snapshot == "M src/main.py"
         assert len(restored.completed_tasks) == 1
         assert restored.completed_tasks[0].files_changed == ["a.py", "b.py"]
@@ -155,7 +174,7 @@ class TestCheckpointRoundtrip:
 
     def test_checkpoint_data_structure(self):
         model = WorldModel(goal="test")
-        model.iteration = 3
+        model.current_node_index = 3
         json_str = model.to_json()
 
         checkpoint = {
@@ -169,4 +188,4 @@ class TestCheckpointRoundtrip:
 
         assert checkpoint["sandbox_id"] == "ws-director-abc12345"
         restored = WorldModel.from_json(checkpoint["world_model_json"])
-        assert restored.iteration == 3
+        assert restored.current_node_index == 3
