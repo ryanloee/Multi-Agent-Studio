@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2, Workflow, Clock, Play, ArrowRight, Target, Settings, FolderOpen, CircleHelp } from "lucide-react";
+import { Plus, Trash2, Workflow, Clock, Play, ArrowRight, Target, Settings, FolderOpen } from "lucide-react";
 import { api } from "@/lib/api";
 import { useLocaleStore } from "@/stores/localeStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -51,7 +51,7 @@ export default function WorkflowListPage() {
     [runs]
   );
 
-  const handleCreate = useCallback(async (kind: "goal" | "import" | "task" = "goal") => {
+  const handleCreate = useCallback(async (kind: "goal" | "import" = "goal") => {
     setCreating(true);
     try {
       const presets = {
@@ -64,11 +64,6 @@ export default function WorkflowListPage() {
           name: `导入项目 ${workflows.length + 1}`,
           description: "接手现有代码仓库，先做项目评估再规划执行。",
           goal: "先评估这个项目的现状，再给出合适的执行 DAG。",
-        },
-        task: {
-          name: `处理任务 ${workflows.length + 1}`,
-          description: "围绕一个明确的问题、需求单或 issue 组织执行。",
-          goal: "",
         },
       } as const;
       const preset = presets[kind];
@@ -163,7 +158,7 @@ export default function WorkflowListPage() {
           <h2 className="text-2xl font-bold text-gray-800 mb-3">{t("wfList.emptyTitle")}</h2>
           <p className="text-gray-500 mb-8 leading-relaxed">{t("wfList.emptyDesc")}</p>
 
-          <div className="grid max-w-3xl mx-auto gap-4 md:grid-cols-3">
+          <div className="grid max-w-2xl mx-auto gap-4 md:grid-cols-2">
             <button
               onClick={() => handleCreate("goal")}
               disabled={creating}
@@ -190,19 +185,6 @@ export default function WorkflowListPage() {
               <span className="text-sm font-semibold text-emerald-700">导入现有项目</span>
               <span className="text-xs text-emerald-500 leading-relaxed">
                 先做 Assess，再在现状上规划
-              </span>
-            </button>
-            <button
-              onClick={() => handleCreate("task")}
-              disabled={creating}
-              className="group flex w-full flex-col items-center gap-3 p-6 rounded-xl border-2 border-amber-200 bg-gradient-to-br from-amber-50 to-orange-50 hover:border-amber-400 hover:shadow-lg transition-all disabled:opacity-50"
-            >
-              <div className="w-12 h-12 rounded-xl bg-amber-100 flex items-center justify-center group-hover:bg-amber-200 transition-colors">
-                <CircleHelp size={24} className="text-amber-600" />
-              </div>
-              <span className="text-sm font-semibold text-amber-700">处理一个任务 / 问题</span>
-              <span className="text-xs text-amber-500 leading-relaxed">
-                适合 issue、bug、需求单和局部修改
               </span>
             </button>
           </div>
@@ -251,14 +233,6 @@ export default function WorkflowListPage() {
                 >
                   <FolderOpen size={16} />
                   导入项目
-                </button>
-                <button
-                  onClick={() => handleCreate("task")}
-                  disabled={creating}
-                  className="inline-flex items-center gap-2 px-4 py-2.5 text-sm font-semibold rounded-xl border border-amber-200 bg-white text-amber-700 hover:bg-amber-50 transition-all disabled:opacity-50"
-                >
-                  <CircleHelp size={16} />
-                  处理任务
                 </button>
               </div>
             </div>

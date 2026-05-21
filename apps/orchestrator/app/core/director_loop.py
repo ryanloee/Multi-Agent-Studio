@@ -541,7 +541,11 @@ class DirectorLoop:
             logger.error("No API URL/key for Planner LLM")
             return None
 
+        mode = global_config.get("mode", "auto")
+        mode_label = "MAINTENANCE" if mode == "import" else "DEVELOPMENT"
+
         system_content = PLANNER_DIRECTOR_SYSTEM.format(
+            mode=mode_label,
             world_model=world.to_prompt_context(),
             available_nodes=available_nodes_text,
         )

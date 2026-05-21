@@ -120,6 +120,7 @@ async def trigger_run(
 
     global_config["_goal"] = goal
     global_config["_workflow_id"] = str(workflow_id)
+    global_config["mode"] = getattr(workflow, "mode", "auto") or "auto"
     dag_json = workflow.dag_json or {}
 
     # 3. Persist run record before starting background execution
