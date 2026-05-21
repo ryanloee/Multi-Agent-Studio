@@ -413,7 +413,18 @@ class DirectorLoop:
                     world.record_success("init-scout", "scout", "Initial project reconnaissance completed")
                 else:
                     world.record_failure("init-scout", "scout", scout_result.error or "Scout failed")
-                    world.project_structure = "(scout failed — project structure unknown)"
+                    # Initial scout failed (likely LLM connection error) — stop the run
+                    error_msg = scout_result.error or "Scout failed"
+                    logger.error(
+                        "Initial scout failed for run %s: %s — stopping run",
+                        run_id, error_msg[:200],
+                    )
+                    clean_finish = True
+                    await self._finish_run(
+                        run_id, "failed",
+                        f"Initial scout failed: {error_msg}",
+                    )
+                    return
 
                 # Update file snapshot
                 world.current_file_snapshot = await self._git_diff_stat(sandbox_id)
@@ -426,7 +437,26 @@ class DirectorLoop:
             # Step 2: Main dispatch loop
             consecutive_no_decision = 0
             last_decision_error = ""
+            
+            # Keep track of the last used node_id so we can keep it illuminated during Director's thinking phase
+            last_active_node_id = "init-scout"
+
             while world.iteration <= world.max_iterations and not cancel_event.is_set():
+                # Attempt to find a valid node_id to keep the UI active during Director's thought process
+                if dag_node_map:
+                    fallback_nodes = [n for cand_list in dag_node_map.values() for n in cand_list]
+                    if fallback_nodes:
+                        last_active_node_id = fallback_nodes[0]
+                
+                if last_active_node_id:
+                    # Emit an event to set the node status to running with a planning message
+                    # This bridges the gap between sub-agent completions and prevents the "green to blue" flickering
+                    await self._emit("node_started", run_id, last_active_node_id)
+                    await self._emit(
+                        "agent_status", run_id, last_active_node_id, 
+                        content="Director is planning next step..."
+                    )
+
                 # Call Director LLM
                 decision, decision_error = await self._call_director_llm(
                     run_id=run_id,
@@ -510,6 +540,22 @@ class DirectorLoop:
                 # Parse result
                 self._update_world_from_result(world, task_id, action, sub_result)
 
+                # If sub-agent failed, stop the entire run immediately.
+                # In sequential workflows, a failed node should not allow
+                # subsequent nodes to proceed.
+                if sub_result.state != "completed":
+                    error_msg = sub_result.error or "Sub-agent failed"
+                    logger.error(
+                        "Sub-agent failed for run %s, task %s: %s — stopping run",
+                        run_id, task_id, error_msg[:200],
+                    )
+                    clean_finish = True
+                    await self._finish_run(
+                        run_id, "failed",
+                        f"Node '{task_id}' ({action}) failed: {error_msg}",
+                    )
+                    return
+
                 # Git commit after worker success
                 if action == "worker" and sub_result.state == "completed":
                     try:
@@ -579,9 +625,24 @@ class DirectorLoop:
         # Prefer DAG node IDs so canvas status animations work
         node_id = ""
         if dag_node_map:
+            # First try exact agent_type match
             candidates = dag_node_map.get(agent_type, [])
             if candidates:
+                # We peek instead of pop so the node stays illuminated if retried.
+                # To handle multiple nodes of the same type, we ideally should track progress,
+                # but for MVP keeping the first one active is better than losing animation.
+                # Actually, pop(0) was meant to advance to the next node. 
+                # Let's keep pop(0) but if it's empty, reuse the last popped one if we can? 
+                # Let's stick to pop(0) for now but fallback to ANY node for initial scout.
                 node_id = candidates.pop(0)
+            
+            # Fallback for initial scout or if no exact match: 
+            # use the first available node from ANY type just so SOMETHING animates on canvas
+            if not node_id:
+                for atype, cand_list in dag_node_map.items():
+                    if cand_list:
+                        node_id = cand_list[0] # peek, don't pop, just to borrow its ID for animation
+                        break
 
         # Reuse failed node ID when Director retries the same action type
         if not node_id and world:
@@ -721,10 +782,37 @@ class DirectorLoop:
                 prompt_preview=f"[Director] iteration={world_model.iteration}",
             )
             t0 = time.monotonic()
-            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
-                resp = await client.post(endpoint, json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
+
+            # Retry transient connection/timeout errors with exponential backoff
+            max_retries = 3
+            last_exc: Exception | None = None
+            data: dict | None = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
+                        resp = await client.post(endpoint, json=payload, headers=headers)
+                        resp.raise_for_status()
+                        data = resp.json()
+                    last_exc = None
+                    break
+                except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                    last_exc = exc
+                    if attempt < max_retries:
+                        delay = 2.0 * (2 ** (attempt - 1))
+                        logger.warning(
+                            "Director LLM transient error (attempt %d/%d), retrying in %.1fs: %s",
+                            attempt, max_retries, delay, exc,
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            "Director LLM transient error persisted after %d attempts: %s",
+                            max_retries, exc,
+                        )
+
+            if data is None:
+                raise last_exc or Exception("Director LLM call returned no data")
+
             elapsed_ms = (time.monotonic() - t0) * 1000
             _dbg.log_llm_call(
                 __name__, provider=director_provider, model=director_model,

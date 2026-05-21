@@ -15,7 +15,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
-from app.core.agent_llm import LLMClient, LLMError
+from app.core.agent_llm import LLMClient, LLMError, LLMConnectionError, LLMTimeoutError
 from app.core.agent_tools import TOOLS, execute_tool, get_system_prompt
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,10 @@ EventEmitter = Callable[..., Awaitable[None]]
 # Default limits
 DEFAULT_MAX_TURNS = 80
 DEFAULT_TIMEOUT_SECONDS = 900  # 15 minutes of inactivity
+
+# LLM retry settings
+LLM_MAX_RETRIES = 3
+LLM_RETRY_BASE_DELAY = 2.0  # seconds, exponential backoff: 2s, 4s, 8s
 
 
 @dataclass
@@ -191,17 +195,45 @@ class AgentRunner:
             await emit("agent_status", run_id=run_id, node_id=node_id,
                         content=f"Turn {turn + 1}/{max_turns}")
 
-            # Call LLM
-            try:
-                response = await self._llm.chat(
-                    messages=messages,
-                    tools=TOOLS,
-                    system=sys_prompt,
-                    model_config=model_config,
-                )
-            except LLMError as exc:
+            # Call LLM (with retry for transient errors)
+            response = None
+            last_llm_error: LLMError | None = None
+            for attempt in range(1, LLM_MAX_RETRIES + 1):
+                try:
+                    response = await self._llm.chat(
+                        messages=messages,
+                        tools=TOOLS,
+                        system=sys_prompt,
+                        model_config=model_config,
+                    )
+                    last_llm_error = None
+                    break
+                except (LLMConnectionError, LLMTimeoutError) as exc:
+                    last_llm_error = exc
+                    if attempt < LLM_MAX_RETRIES:
+                        delay = LLM_RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        logger.warning(
+                            "LLM transient error (attempt %d/%d), retrying in %.1fs: %s",
+                            attempt, LLM_MAX_RETRIES, delay, exc,
+                        )
+                        await emit(
+                            "agent_status", run_id=run_id, node_id=node_id,
+                            content=f"LLM connection error, retrying ({attempt}/{LLM_MAX_RETRIES})...",
+                        )
+                        await asyncio.sleep(delay)
+                    else:
+                        logger.error(
+                            "LLM transient error persisted after %d attempts: %s",
+                            LLM_MAX_RETRIES, exc,
+                        )
+                except LLMError as exc:
+                    # Non-transient errors (e.g. 4xx API errors) — fail immediately
+                    last_llm_error = exc
+                    break
+
+            if response is None:
                 result.success = False
-                result.error = f"LLM error: {exc}"
+                result.error = f"LLM error: {last_llm_error}"
                 return result
 
             result.turns_used = turn + 1
