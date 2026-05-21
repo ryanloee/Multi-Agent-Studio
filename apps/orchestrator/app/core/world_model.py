@@ -46,6 +46,8 @@ class WorldModel:
     current_file_snapshot: str = ""
 
     current_node_index: int = 0
+    iteration: int = 0
+    last_node_id: str = ""
     node_queue: list[dict] = field(default_factory=list)
     node_statuses: dict[str, str] = field(default_factory=dict)
 
@@ -92,6 +94,8 @@ class WorldModel:
             "reviews": [asdict(r) for r in self.reviews],
             "current_file_snapshot": self.current_file_snapshot,
             "current_node_index": self.current_node_index,
+            "iteration": self.iteration,
+            "last_node_id": self.last_node_id,
             "node_queue": self.node_queue,
             "node_statuses": self.node_statuses,
             "planner_review_messages": self.planner_review_messages,
@@ -135,6 +139,8 @@ class WorldModel:
             project_structure=raw.get("project_structure", ""),
             current_file_snapshot=raw.get("current_file_snapshot", ""),
             current_node_index=raw.get("current_node_index", 0),
+            iteration=raw.get("iteration", 0),
+            last_node_id=raw.get("last_node_id", ""),
             node_queue=raw.get("node_queue", []),
             node_statuses=raw.get("node_statuses", {}),
             planner_review_messages=raw.get("planner_review_messages", []),

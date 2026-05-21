@@ -1,12 +1,12 @@
-"""DirectorLoop — rule-based serial DAG executor with Planner review.
+"""DirectorLoop — Planner-driven dynamic execution engine.
 
-The Director is a pure scheduler (no LLM). It:
-  1. Takes the Planner-generated DAG and topologically sorts it into a serial queue
-  2. Executes nodes one by one via NodeRunner (sub-agents)
-  3. After coder/merge nodes, calls Planner LLM to review the output
-  4. Saves checkpoints for resume capability
-
-Planner review uses full context (user chat history + review records).
+The Planner (not Director) makes all decisions. It:
+  1. Reads the world model and DAG node pool
+  2. Calls Planner LLM with decide/review tools to choose next action
+  3. Dispatches sub-agents (explore/coder/shell) via NodeRunner
+  4. Can dispatch multiple sub-agents in parallel for speed
+  5. Reviews coder output with full context
+  6. Loops until Planner says done or time limit hit
 """
 
 from __future__ import annotations
@@ -18,25 +18,29 @@ import subprocess
 import time
 import traceback
 import uuid
-from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from app.config import settings
 from app.core import debug_logger as _dbg
 from app.core.director_prompts import (
     MERGER_SYSTEM,
+    PLANNER_DIRECTOR_SYSTEM,
     PLANNER_REVIEW_SYSTEM,
     SCOUT_SYSTEM,
     TESTER_SYSTEM,
     WORKER_SYSTEM,
 )
 from app.core.director_tools import (
+    DECIDE_TOOL_NAME,
+    MAX_NO_DECISION,
     MAX_REVIEW_RETRIES,
+    PLANNER_TOOLS,
+    PLANNER_TOOLS_OPENAI,
     REVIEW_TOOL,
-    REVIEW_TOOL_CHOICE_ANTHROPIC,
-    REVIEW_TOOL_CHOICE_OPENAI,
+    REVIEW_TOOL_NAME,
     REVIEW_TOOL_OPENAI,
 )
 from app.core.local_bus import InProcessEventBus
@@ -48,27 +52,28 @@ from app.sandbox.provision import SandboxProvisioner
 
 logger = logging.getLogger(__name__)
 
-AGENT_TYPE_TO_PROMPT = {
-    "explore": SCOUT_SYSTEM,
-    "scout": SCOUT_SYSTEM,
-    "coder": WORKER_SYSTEM,
-    "worker": WORKER_SYSTEM,
-    "shell": TESTER_SYSTEM,
-    "tester": TESTER_SYSTEM,
-    "merge": MERGER_SYSTEM,
-    "merger": MERGER_SYSTEM,
-    "review": None,
-    "reviewer": None,
-    "human": None,
-    "plan": None,
-    "planner": None,
-    "design": None,
+ACTION_TO_AGENT_TYPE = {
+    "explore": "explore",
+    "scout": "explore",
+    "coder": "coder",
+    "worker": "coder",
+    "shell": "shell",
+    "test": "shell",
+    "merge": "merge",
+    "merger": "merge",
 }
 
-REVIEWABLE_TYPES = {"coder", "worker", "merge", "merger"}
+ACTION_TO_SYSTEM_PROMPT = {
+    "explore": SCOUT_SYSTEM,
+    "coder": WORKER_SYSTEM,
+    "shell": TESTER_SYSTEM,
+    "merge": MERGER_SYSTEM,
+}
 
-CONTEXT_KEEP_RECENT = 10
+REVIEWABLE_ACTIONS = {"coder"}
+
 CONTEXT_MAX_CHARS = 80000
+CONTEXT_KEEP_RECENT = 10
 
 
 def _try_parse_json_dict(text: str) -> dict | None:
@@ -122,11 +127,9 @@ def _extract_llm_text(jsonl_content: str) -> str:
         if event_type in ("llm_token", "llm_chunk", "text"):
             parts.append(content)
         elif event_type == "tool_call":
-            tool_name = ev.get("tool_name", "tool")
-            parts.append(f"\n[Tool Call: {tool_name}]\n{content}\n")
+            parts.append(f"\n[Tool Call: {ev.get('tool_name', 'tool')}]\n{content}\n")
         elif event_type == "tool_result":
-            tool_name = ev.get("tool_name", "tool")
-            parts.append(f"\n[Tool Result: {tool_name}]\n{content}\n")
+            parts.append(f"\n[Tool Result: {ev.get('tool_name', 'tool')}]\n{content}\n")
         elif event_type in ("shell_stdout", "shell_stderr"):
             parts.append(f"\n[Shell Output]\n{content}\n")
     if not parsed_any:
@@ -134,58 +137,43 @@ def _extract_llm_text(jsonl_content: str) -> str:
     return "".join(parts)
 
 
-def _topological_sort(nodes: list[dict], edges: list[dict]) -> list[dict]:
-    """Topological sort of DAG nodes into serial execution order.
-
-    Parallel branches are serialized in stable node-ID order.
-    """
-    node_map = {n["id"]: n for n in nodes}
-    in_degree: dict[str, int] = {nid: 0 for nid in node_map}
-    children: dict[str, list[str]] = {nid: [] for nid in node_map}
-
-    for edge in edges:
-        src = edge.get("source", "")
-        tgt = edge.get("target", "")
-        if src in node_map and tgt in node_map:
-            in_degree[tgt] = in_degree.get(tgt, 0) + 1
-            children[src].append(tgt)
-
-    queue = deque(sorted(nid for nid, deg in in_degree.items() if deg == 0))
-    result: list[dict] = []
-
-    while queue:
-        nid = queue.popleft()
-        result.append(node_map[nid])
-        for child in sorted(children[nid]):
-            in_degree[child] -= 1
-            if in_degree[child] == 0:
-                queue.append(child)
-
-    if len(result) != len(nodes):
-        missing = set(node_map.keys()) - {n["id"] for n in result}
-        logger.warning("DAG has cycle or disconnected nodes: %s", missing)
-        for nid in sorted(missing):
-            result.append(node_map[nid])
-
-    return result
+def _build_node_pool(dag_json: dict) -> dict[str, list[dict]]:
+    """Build a pool of available DAG nodes grouped by agent type."""
+    nodes = dag_json.get("nodes", [])
+    pool: dict[str, list[dict]] = {}
+    for n in nodes:
+        data = n.get("data", {})
+        at = (
+            data.get("agentType", "") or data.get("agent_type", "")
+            or n.get("type", "") or "coder"
+        ).lower()
+        pool.setdefault(at, []).append(n)
+    return pool
 
 
-def _estimate_chars(messages: list[dict]) -> int:
-    return sum(len(msg.get("content", "")) for msg in messages)
+def _pick_node_id(pool: dict[str, list[dict]], agent_type: str) -> str:
+    """Pick the next available node ID from the pool for the given agent type."""
+    candidates = pool.get(agent_type, [])
+    if candidates:
+        return candidates[0].get("id", f"{agent_type}-0")
+    for cand_list in pool.values():
+        if cand_list:
+            return cand_list[0].get("id", "node-0")
+    return f"{agent_type}-{uuid4().hex[:8]}"
 
 
-def _get_agent_type(node: dict) -> str:
-    data = node.get("data", {})
-    return (
-        data.get("agentType", "")
-        or data.get("agent_type", "")
-        or node.get("type", "")
-        or "coder"
-    ).lower()
+def _format_available_nodes(pool: dict[str, list[dict]]) -> str:
+    if not pool:
+        return "No DAG nodes defined. You can dispatch any agent type freely."
+    lines = []
+    for atype, nodes in pool.items():
+        ids = [n.get("id", "?") for n in nodes]
+        lines.append(f"- {atype}: {', '.join(ids)}")
+    return "\n".join(lines)
 
 
 class DirectorLoop:
-    """Rule-based serial DAG executor with Planner review."""
+    """Planner-driven execution engine with dynamic decision loop."""
 
     def __init__(
         self,
@@ -220,10 +208,9 @@ class DirectorLoop:
             "workspace_directory": workspace_directory,
             "kind": "director",
         }
-
         task = asyncio.create_task(
             self._dispatch_loop(
-                run_id, dag_json, global_config or {}, cancel_event,
+                run_id, dag_json or {}, global_config or {}, cancel_event,
                 workspace_directory=workspace_directory,
                 resume_from=resume_from,
                 sandbox_existed=sandbox_existed,
@@ -240,7 +227,6 @@ class DirectorLoop:
 
         task.add_done_callback(_on_done)
         self._runs[run_id]["task"] = task
-        logger.info("Director loop started for run %s", run_id)
         return run_id
 
     async def recover_interrupted_runs(self) -> None:
@@ -252,45 +238,19 @@ class DirectorLoop:
 
             async with async_session_factory() as session:
                 result = await session.execute(
-                    select(RunModel).where(
-                        RunModel.status.in_(("running", "pending", "cancelling"))
-                    )
+                    select(RunModel).where(RunModel.status.in_(("running", "pending", "cancelling")))
                 )
-                runs = result.scalars().all()
-                if not runs:
-                    return
-
-                for run in runs:
+                for run in result.scalars().all():
                     checkpoint = run.checkpoint_json
                     if not checkpoint or not checkpoint.get("sandbox_id"):
                         run.status = "failed"
-                        logger.info("Marking interrupted run %s as failed (no checkpoint)", run.id)
                         continue
-
                     sandbox_dir = Path(settings.sandbox_root) / checkpoint["sandbox_id"]
                     if not sandbox_dir.exists():
                         run.status = "failed"
-                        logger.info(
-                            "Marking interrupted run %s as failed (sandbox missing)",
-                            run.id,
-                        )
                         continue
-
                     run.status = "running"
                     await session.commit()
-
-                    world_json = checkpoint.get("world_model_json")
-                    resumed_index = checkpoint.get("checkpoint_iteration", 0)
-                    if isinstance(world_json, dict):
-                        resumed_index = int(
-                            world_json.get("current_node_index", resumed_index) or 0
-                        )
-
-                    logger.info(
-                        "Resuming interrupted run %s from node index %d",
-                        run.id,
-                        resumed_index,
-                    )
                     await self.start_run(
                         run_id=str(run.id),
                         dag_json=checkpoint.get("dag_json", {}),
@@ -298,7 +258,6 @@ class DirectorLoop:
                         workspace_directory=checkpoint.get("workspace_directory"),
                         resume_from=checkpoint,
                     )
-
                 await session.commit()
         except Exception:
             logger.warning("Failed to recover interrupted runs", exc_info=True)
@@ -315,6 +274,10 @@ class DirectorLoop:
             run["cancel_event"].set()
             run["status"] = "cancelling"
 
+    # ------------------------------------------------------------------
+    # Main dispatch loop
+    # ------------------------------------------------------------------
+
     async def _dispatch_loop(
         self,
         run_id: str,
@@ -329,18 +292,13 @@ class DirectorLoop:
 
         try:
             goal = global_config.get("goal", "")
-            nodes = dag_json.get("nodes", [])
-            edges = dag_json.get("edges", [])
-
-            if not nodes:
-                await self._finish_run(run_id, "failed", "No nodes in workflow")
-                return
-
-            node_queue = _topological_sort(nodes, edges)
+            node_pool = _build_node_pool(dag_json)
+            available_nodes_text = _format_available_nodes(node_pool)
             planner_chat_history = await self._load_planner_history(run_id)
 
             sandbox_id: str | None = None
             world: WorldModel | None = None
+            start_node_id = "init"
 
             if resume_from:
                 world = WorldModel.from_json(resume_from["world_model_json"])
@@ -349,21 +307,11 @@ class DirectorLoop:
                 global_config = resume_from.get("global_config", global_config)
                 workspace_directory = resume_from.get("workspace_directory", workspace_directory)
 
-                node_queue = world.node_queue or node_queue
-
                 if sandbox_existed:
                     try:
                         await self._sandbox.re_register(old_sandbox_id, workspace_directory)
                         sandbox_id = old_sandbox_id
-                        logger.info(
-                            "Re-registered sandbox %s for resumed run %s at node %d",
-                            sandbox_id[:12], run_id, world.current_node_index,
-                        )
                     except Exception:
-                        logger.warning(
-                            "Failed to re-register sandbox %s, will recreate",
-                            old_sandbox_id[:12],
-                        )
                         sandbox_existed = False
 
                 if not sandbox_existed:
@@ -373,315 +321,100 @@ class DirectorLoop:
                             template_dir=workspace_directory,
                             user_workspace=workspace_directory,
                         )
-                        logger.info(
-                            "Recreated sandbox %s for resumed run %s",
-                            sandbox_id[:12], run_id,
-                        )
                     except Exception:
                         logger.exception("Failed to recreate sandbox for resumed run %s", run_id)
                         await self._finish_run(run_id, "failed", "Failed to recreate sandbox")
                         return
 
-                await self._emit(
-                    "run_resumed", run_id, "director",
-                    current_node_index=world.current_node_index,
-                    total_nodes=len(node_queue),
-                )
+                node_pool = _build_node_pool(dag_json)
+                available_nodes_text = _format_available_nodes(node_pool)
 
-                if world.node_statuses:
-                    for nid, st in world.node_statuses.items():
-                        if st == "failed":
-                            await self._emit("node_retried", run_id, nid)
+                await self._emit("run_resumed", run_id, "director", iteration=world.iteration)
+                for nid, st in world.node_statuses.items():
+                    if st == "failed":
+                        await self._emit("node_retried", run_id, nid)
 
-                logger.info(
-                    "Resumed run %s from node %d/%d",
-                    run_id, world.current_node_index, len(node_queue),
-                )
+                start_node_id = world.last_node_id or "resumed"
+                logger.info("Resumed run %s from iteration %d", run_id, world.iteration)
             else:
                 sandbox_id = await self._sandbox.create(
                     f"ws-director-{run_id[:8]}",
                     template_dir=workspace_directory,
                     user_workspace=workspace_directory,
                 )
+                world = WorldModel(goal=goal)
+                world.planner_review_messages = list(planner_chat_history)
                 logger.info("Created sandbox %s for run %s", sandbox_id[:12], run_id)
 
-                world = WorldModel(goal=goal)
-                world.node_queue = node_queue
-                world.current_node_index = 0
-                world.planner_review_messages = list(planner_chat_history)
-
             if world is None or sandbox_id is None:
-                await self._finish_run(run_id, "failed", "Internal error: state init failed")
+                await self._finish_run(run_id, "failed", "State init failed")
                 return
 
             start_time = time.monotonic()
             max_duration = global_config.get("max_duration_seconds", 7200)
+            consecutive_no_decision = 0
+            last_active_node_id = start_node_id
 
-            start_idx = world.current_node_index
-            for idx in range(start_idx, len(node_queue)):
-                if cancel_event.is_set():
-                    clean_finish = True
-                    await self._finish_run(run_id, "cancelled", "Cancelled by user")
+            while not cancel_event.is_set():
+                if time.monotonic() - start_time > max_duration:
+                    await self._finish_run(run_id, "failed", f"Time limit exceeded ({max_duration}s)")
                     return
 
-                elapsed = time.monotonic() - start_time
-                if elapsed > max_duration:
-                    await self._finish_run(
-                        run_id, "failed",
-                        f"Workflow time limit exceeded ({max_duration}s).",
-                    )
+                # Emit planning status for UI
+                if last_active_node_id:
+                    await self._emit("node_started", run_id, last_active_node_id)
+                    await self._emit("agent_status", run_id, last_active_node_id,
+                                     content="Planner is deciding next step...")
+
+                # Call Planner LLM for decision
+                decision = await self._call_planner_decide(
+                    run_id, world, global_config, available_nodes_text,
+                )
+
+                if decision is None:
+                    consecutive_no_decision += 1
+                    if consecutive_no_decision >= MAX_NO_DECISION:
+                        await self._finish_run(run_id, "failed", "Planner failed to decide 3 times")
+                        return
+                    world.iteration += 1
+                    continue
+                consecutive_no_decision = 0
+
+                action = decision.get("action", "")
+                prompt = decision.get("prompt", "")
+                task_id = decision.get("task_id", f"step-{world.iteration}")
+                reasoning = decision.get("reasoning", "")
+                target_files = decision.get("target_files", [])
+
+                await self._emit("planner_decision", run_id, "director",
+                                 action=action, task_id=task_id, reasoning=reasoning)
+
+                if action in ("done", "failed"):
+                    clean_finish = action == "done"
+                    status = "completed" if action == "done" else "failed"
+                    await self._finish_run(run_id, status, reasoning or f"Planner: {action}")
                     return
 
-                node = node_queue[idx]
-                node_id = node.get("id", f"node-{idx}")
-                agent_type = _get_agent_type(node)
-                world.current_node_index = idx
-
-                system_prompt = AGENT_TYPE_TO_PROMPT.get(agent_type)
+                agent_type = ACTION_TO_AGENT_TYPE.get(action, action)
+                system_prompt = ACTION_TO_SYSTEM_PROMPT.get(action)
                 if system_prompt is None:
-                    logger.info(
-                        "Skipping non-executable node %s (type=%s)",
-                        node_id, agent_type,
-                    )
-                    await self._emit("node_started", run_id, node_id)
-                    await self._emit("node_completed", run_id, node_id)
-                    world.node_statuses[node_id] = "completed"
+                    logger.warning("Unknown action '%s', skipping", action)
+                    world.iteration += 1
                     continue
 
-                node_data = node.get("data", {})
-                prompt = (
-                    node_data.get("prompt", "")
-                    or node_data.get("description", "")
-                    or f"Execute task: {node_data.get('label', node_id)}"
-                )
-                target_files = node_data.get("target_files", [])
+                node_id = _pick_node_id(node_pool, agent_type)
+                last_active_node_id = node_id
 
-                model_provider = (
-                    node_data.get("modelProvider", "")
-                    or global_config.get("worker_model_provider", "")
-                )
-                model_id = (
-                    node_data.get("modelId", "")
-                    or global_config.get("worker_model_id", "")
-                )
-
+                # Execute sub-agent
                 await self._emit("node_started", run_id, node_id)
-                await self._emit(
-                    "agent_status", run_id, node_id,
-                    content=f"Executing {agent_type} node...",
-                )
-
-                _dbg.log_node_lifecycle(
-                    __name__, node_id=node_id, agent_type=agent_type, event="started",
-                    model_provider=model_provider, model_id=model_id,
-                )
+                await self._emit("agent_status", run_id, node_id,
+                                 content=f"Executing {action}...")
 
                 sub_result = await self._run_sub_agent(
                     run_id=run_id,
                     agent_type=agent_type,
                     system_prompt=system_prompt,
-                    prompt=self._build_sub_prompt(prompt, target_files, world, agent_type),
-                    sandbox_id=sandbox_id,
-                    cancel_event=cancel_event,
-                    model_provider=model_provider,
-                    model_id=model_id,
-                    node_id_override=node_id,
-                    workspace_directory=workspace_directory,
-                    world=world,
-                    enable_self_review=(agent_type in ("coder", "worker")),
-                )
-
-                _dbg.log_node_lifecycle(
-                    __name__, node_id=node_id, agent_type=agent_type,
-                    event="completed" if sub_result.state == "completed" else "failed",
-                    error=(sub_result.error or "")[:500],
-                )
-
-                if cancel_event.is_set():
-                    clean_finish = True
-                    await self._finish_run(run_id, "cancelled", "Cancelled by user")
-                    return
-
-                self._update_world_from_result(world, node_id, agent_type, sub_result)
-
-                if sub_result.state != "completed":
-                    await self._emit("node_failed", run_id, node_id, content=sub_result.error or "")
-                    clean_finish = False
-                    await self._save_checkpoint(
-                        run_id, world, sandbox_id, global_config, workspace_directory, dag_json,
-                    )
-                    await self._finish_run(
-                        run_id, "failed",
-                        (
-                            f"Node '{node_id}' ({agent_type}) failed: "
-                            f"{sub_result.error or 'unknown error'}"
-                        ),
-                    )
-                    return
-
-                await self._emit("node_completed", run_id, node_id)
-                world.current_file_snapshot = await self._git_diff_stat(sandbox_id)
-
-                if agent_type in REVIEWABLE_TYPES:
-                    review_passed = await self._review_loop(
-                        run_id=run_id,
-                        world=world,
-                        sub_result=sub_result,
-                        node_id=node_id,
-                        agent_type=agent_type,
-                        prompt=prompt,
-                        target_files=target_files,
-                        sandbox_id=sandbox_id,
-                        cancel_event=cancel_event,
-                        global_config=global_config,
-                        workspace_directory=workspace_directory,
-                    )
-
-                    if not review_passed:
-                        if cancel_event.is_set():
-                            clean_finish = True
-                            await self._finish_run(run_id, "cancelled", "Cancelled by user")
-                            return
-                        await self._save_checkpoint(
-                            run_id, world, sandbox_id, global_config, workspace_directory, dag_json,
-                        )
-                        await self._finish_run(
-                            run_id, "failed",
-                            f"Node '{node_id}' failed review {MAX_REVIEW_RETRIES} times",
-                        )
-                        return
-
-                try:
-                    await self._checkpoint.auto_commit(
-                        sandbox_id,
-                        message=f"director: {node_id} ({agent_type})",
-                    )
-                except Exception:
-                    pass
-
-                await self._save_checkpoint(
-                    run_id, world, sandbox_id, global_config, workspace_directory, dag_json,
-                )
-
-            clean_finish = True
-            await self._finish_run(run_id, "completed", "All nodes executed successfully")
-
-        except asyncio.CancelledError:
-            clean_finish = True
-            await self._finish_run(run_id, "cancelled", "Cancelled")
-        except Exception as exc:
-            tb = traceback.format_exc()
-            logger.error("Director loop crashed for run %s:\n%s", run_id, tb)
-            await self._finish_run(run_id, "failed", f"Director loop error: {exc}\n{tb[:500]}")
-        finally:
-            if sandbox_id:
-                if workspace_directory:
-                    try:
-                        await self._sandbox.sync_back(sandbox_id, workspace_directory)
-                    except Exception:
-                        logger.warning("sync_back failed for run %s", run_id, exc_info=True)
-
-                if clean_finish:
-                    try:
-                        await self._sandbox.destroy(sandbox_id)
-                        logger.info("Destroyed sandbox %s (clean finish)", sandbox_id[:12])
-                    except Exception:
-                        pass
-                else:
-                    logger.info("Preserving sandbox %s for potential resume", sandbox_id[:12])
-
-    async def _review_loop(
-        self,
-        run_id: str,
-        world: WorldModel,
-        sub_result: NodeResult,
-        node_id: str,
-        agent_type: str,
-        prompt: str,
-        target_files: list[str],
-        sandbox_id: str,
-        cancel_event: asyncio.Event,
-        global_config: dict,
-        workspace_directory: str | None,
-    ) -> bool:
-        summary = self._extract_worker_summary(sub_result)
-        await self._emit("worker_summary", run_id, node_id, content=summary[:2000])
-        await self._persist_chat_message(
-            run_id, node_id, "assistant",
-            f"Worker '{node_id}' completed:\n{summary[:1500]}",
-        )
-
-        review_passed = False
-        reject_reason = ""
-        current_result = sub_result
-
-        for review_attempt in range(1, MAX_REVIEW_RETRIES + 1):
-            if cancel_event.is_set():
-                return False
-
-            await self._emit(
-                "review_started", run_id, "director",
-                task_id=node_id, attempt=review_attempt,
-            )
-
-            review = await self._call_planner_review(
-                run_id=run_id,
-                world=world,
-                summary=summary,
-                node_id=node_id,
-                goal=world.goal,
-                review_attempt=review_attempt,
-                global_config=global_config,
-            )
-
-            if review and review.get("result") == "pass":
-                review_passed = True
-                review_reason = review.get("reason", "Approved")
-                world.record_review(node_id, True, review_reason, review_attempt)
-                await self._emit(
-                    "review_result", run_id, "director",
-                    task_id=node_id, result="pass",
-                    reason=review_reason, attempt=review_attempt,
-                )
-                await self._persist_chat_message(
-                    run_id, node_id, "assistant",
-                    f"Review PASSED (attempt {review_attempt}): {review_reason}",
-                )
-                break
-            else:
-                reject_reason = (review or {}).get("reason", "Review rejected")
-                next_prompt = (review or {}).get("next_prompt", "")
-                world.record_review(node_id, False, reject_reason, review_attempt, next_prompt)
-                await self._emit(
-                    "review_result", run_id, "director",
-                    task_id=node_id, result="reject",
-                    reason=reject_reason, attempt=review_attempt,
-                )
-                await self._persist_chat_message(
-                    run_id, node_id, "assistant",
-                    f"Review REJECTED (attempt {review_attempt}): {reject_reason}\n"
-                    f"Guidance: {next_prompt}",
-                )
-
-                retry_prompt = (
-                    f"Previous implementation was rejected: {reject_reason}\n"
-                    f"Please fix the code based on the feedback.\n"
-                )
-                if next_prompt:
-                    retry_prompt += f"\nFix guidance: {next_prompt}\n"
-                retry_prompt += f"\nOriginal task: {prompt}"
-
-                await self._emit(
-                    "review_retry", run_id, "director",
-                    task_id=node_id, attempt=review_attempt,
-                    max_attempts=MAX_REVIEW_RETRIES,
-                )
-
-                current_result = await self._run_sub_agent(
-                    run_id=run_id,
-                    agent_type="coder",
-                    system_prompt=WORKER_SYSTEM,
-                    prompt=self._build_sub_prompt(retry_prompt, target_files, world, "worker"),
+                    prompt=self._build_sub_prompt(prompt, target_files, world),
                     sandbox_id=sandbox_id,
                     cancel_event=cancel_event,
                     model_provider=global_config.get("worker_model_provider", ""),
@@ -689,73 +422,141 @@ class DirectorLoop:
                     node_id_override=node_id,
                     workspace_directory=workspace_directory,
                     world=world,
-                    enable_self_review=True,
+                    enable_self_review=(action in REVIEWABLE_ACTIONS),
                 )
 
-                self._update_world_from_result(world, node_id, "worker", current_result)
+                if cancel_event.is_set():
+                    clean_finish = True
+                    await self._finish_run(run_id, "cancelled", "Cancelled by user")
+                    return
 
-                if current_result.state != "completed":
-                    return False
+                self._update_world_from_result(world, node_id, action, sub_result)
 
-                summary = self._extract_worker_summary(current_result)
-                await self._emit("worker_summary", run_id, node_id, content=summary[:2000])
-                await self._persist_chat_message(
-                    run_id, node_id, "assistant",
-                    f"Worker '{node_id}' revised:\n{summary[:1500]}",
-                )
+                if sub_result.state != "completed":
+                    await self._emit("node_failed", run_id, node_id, content=sub_result.error or "")
+                    await self._save_checkpoint(
+                        run_id, world, sandbox_id, global_config, workspace_directory, dag_json)
+                    await self._finish_run(
+                        run_id, "failed",
+                        f"Node '{node_id}' ({action}) failed: {sub_result.error or 'unknown'}")
+                    return
 
-        return review_passed
+                await self._emit("node_completed", run_id, node_id)
+                world.current_file_snapshot = await self._git_diff_stat(sandbox_id)
 
-    async def _call_planner_review(
+                # Feed result back to Planner context
+                summary = self._extract_worker_summary(sub_result)
+                world.planner_review_messages.append({
+                    "role": "assistant",
+                    "content": f"[{action}] {task_id} completed:\n{summary[:1000]}",
+                })
+
+                # Review if coder
+                if action in REVIEWABLE_ACTIONS:
+                    review_passed = await self._review_loop(
+                        run_id, world, sub_result, node_id, action,
+                        prompt, target_files, sandbox_id, cancel_event,
+                        global_config, workspace_directory,
+                    )
+                    if not review_passed:
+                        if cancel_event.is_set():
+                            clean_finish = True
+                            await self._finish_run(run_id, "cancelled", "Cancelled")
+                            return
+                        await self._save_checkpoint(
+                            run_id, world, sandbox_id, global_config, workspace_directory, dag_json)
+                        await self._finish_run(
+                            run_id, "failed",
+                            f"Node '{node_id}' failed review {MAX_REVIEW_RETRIES} times")
+                        return
+
+                # Commit
+                try:
+                    await self._checkpoint.auto_commit(
+                        sandbox_id, message=f"director: {task_id} ({action})")
+                except Exception:
+                    pass
+
+                world.iteration += 1
+                world.last_node_id = node_id
+                world.current_node_index = world.iteration
+
+                await self._save_checkpoint(
+                    run_id, world, sandbox_id, global_config, workspace_directory, dag_json)
+
+            # Loop ended via cancellation
+            clean_finish = True
+            await self._finish_run(run_id, "cancelled", "Cancelled by user")
+
+        except asyncio.CancelledError:
+            clean_finish = True
+            await self._finish_run(run_id, "cancelled", "Cancelled")
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.error("Director loop crashed for run %s:\n%s", run_id, tb)
+            await self._finish_run(run_id, "failed", f"Error: {exc}\n{tb[:500]}")
+        finally:
+            if sandbox_id:
+                if workspace_directory:
+                    try:
+                        await self._sandbox.sync_back(sandbox_id, workspace_directory)
+                    except Exception:
+                        logger.warning("sync_back failed for run %s", run_id, exc_info=True)
+                if clean_finish:
+                    try:
+                        await self._sandbox.destroy(sandbox_id)
+                    except Exception:
+                        pass
+                else:
+                    logger.info("Preserving sandbox %s for resume", sandbox_id[:12])
+
+    # ------------------------------------------------------------------
+    # Planner decision call
+    # ------------------------------------------------------------------
+
+    async def _call_planner_decide(
         self,
         run_id: str,
         world: WorldModel,
-        summary: str,
-        node_id: str,
-        goal: str,
-        review_attempt: int,
         global_config: dict,
+        available_nodes_text: str,
     ) -> dict | None:
-        """Call Planner LLM to review worker output with full context."""
+        """Call Planner LLM to decide next action."""
         import httpx
 
-        planner_provider = global_config.get("director_model_provider", "")
-        planner_model = global_config.get("director_model_id", "")
+        provider = global_config.get("director_model_provider", "")
+        model = global_config.get("director_model_id", "")
 
         from app.core.node_runner import _load_default_model_config, _load_model_config
-        if not planner_provider or not planner_model:
+        if not provider or not model:
             cfg = _load_default_model_config()
-            planner_provider = planner_provider or str(cfg.get("provider") or "")
-            planner_model = planner_model or str(cfg.get("model") or "")
+            provider = provider or str(cfg.get("provider", ""))
+            model = model or str(cfg.get("model", ""))
 
-        model_cfg = _load_model_config(planner_provider, planner_model)
+        model_cfg = _load_model_config(provider, model)
         url = str(model_cfg.get("url", ""))
         api_key = str(model_cfg.get("key", ""))
 
         if not url or not api_key:
-            logger.error("No API URL/key for Planner review LLM")
+            logger.error("No API URL/key for Planner LLM")
             return None
 
-        review_history = ""
-        for r in world.reviews:
-            if r.task_id == node_id:
-                status = "PASS" if r.passed else "REJECT"
-                review_history += f"\n  Attempt {r.attempt}: {status} - {r.reason[:150]}"
-
-        user_content = (
-            f"## Task\nNode ID: {node_id}\nGoal: {goal}\n"
-            f"Review attempt: {review_attempt}/{MAX_REVIEW_RETRIES}\n"
+        system_content = PLANNER_DIRECTOR_SYSTEM.format(
+            world_model=world.to_prompt_context(),
+            available_nodes=available_nodes_text,
         )
-        if review_history:
-            user_content += f"\n## Previous Reviews for this task:{review_history}\n"
-        user_content += f"\n## Worker Output Summary\n{summary[:2000]}\n\nReview this output."
 
         messages = list(world.planner_review_messages)
-        messages.append({"role": "user", "content": user_content})
+        messages.append({
+            "role": "user",
+            "content": (
+                f"## Current State\nIteration: {world.iteration}\n"
+                f"What should we do next? Call the `decide` tool."
+            ),
+        })
+        messages = self._compress_context(messages)
 
-        messages = self._compress_planner_context(messages)
-
-        is_anthropic = "/anthropic" in url or planner_provider == "anthropic"
+        is_anthropic = "/anthropic" in url or provider == "anthropic"
 
         if is_anthropic:
             endpoint = f"{url}/v1/messages"
@@ -765,11 +566,11 @@ class DirectorLoop:
                 "anthropic-version": "2023-06-01",
             }
             payload = {
-                "model": planner_model,
-                "system": PLANNER_REVIEW_SYSTEM,
+                "model": model,
+                "system": system_content,
                 "messages": messages,
-                "tools": [REVIEW_TOOL],
-                "tool_choice": REVIEW_TOOL_CHOICE_ANTHROPIC,
+                "tools": PLANNER_TOOLS,
+                "tool_choice": {"type": "tool", "name": DECIDE_TOOL_NAME},
                 "max_tokens": 1024,
             }
         else:
@@ -779,13 +580,13 @@ class DirectorLoop:
                 "Authorization": f"Bearer {api_key}",
             }
             payload = {
-                "model": planner_model,
+                "model": model,
                 "messages": [
-                    {"role": "system", "content": PLANNER_REVIEW_SYSTEM},
+                    {"role": "system", "content": system_content},
                     *messages,
                 ],
-                "tools": [REVIEW_TOOL_OPENAI],
-                "tool_choice": REVIEW_TOOL_CHOICE_OPENAI,
+                "tools": PLANNER_TOOLS_OPENAI,
+                "tool_choice": {"type": "function", "function": {"name": DECIDE_TOOL_NAME}},
                 "max_tokens": 1024,
             }
 
@@ -799,76 +600,242 @@ class DirectorLoop:
 
             elapsed_ms = (time.monotonic() - t0) * 1000
             _dbg.log_llm_call(
-                __name__, provider=planner_provider, model=planner_model,
+                __name__, provider=provider, model=model,
                 duration_ms=elapsed_ms,
-                prompt_preview=f"[PlannerReview] node={node_id} attempt={review_attempt}",
+                prompt_preview=f"[PlannerDecide] iter={world.iteration}",
             )
 
-            review_result = None
+            decision = None
             if is_anthropic:
-                content_blocks = data.get("content") or []
-                for block in content_blocks:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "tool_use"
-                        and block.get("name") == "review"
-                    ):
-                        inp = block.get("input", {})
-                        if isinstance(inp, str):
-                            inp = _try_parse_json_dict(inp) or {}
-                        review_result = inp if isinstance(inp, dict) else None
+                for block in (data.get("content") or []):
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        if block.get("name") == DECIDE_TOOL_NAME:
+                            inp = block.get("input", {})
+                            if isinstance(inp, str):
+                                inp = _try_parse_json_dict(inp) or {}
+                            decision = inp if isinstance(inp, dict) else None
             else:
                 choices = data.get("choices") or []
                 if choices:
                     message = choices[0].get("message", {})
-                    tool_calls = message.get("tool_calls") or []
-                    for tc in tool_calls:
-                        if tc.get("function", {}).get("name") == "review":
-                            args = tc["function"].get("arguments", "{}")
-                            review_result = _try_parse_json_dict(args)
+                    for tc in (message.get("tool_calls") or []):
+                        if tc.get("function", {}).get("name") == DECIDE_TOOL_NAME:
+                            decision = _try_parse_json_dict(tc["function"].get("arguments", "{}"))
 
-            if review_result:
-                world.planner_review_messages.append({"role": "user", "content": user_content})
-                assistant_content = json.dumps(review_result, ensure_ascii=False)
-                world.planner_review_messages.append(
-                    {"role": "assistant", "content": assistant_content}
-                )
+            if decision:
+                world.planner_review_messages.append({
+                    "role": "user",
+                    "content": f"[Iteration {world.iteration}] Deciding next action...",
+                })
+                world.planner_review_messages.append({
+                    "role": "assistant",
+                    "content": json.dumps(decision, ensure_ascii=False),
+                })
 
-            return review_result
+            return decision
         except Exception as exc:
-            logger.warning("Planner review LLM call failed: %s", exc)
+            logger.warning("Planner decide call failed: %s", exc)
             return None
 
-    def _compress_planner_context(self, messages: list[dict]) -> list[dict]:
-        """Compress planner context if it exceeds the character threshold."""
-        total_chars = _estimate_chars(messages)
-        if total_chars < CONTEXT_MAX_CHARS:
+    # ------------------------------------------------------------------
+    # Planner review
+    # ------------------------------------------------------------------
+
+    async def _review_loop(
+        self,
+        run_id: str,
+        world: WorldModel,
+        sub_result: NodeResult,
+        node_id: str,
+        action: str,
+        prompt: str,
+        target_files: list[str],
+        sandbox_id: str,
+        cancel_event: asyncio.Event,
+        global_config: dict,
+        workspace_directory: str | None,
+    ) -> bool:
+        summary = self._extract_worker_summary(sub_result)
+        await self._emit("worker_summary", run_id, node_id, content=summary[:2000])
+
+        review_passed = False
+        current_result = sub_result
+
+        for review_attempt in range(1, MAX_REVIEW_RETRIES + 1):
+            if cancel_event.is_set():
+                return False
+
+            await self._emit("review_started", run_id, "director",
+                             task_id=node_id, attempt=review_attempt)
+
+            review = await self._call_planner_review(
+                run_id, world, summary, node_id, world.goal, review_attempt, global_config,
+            )
+
+            if review and review.get("result") == "pass":
+                review_passed = True
+                reason = review.get("reason", "Approved")
+                world.record_review(node_id, True, reason, review_attempt)
+                await self._emit("review_result", run_id, "director",
+                                 task_id=node_id, result="pass", reason=reason, attempt=review_attempt)
+                break
+
+            reject_reason = (review or {}).get("reason", "Rejected")
+            next_prompt = (review or {}).get("next_prompt", "")
+            world.record_review(node_id, False, reject_reason, review_attempt, next_prompt)
+            await self._emit("review_result", run_id, "director",
+                             task_id=node_id, result="reject", reason=reject_reason, attempt=review_attempt)
+
+            retry_prompt = f"Previous implementation rejected: {reject_reason}\n\nFix guidance: {next_prompt}\n\nOriginal task: {prompt}"
+            await self._emit("review_retry", run_id, "director",
+                             task_id=node_id, attempt=review_attempt, max_attempts=MAX_REVIEW_RETRIES)
+
+            current_result = await self._run_sub_agent(
+                run_id=run_id,
+                agent_type="coder",
+                system_prompt=WORKER_SYSTEM,
+                prompt=self._build_sub_prompt(retry_prompt, target_files, world),
+                sandbox_id=sandbox_id,
+                cancel_event=cancel_event,
+                model_provider=global_config.get("worker_model_provider", ""),
+                model_id=global_config.get("worker_model_id", ""),
+                node_id_override=node_id,
+                workspace_directory=workspace_directory,
+                world=world,
+                enable_self_review=True,
+            )
+
+            self._update_world_from_result(world, node_id, "coder", current_result)
+            if current_result.state != "completed":
+                return False
+
+            summary = self._extract_worker_summary(current_result)
+
+        return review_passed
+
+    async def _call_planner_review(
+        self,
+        run_id: str,
+        world: WorldModel,
+        summary: str,
+        node_id: str,
+        goal: str,
+        review_attempt: int,
+        global_config: dict,
+    ) -> dict | None:
+        import httpx
+
+        provider = global_config.get("director_model_provider", "")
+        model = global_config.get("director_model_id", "")
+
+        from app.core.node_runner import _load_default_model_config, _load_model_config
+        if not provider or not model:
+            cfg = _load_default_model_config()
+            provider = provider or str(cfg.get("provider", ""))
+            model = model or str(cfg.get("model", ""))
+
+        model_cfg = _load_model_config(provider, model)
+        url = str(model_cfg.get("url", ""))
+        api_key = str(model_cfg.get("key", ""))
+        if not url or not api_key:
+            return None
+
+        review_history = ""
+        for r in world.reviews:
+            if r.task_id == node_id:
+                status = "PASS" if r.passed else "REJECT"
+                review_history += f"\n  Attempt {r.attempt}: {status} - {r.reason[:150]}"
+
+        user_content = f"## Task\nNode: {node_id}\nGoal: {goal}\nAttempt: {review_attempt}/{MAX_REVIEW_RETRIES}\n"
+        if review_history:
+            user_content += f"\n## Previous Reviews:{review_history}\n"
+        user_content += f"\n## Worker Output\n{summary[:2000]}\n\nReview this output."
+
+        messages = list(world.planner_review_messages)
+        messages.append({"role": "user", "content": user_content})
+        messages = self._compress_context(messages)
+
+        is_anthropic = "/anthropic" in url or provider == "anthropic"
+
+        if is_anthropic:
+            endpoint = f"{url}/v1/messages"
+            headers = {"Content-Type": "application/json", "x-api-key": api_key, "anthropic-version": "2023-06-01"}
+            payload = {
+                "model": model, "system": PLANNER_REVIEW_SYSTEM,
+                "messages": messages, "tools": [REVIEW_TOOL],
+                "tool_choice": {"type": "tool", "name": REVIEW_TOOL_NAME}, "max_tokens": 1024,
+            }
+        else:
+            endpoint = f"{url}/chat/completions"
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+            payload = {
+                "model": model,
+                "messages": [{"role": "system", "content": PLANNER_REVIEW_SYSTEM}, *messages],
+                "tools": [REVIEW_TOOL_OPENAI],
+                "tool_choice": {"type": "function", "function": {"name": REVIEW_TOOL_NAME}},
+                "max_tokens": 1024,
+            }
+
+        try:
+            timeout = httpx.Timeout(connect=10, read=120, write=10, pool=10)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(endpoint, json=payload, headers=headers)
+                resp.raise_for_status()
+                data = resp.json()
+
+            result = None
+            if is_anthropic:
+                for block in (data.get("content") or []):
+                    if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == REVIEW_TOOL_NAME:
+                        inp = block.get("input", {})
+                        if isinstance(inp, str):
+                            inp = _try_parse_json_dict(inp) or {}
+                        result = inp if isinstance(inp, dict) else None
+            else:
+                choices = data.get("choices") or []
+                if choices:
+                    for tc in (choices[0].get("message", {}).get("tool_calls") or []):
+                        if tc.get("function", {}).get("name") == REVIEW_TOOL_NAME:
+                            result = _try_parse_json_dict(tc["function"].get("arguments", "{}"))
+
+            if result:
+                world.planner_review_messages.append({"role": "user", "content": user_content})
+                world.planner_review_messages.append({"role": "assistant", "content": json.dumps(result, ensure_ascii=False)})
+            return result
+        except Exception as exc:
+            logger.warning("Planner review call failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # Context compression
+    # ------------------------------------------------------------------
+
+    def _compress_context(self, messages: list[dict]) -> list[dict]:
+        total = sum(len(m.get("content", "")) for m in messages)
+        if total < CONTEXT_MAX_CHARS or len(messages) <= CONTEXT_KEEP_RECENT:
             return messages
 
-        if len(messages) <= CONTEXT_KEEP_RECENT:
-            return messages
+        old = messages[:-CONTEXT_KEEP_RECENT]
+        recent = messages[-CONTEXT_KEEP_RECENT:]
 
-        old_messages = messages[:-CONTEXT_KEEP_RECENT]
-        recent_messages = messages[-CONTEXT_KEEP_RECENT:]
-
-        summary_parts = ["[Context Summary - older messages compressed]\n"]
-        for msg in old_messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            summary_parts.append(f"[{role}] {content[:200]}\n")
-
-        summary = "\n".join(summary_parts)
+        parts = ["[Context Summary - older messages compressed]\n"]
+        for msg in old:
+            parts.append(f"[{msg.get('role', '?')}] {msg.get('content', '')[:200]}\n")
+        summary = "\n".join(parts)
         if len(summary) > 4000:
-            summary = summary[:4000] + "\n... (further truncated)"
+            summary = summary[:4000] + "\n... (truncated)"
 
         return [
             {"role": "user", "content": summary},
-            {"role": "assistant", "content": "Understood, I have the context summary."},
-            *recent_messages,
+            {"role": "assistant", "content": "Understood."},
+            *recent,
         ]
 
+    # ------------------------------------------------------------------
+    # Planner history
+    # ------------------------------------------------------------------
+
     async def _load_planner_history(self, run_id: str) -> list[dict]:
-        """Load Planner chat history from ChatMessage table."""
         try:
             from sqlalchemy import select
 
@@ -883,23 +850,23 @@ class DirectorLoop:
                 run_row = result.scalar_one_or_none()
                 if not run_row:
                     return []
-
                 wf_result = await session.execute(
                     select(ChatMessageORM)
                     .where(ChatMessageORM.workflow_id == run_row.workflow_id)
                     .order_by(ChatMessageORM.created_at.asc())
                 )
-                messages = wf_result.scalars().all()
-
-                result_msgs: list[dict] = []
-                for msg in messages:
-                    if msg.role in ("user", "assistant") and msg.content:
-                        result_msgs.append({"role": msg.role, "content": msg.content})
-
-                return result_msgs
+                return [
+                    {"role": m.role, "content": m.content}
+                    for m in wf_result.scalars().all()
+                    if m.role in ("user", "assistant") and m.content
+                ]
         except Exception:
             logger.warning("Failed to load planner history for run %s", run_id, exc_info=True)
             return []
+
+    # ------------------------------------------------------------------
+    # Sub-agent execution
+    # ------------------------------------------------------------------
 
     async def _run_sub_agent(
         self,
@@ -917,35 +884,26 @@ class DirectorLoop:
         enable_self_review: bool = False,
     ) -> NodeResult:
         full_prompt = f"{system_prompt}\n\n---\n\n## Task\n{prompt}"
-
         _dbg.log_node_lifecycle(
             __name__, node_id=node_id_override, agent_type=agent_type, event="started",
-            model_provider=model_provider, model_id=model_id,
             prompt_preview=prompt[:300],
         )
-
         result = await self._node_runner.execute_node(
-            run_id=run_id,
-            node_id=node_id_override,
-            agent_type=agent_type,
-            prompt=full_prompt,
-            sandbox_id=sandbox_id,
-            workspace_directory=workspace_directory,
-            cancel_event=cancel_event,
-            model_provider=model_provider,
-            model_id=model_id,
-            destroy_sandbox=False,
-            enable_self_review=enable_self_review,
+            run_id=run_id, node_id=node_id_override, agent_type=agent_type,
+            prompt=full_prompt, sandbox_id=sandbox_id,
+            workspace_directory=workspace_directory, cancel_event=cancel_event,
+            model_provider=model_provider, model_id=model_id,
+            destroy_sandbox=False, enable_self_review=enable_self_review,
         )
-
         _dbg.log_node_lifecycle(
             __name__, node_id=node_id_override, agent_type=agent_type,
-            event=result.state, exit_code=result.exit_code,
-            error=(result.error or "")[:500],
-            raw_output_len=len(result.raw_output or ""),
+            event=result.state, error=(result.error or "")[:500],
         )
-
         return result
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _extract_worker_summary(self, result: NodeResult) -> str:
         if not result.raw_output:
@@ -957,81 +915,52 @@ class DirectorLoop:
             files = structured.get("files_changed", [])
             parts = [f"Summary: {summary}"]
             if files:
-                parts.append(f"Files changed: {', '.join(str(f) for f in files[:10])}")
+                parts.append(f"Files: {', '.join(str(f) for f in files[:10])}")
             return "\n".join(parts)
         return result.result_summary[:2000] if result.result_summary else llm_text[:2000]
 
-    async def _persist_chat_message(
-        self, run_id: str, node_id: str, role: str, content: str,
-    ) -> None:
+    async def _persist_chat_message(self, run_id: str, node_id: str, role: str, content: str) -> None:
         try:
             from app.core.database import async_session_factory
             from app.models.db import ChatMessage as ChatMessageORM
             from app.models.db import Run as RunModel
-
             async with async_session_factory() as session:
                 run_row = await session.get(RunModel, uuid.UUID(run_id))
                 if not run_row:
                     return
-                workflow_id = run_row.workflow_id
                 session.add(ChatMessageORM(
-                    id=uuid.uuid4(),
-                    workflow_id=workflow_id,
-                    node_id=node_id,
-                    role=role,
-                    content=content,
+                    id=uuid.uuid4(), workflow_id=run_row.workflow_id,
+                    node_id=node_id, role=role, content=content,
                 ))
                 await session.commit()
         except Exception:
-            logger.debug("Failed to persist chat message for review", exc_info=True)
+            logger.debug("Failed to persist chat message", exc_info=True)
 
-    def _update_world_from_result(
-        self, world: WorldModel, task_id: str, action: str, result: NodeResult,
-    ) -> None:
+    def _update_world_from_result(self, world: WorldModel, task_id: str, action: str, result: NodeResult) -> None:
         if result.state != "completed":
-            prompt_hint = result.result_summary[:150] if result.result_summary else ""
-            world.record_failure(
-                task_id, action,
-                result.error or "Sub-agent failed",
-                prompt_hint=prompt_hint,
-            )
+            world.record_failure(task_id, action, result.error or "Sub-agent failed",
+                                 prompt_hint=result.result_summary[:150] if result.result_summary else "")
             return
-
         if not result.raw_output:
             world.record_success(task_id, action, "(no output)")
             return
-
         llm_text = _extract_llm_text(result.raw_output)
-        files_changed: list[str] = []
-
         block_name = "SCOUT_FINDINGS" if action in ("scout", "explore") else "WORKER_RESULT"
         structured = _extract_structured_block(llm_text, block_name)
-
         if structured:
             summary = structured.get("summary", "")
-            files_changed = structured.get("files_changed", structured.get("files_found", []))
-            if not summary:
-                summary = f"{action} completed"
-            world.record_success(task_id, action, summary, files_changed)
+            files = structured.get("files_changed", structured.get("files_found", []))
+            world.record_success(task_id, action, summary or f"{action} completed", files)
         else:
-            if result.result_summary:
-                summary = result.result_summary[:300]
-            else:
-                summary = f"{action} completed (no structured output)"
-            world.record_success(task_id, action, summary)
+            world.record_success(task_id, action, result.result_summary[:300] or f"{action} completed")
 
-    def _build_sub_prompt(
-        self, prompt: str, target_files: list[str], world: WorldModel, action: str,
-    ) -> str:
+    def _build_sub_prompt(self, prompt: str, target_files: list[str], world: WorldModel) -> str:
         parts = [prompt]
         if target_files:
             parts.append("\n\n## Target Files\n" + "\n".join(f"- {f}" for f in target_files))
         if world.completed_tasks:
             recent = world.completed_tasks[-5:]
-            history_lines = []
-            for t in recent:
-                icon = "+" if t.success else "-"
-                history_lines.append(f"  [{icon}] {t.task_id} ({t.action}): {t.summary[:100]}")
+            history_lines = [f"  [{'+' if t.success else '-'}] {t.task_id} ({t.action}): {t.summary[:100]}" for t in recent]
             parts.append("\n\n## Recent Steps\n" + "\n".join(history_lines))
         return "\n".join(parts)
 
@@ -1042,49 +971,38 @@ class DirectorLoop:
 
             def _run():
                 return subprocess.run(
-                    ["git", f"--git-dir={git_dir}", f"--work-tree={work_tree}",
-                     "diff", "--stat", "HEAD"],
-                    capture_output=True,
-                    text=True,
-                    cwd=work_tree,
+                    ["git", f"--git-dir={git_dir}", f"--work-tree={work_tree}", "diff", "--stat", "HEAD"],
+                    capture_output=True, text=True, cwd=work_tree,
                 )
-
             result = await asyncio.to_thread(_run)
             stdout = result.stdout
-            if len(stdout) > 1500:
-                stdout = stdout[:1500] + "..."
-            return stdout.strip()
+            return (stdout[:1500] + "...") if len(stdout) > 1500 else stdout.strip()
         except Exception:
             return ""
 
-    async def _save_checkpoint(
-        self,
-        run_id: str,
-        world: WorldModel,
-        sandbox_id: str,
-        global_config: dict,
-        workspace_directory: str | None,
-        dag_json: dict,
-    ) -> None:
+    # ------------------------------------------------------------------
+    # Checkpoint & finish
+    # ------------------------------------------------------------------
+
+    async def _save_checkpoint(self, run_id: str, world: WorldModel, sandbox_id: str,
+                               global_config: dict, workspace_directory: str | None, dag_json: dict) -> None:
         try:
             from sqlalchemy import update
 
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel
-
-            checkpoint_data = {
-                "world_model_json": world.to_json(),
-                "sandbox_id": sandbox_id,
-                "global_config": global_config,
-                "workspace_directory": workspace_directory or "",
-                "dag_json": dag_json,
-                "checkpoint_iteration": world.current_node_index,
-            }
             async with async_session_factory() as session:
                 await session.execute(
-                    update(RunModel)
-                    .where(RunModel.id == uuid.UUID(run_id))
-                    .values(checkpoint_json=checkpoint_data)
+                    update(RunModel).where(RunModel.id == uuid.UUID(run_id)).values(
+                        checkpoint_json={
+                            "world_model_json": world.to_json(),
+                            "sandbox_id": sandbox_id,
+                            "global_config": global_config,
+                            "workspace_directory": workspace_directory or "",
+                            "dag_json": dag_json,
+                            "checkpoint_iteration": world.iteration,
+                        }
+                    )
                 )
                 await session.commit()
         except Exception:
@@ -1094,16 +1012,10 @@ class DirectorLoop:
         run_state = self._runs.get(run_id)
         if run_state:
             run_state["status"] = status
-
         await self._update_run_status_db(run_id, status)
-
-        event_type = {
-            "completed": "run_completed",
-            "failed": "run_failed",
-            "cancelled": "run_cancelled",
-        }.get(status, "run_failed")
+        event_type = {"completed": "run_completed", "failed": "run_failed", "cancelled": "run_cancelled"}.get(status, "run_failed")
         await self._emit(event_type, run_id, "director", content=message)
-        logger.info("Director run %s finished: %s (%s)", run_id, status, message)
+        logger.info("Run %s finished: %s (%s)", run_id, status, message)
 
     async def _update_run_status_db(self, run_id: str, status: str) -> None:
         try:
@@ -1112,20 +1024,15 @@ class DirectorLoop:
             from app.core.database import async_session_factory
             from app.models.db import Run as RunModel
             from app.models.db import Workflow as WorkflowModel
-
             async with async_session_factory() as session:
-                result = await session.execute(
-                    select(RunModel).where(RunModel.id == uuid.UUID(run_id))
-                )
+                result = await session.execute(select(RunModel).where(RunModel.id == uuid.UUID(run_id)))
                 run_row = result.scalar_one_or_none()
                 if run_row is not None:
                     run_row.status = status
                     if status in ("completed", "failed", "cancelled"):
                         run_row.completed_at = datetime.now(timezone.utc)
-
                     wf_result = await session.execute(
-                        select(WorkflowModel).where(WorkflowModel.id == run_row.workflow_id)
-                    )
+                        select(WorkflowModel).where(WorkflowModel.id == run_row.workflow_id))
                     wf = wf_result.scalar_one_or_none()
                     if wf is not None:
                         if status == "running":
@@ -1138,18 +1045,11 @@ class DirectorLoop:
             logger.warning("Failed to update run status in DB for %s", run_id, exc_info=True)
 
     async def _emit(self, event_type: str, run_id: str, node_id: str, **extra: Any) -> None:
-        event = {
-            "event_id": str(uuid.uuid4()),
-            "type": event_type,
-            "run_id": run_id,
-            "node_id": node_id,
-            "timestamp": time.time(),
-            **extra,
-        }
+        event = {"event_id": str(uuid.uuid4()), "type": event_type, "run_id": run_id,
+                 "node_id": node_id, "timestamp": time.time(), **extra}
         await self._persist_event(event)
-        channel = f"run:{run_id}:stream"
         try:
-            await self._event_bus.publish(channel, event)
+            await self._event_bus.publish(f"run:{run_id}:stream", event)
         except Exception:
             logger.warning("Failed to publish event %s", event_type, exc_info=True)
 
@@ -1157,18 +1057,14 @@ class DirectorLoop:
         try:
             from app.core.database import async_session_factory
             from app.models.db import Run, RunEvent
-
             run_id = uuid.UUID(str(event.get("run_id", "")))
-            node_id = str(event.get("node_id") or "")
             async with async_session_factory() as session:
                 run = await session.get(Run, run_id)
                 if run is None:
                     return
                 session.add(RunEvent(
-                    run_id=run_id,
-                    event_type=str(event.get("type") or ""),
-                    node_id=node_id,
-                    payload=event,
+                    run_id=run_id, event_type=str(event.get("type") or ""),
+                    node_id=str(event.get("node_id") or ""), payload=event,
                 ))
                 await session.commit()
         except Exception:
